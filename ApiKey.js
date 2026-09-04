@@ -137,7 +137,7 @@ app.post('/api/claim-key', async (req, res) => {
             const lvData = await lvResponse.json().catch(() => ({}));
             console.log("[Linkvertise Response]", lvResponse.status, lvData);
 
-            if (lvResponse.ok && (lvData.success === true || lvData.status === 200 || lvData.status === 'SUCCESS' || lvData.valid === true || lvData.user_id)) {
+            if (lvResponse.ok && (lvData.success === true || lvData.status === true || lvData.status === 200 || lvData.status === 'SUCCESS' || lvData.valid === true || lvData.user_id)) {
                 isValidHash = true;
             } else if (lvData.success === false && (lvResponse.status === 401 || lvResponse.status === 403)) {
                 return res.status(403).json({ 
