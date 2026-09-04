@@ -27,7 +27,10 @@ try {
     }
     
     if (!credential) {
-        const keyPath = process.env.FIREBASE_SERVICE_ACCOUNT_KEY_PATH || path.join(__dirname, 'serviceAccountKey.json');
+        const configuredKeyPath = process.env.FIREBASE_SERVICE_ACCOUNT_KEY_PATH;
+        const keyPath = configuredKeyPath
+            ? (path.isAbsolute(configuredKeyPath) ? configuredKeyPath : path.resolve(__dirname, configuredKeyPath))
+            : path.join(__dirname, 'serviceAccountKey.json');
         if (fs.existsSync(keyPath)) {
             const serviceAccount = require(keyPath);
             credential = cert(serviceAccount);
