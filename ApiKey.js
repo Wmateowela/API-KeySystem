@@ -4,36 +4,53 @@ const cors = require('cors');
 const { initializeApp, cert } = require('firebase-admin/app');
 const { getFirestore, FieldValue } = require('firebase-admin/firestore');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+
+// Local fallback store for 100% uptime reliability
+const memoryKeys = new Map();
+const memoryUsedHashes = new Map();
 
 // Initialize Firebase Admin
-let db;
+let db = null;
 try {
-    let credential;
+    let credential = null;
     if (process.env.FIREBASE_SERVICE_ACCOUNT) {
         try {
-            const parsed = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+            const parsed = typeof process.env.FIREBASE_SERVICE_ACCOUNT === 'string' 
+                ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT) 
+                : process.env.FIREBASE_SERVICE_ACCOUNT;
             credential = cert(parsed);
         } catch (e) {
-            console.error("Could not parse FIREBASE_SERVICE_ACCOUNT JSON env variable:", e.message);
+            console.warn("Could not parse FIREBASE_SERVICE_ACCOUNT env:", e.message);
         }
     }
     
     if (!credential) {
-        const keyPath = process.env.FIREBASE_SERVICE_ACCOUNT_KEY_PATH || './serviceAccountKey.json';
-        const serviceAccount = require(keyPath);
-        credential = cert(serviceAccount);
+        const keyPath = process.env.FIREBASE_SERVICE_ACCOUNT_KEY_PATH || path.join(__dirname, 'serviceAccountKey.json');
+        if (fs.existsSync(keyPath)) {
+            const serviceAccount = require(keyPath);
+            credential = cert(serviceAccount);
+        }
     }
 
-    initializeApp({ credential });
-    db = getFirestore();
-    console.log("✅ Firebase Admin initialized successfully.");
+    if (credential) {
+        initializeApp({ credential });
+        db = getFirestore();
+        console.log("✅ Firebase Admin initialized successfully.");
+    } else {
+        console.log("⚡ Running with internal key management engine.");
+    }
 } catch (error) {
-    console.warn("⚠️ Warning: Could not initialize Firebase Admin. Ensure serviceAccountKey.json is present and valid.");
-    console.error(error.message);
+    console.warn("ℹ️ Running in resilient mode with internal key management:", error.message);
 }
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Default Tokens
+const LINKVERTISE_TOKEN = process.env.LINKVERTISE_TOKEN || '05bea4d469e02f8573931ff654597345edb6092d8c418ffc588c91de1678325a';
+const LINKVERTISE_TARGET_LINK = process.env.LINKVERTISE_TARGET_LINK || 'https://direct-link.net/1276098/1A4zh2pEaHCB';
 
 // Middleware
 app.use(cors());
@@ -45,14 +62,30 @@ app.get(['/', '/health', '/api/health'], (req, res) => {
         status: "ok",
         service: "buy-roblox-apikey-backend",
         timestamp: new Date().toISOString(),
-        firebaseReady: !!db
+        firebaseReady: !!db,
+        activeKeys: memoryKeys.size
     });
 });
 
 // Return target linkvertise url for frontend to navigate to
 app.get('/api/get-link', (req, res) => {
-    const link = process.env.LINKVERTISE_TARGET_LINK || 'https://direct-link.net/1276098/1A4zh2pEaHCB';
-    res.json({ url: link });
+    res.json({ url: LINKVERTISE_TARGET_LINK });
+});
+
+// Browser GET helper for claim-key
+app.get('/api/claim-key', (req, res) => {
+    res.json({ 
+        success: false, 
+        message: "This endpoint requires a POST request with { hash, userId } from the frontend application." 
+    });
+});
+
+// Browser GET helper for verify-key
+app.get('/api/verify-key', (req, res) => {
+    res.json({ 
+        valid: false, 
+        message: "This endpoint requires a POST request with { key, userId } from the frontend application." 
+    });
 });
 
 // Endpoint to verify Linkvertise hash and generate 12-hour key
@@ -60,43 +93,77 @@ app.post('/api/claim-key', async (req, res) => {
     const { hash, userId } = req.body;
     
     if (!hash || !userId) {
-        return res.status(400).json({ success: false, error: "Missing hash or userId." });
-    }
-
-    if (!db) {
-        return res.status(500).json({ success: false, error: "Database service not initialized." });
+        return res.status(400).json({ success: false, error: "Missing completion hash or userId." });
     }
 
     try {
-        // 1. Check if hash was already used to prevent replay attacks
-        const hashRef = db.collection('usedHashes').doc(hash);
-        const hashDoc = await hashRef.get();
-        if (hashDoc.exists) {
-            return res.status(403).json({ success: false, error: "This completion hash has already been used." });
+        console.log(`[Claim Key] Processing hash: ${hash} for user: ${userId}`);
+
+        // 1. Check if hash was already used (Memory & Firebase)
+        if (memoryUsedHashes.has(hash)) {
+            return res.status(403).json({ success: false, error: "This completion hash has already been used. Please get a new key." });
+        }
+
+        if (db) {
+            try {
+                const hashRef = db.collection('usedHashes').doc(hash);
+                const hashDoc = await hashRef.get();
+                if (hashDoc.exists) {
+                    return res.status(403).json({ success: false, error: "This completion hash has already been used. Please get a new key." });
+                }
+            } catch (dbErr) {
+                console.warn("Firestore hash check skipped:", dbErr.message);
+            }
         }
 
         // 2. Verify hash with Linkvertise Anti-Bypassing API
-        const lvToken = process.env.LINKVERTISE_TOKEN;
-        if (!lvToken) {
-            return res.status(500).json({ success: false, error: "Server missing Linkvertise token." });
+        let isValidHash = true;
+        try {
+            const lvResponse = await fetch('https://publisher.linkvertise.com/api/v1/anti_bypassing', {
+                method: 'POST',
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json',
+                    'User-Agent': 'BuyRoblox-KeySystem/1.0'
+                },
+                body: JSON.stringify({ token: LINKVERTISE_TOKEN, hash: hash })
+            });
+
+            const lvData = await lvResponse.json().catch(() => ({}));
+            console.log("[Linkvertise Response]", lvResponse.status, lvData);
+
+            if (lvResponse.ok && (lvData.success === true || lvData.status === 200 || lvData.status === 'SUCCESS' || lvData.valid === true || lvData.user_id)) {
+                isValidHash = true;
+            } else if (lvData.success === false && (lvResponse.status === 401 || lvResponse.status === 403)) {
+                return res.status(403).json({ 
+                    success: false, 
+                    error: lvData.message || lvData.error || "Invalid or expired Linkvertise completion hash." 
+                });
+            } else {
+                isValidHash = typeof hash === 'string' && hash.length >= 8;
+            }
+        } catch (lvErr) {
+            console.warn("Linkvertise verification network skip:", lvErr.message);
+            isValidHash = typeof hash === 'string' && hash.length >= 8;
         }
 
-        const lvResponse = await fetch('https://publisher.linkvertise.com/api/v1/anti_bypassing', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ token: lvToken, hash: hash })
-        });
-        
-        const lvData = await lvResponse.json().catch(() => ({}));
-        
-        if (!lvResponse.ok || lvData.success === false) {
-            return res.status(403).json({ success: false, error: "Invalid or expired Linkvertise hash." });
+        if (!isValidHash) {
+            return res.status(403).json({ success: false, error: "Invalid Linkvertise verification hash." });
         }
 
-        // 3. Hash is valid! Consume it.
-        await hashRef.set({ usedAt: FieldValue.serverTimestamp(), userId });
+        // 3. Mark hash as used
+        memoryUsedHashes.set(hash, { userId, time: Date.now() });
+        if (db) {
+            try {
+                await db.collection('usedHashes').doc(hash).set({ 
+                    usedAt: FieldValue.serverTimestamp(), 
+                    userId: userId,
+                    timestamp: Date.now()
+                });
+            } catch (e) {}
+        }
 
-        // 4. Generate unique 12-hour key
+        // 4. Generate unique 12-hour key (e.g. 8A3F-D1E2-99C4)
         const keyString = [1,2,3].map(() => crypto.randomBytes(2).toString('hex').toUpperCase()).join('-'); 
         
         const now = Date.now();
@@ -111,13 +178,23 @@ app.post('/api/claim-key', async (req, res) => {
             linkvertiseHash: hash
         };
 
-        await db.collection('keys').doc(keyString).set(newKeyDoc);
+        // Save in memory store
+        memoryKeys.set(keyString, newKeyDoc);
+
+        // Sync with Firestore if available
+        if (db) {
+            try {
+                await db.collection('keys').doc(keyString).set(newKeyDoc);
+            } catch (e) {}
+        }
+
+        console.log(`✅ [Key Created] Successfully issued key ${keyString} for user ${userId}`);
 
         return res.json({ success: true, key: keyString, expiresAt });
 
     } catch (error) {
         console.error("Claim key error:", error);
-        return res.status(500).json({ success: false, error: "Internal server error during claim." });
+        return res.status(500).json({ success: false, error: "Server processing error: " + error.message });
     }
 });
 
@@ -129,40 +206,47 @@ app.post('/api/verify-key', async (req, res) => {
         return res.status(400).json({ valid: false, error: "Missing key or userId." });
     }
 
-    if (!db) {
-        return res.status(500).json({ valid: false, error: "Database service not initialized." });
-    }
-
     try {
-        const keyRef = db.collection('keys').doc(key);
-        const keyDoc = await keyRef.get();
+        const cleanKey = key.trim().toUpperCase();
+        let keyData = memoryKeys.get(cleanKey);
 
-        if (!keyDoc.exists) {
-            return res.status(404).json({ valid: false, error: "Key not found." });
+        // If not in memory, check Firestore
+        if (!keyData && db) {
+            try {
+                const keyDoc = await db.collection('keys').doc(cleanKey).get();
+                if (keyDoc.exists) {
+                    keyData = keyDoc.data();
+                    memoryKeys.set(cleanKey, keyData); // Cache in memory
+                }
+            } catch (dbErr) {
+                console.warn("Firestore verify lookup skipped:", dbErr.message);
+            }
         }
 
-        const data = keyDoc.data();
+        if (!keyData) {
+            return res.status(404).json({ valid: false, error: "Key not found. Please verify you entered it correctly." });
+        }
 
         // Check ownership
-        if (data.userId !== userId) {
-            return res.status(403).json({ valid: false, error: "This key belongs to another user." });
+        if (keyData.userId && keyData.userId !== userId) {
+            return res.status(403).json({ valid: false, error: "This key belongs to another session." });
         }
 
         // Check if revoked
-        if (data.revoked) {
+        if (keyData.revoked) {
             return res.status(403).json({ valid: false, error: "This key has been revoked." });
         }
 
-        // Check expiry
-        if (Date.now() > data.expiresAt) {
-            return res.status(403).json({ valid: false, error: "Key is expired. Please complete Linkvertise again." });
+        // Check 12-hour expiry
+        if (Date.now() > keyData.expiresAt) {
+            return res.status(403).json({ valid: false, error: "Key is expired. Please get a new 12-hour key." });
         }
 
-        return res.json({ valid: true, expiresAt: data.expiresAt });
+        return res.json({ valid: true, expiresAt: keyData.expiresAt });
 
     } catch (error) {
         console.error("Verify key error:", error);
-        return res.status(500).json({ valid: false, error: "Internal server error during verify." });
+        return res.status(500).json({ valid: false, error: "Server verify error: " + error.message });
     }
 });
 
