@@ -120,7 +120,9 @@ app.post('/api/claim-key', async (req, res) => {
         }
 
         // 2. Verify hash with Linkvertise Anti-Bypassing API
-        let isValidHash = true;
+        let isValidHash = false;
+        let lvErrorMsg = "Invalid Linkvertise verification hash.";
+        
         try {
             const lvResponse = await fetch('https://publisher.linkvertise.com/api/v1/anti_bypassing', {
                 method: 'POST',
@@ -143,15 +145,17 @@ app.post('/api/claim-key', async (req, res) => {
                     error: lvData.message || lvData.error || "Invalid or expired Linkvertise completion hash." 
                 });
             } else {
-                isValidHash = typeof hash === 'string' && hash.length >= 8;
+                isValidHash = false;
+                lvErrorMsg = "Verification failed. Hash is not recognized by Linkvertise.";
             }
         } catch (lvErr) {
-            console.warn("Linkvertise verification network skip:", lvErr.message);
-            isValidHash = typeof hash === 'string' && hash.length >= 8;
+            console.warn("Linkvertise verification network error:", lvErr.message);
+            isValidHash = false;
+            lvErrorMsg = "Verification Server is busy. Please try clicking Confirm again in 5 seconds.";
         }
 
         if (!isValidHash) {
-            return res.status(403).json({ success: false, error: "Invalid Linkvertise verification hash." });
+            return res.status(403).json({ success: false, error: lvErrorMsg });
         }
 
         // 3. Mark hash as used
