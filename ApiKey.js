@@ -153,25 +153,27 @@ app.post('/api/create-lootlabs-locker', async (req, res) => {
         });
 
         const llData = await llResponse.json().catch(() => ({}));
-        console.log("[LootLabs create-locker]", llResponse.status, JSON.stringify(llData).slice(0, 200));
+        console.log("[LootLabs create-locker]", llResponse.status, JSON.stringify(llData).slice(0, 300));
 
-        if (llResponse.ok && (llData.type === 'created' || llData.type === 'fetch' || llData.type === 'fetched') && llData.message) {
-            const locker = llData.message;
-            const lootUrl = locker.loot_url || (locker.short ? `https://loot-link.com/s?${locker.short}` : null);
-            if (lootUrl) {
-                return res.json({
-                    success: true,
-                    lockerUrl: lootUrl,
-                    postbackValue
-                });
-            }
-            return res.status(500).json({ success: false, error: "LootLabs did not return a locker URL." });
+        // LootLabs returns message as an array (sometimes single object) — handle both
+        let locker = null;
+        if (Array.isArray(llData.message) && llData.message.length > 0) {
+            locker = llData.message[0];
+        } else if (llData.message && typeof llData.message === 'object') {
+            locker = llData.message;
         }
 
-        return res.status(500).json({
-            success: false,
-            error: (llData && llData.message) ? llData.message : "Failed to create LootLabs locker."
-        });
+        if (llResponse.ok && locker && (locker.loot_url || locker.short)) {
+            const lootUrl = locker.loot_url || `https://lootdest.org/s?${locker.short}`;
+            return res.json({
+                success: true,
+                lockerUrl: lootUrl,
+                postbackValue
+            });
+        }
+
+        const errMsg = (llData && llData.message) ? (typeof llData.message === 'string' ? llData.message : JSON.stringify(llData.message)) : "Failed to create LootLabs locker.";
+        return res.status(500).json({ success: false, error: errMsg });
     } catch (err) {
         console.error("LootLabs create error:", err.message);
         return res.status(500).json({ success: false, error: "LootLabs API error: " + err.message });
