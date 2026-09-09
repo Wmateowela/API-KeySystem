@@ -314,6 +314,41 @@ app.post('/api/claim-lootlabs-key', async (req, res) => {
     }
 });
 
+// LOCAL ONLY: Directly generate a LootLabs key without postback (for testing)
+app.post('/api/generate-lootlabs-key-local', async (req, res) => {
+    const { userId } = req.body;
+    if (!userId) {
+        return res.status(400).json({ success: false, error: "Missing userId." });
+    }
+
+    try {
+        // Generate key
+        const keyString = [1,2,3].map(() => crypto.randomBytes(2).toString('hex').toUpperCase()).join('-');
+        const now = Date.now();
+        const expiresAt = now + (12 * 60 * 60 * 1000);
+        const newKeyDoc = {
+            key: keyString,
+            userId: userId,
+            createdAt: now,
+            expiresAt: expiresAt,
+            revoked: false,
+            lootlabsLocal: true
+        };
+        memoryKeys.set(keyString, newKeyDoc);
+        if (db) {
+            try {
+                await db.collection('keys').doc(keyString).set(newKeyDoc);
+            } catch (e) {}
+        }
+
+        console.log(`[LootLabs Local] Key issued ${keyString} for user ${userId}`);
+        return res.json({ success: true, key: keyString, expiresAt });
+    } catch (err) {
+        console.error("LootLabs local generate error:", err);
+        return res.status(500).json({ success: false, error: "Server error: " + err.message });
+    }
+});
+
 // Browser GET helper for verify-key
 app.get('/api/verify-key', (req, res) => {
     res.json({ 
