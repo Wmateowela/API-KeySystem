@@ -132,8 +132,9 @@ app.post('/api/create-lootlabs-locker', async (req, res) => {
     }
 
     // Destination URL LootLabs will redirect user to after completion
-    // We pass the postbackValue in the URL so we can correlate on the frontend callback too
-    const destinationUrl = `${FRONTEND_BASE_URL}/key.html?lootlabs_done=${postbackValue}`;
+    // We pass the postbackValue in the URL fragment so it survives redirects
+    const requestedUrl = (req.body && typeof req.body.destinationUrl === 'string' && req.body.destinationUrl.trim()) ? req.body.destinationUrl.trim() : null;
+    const destinationUrl = requestedUrl ? `${requestedUrl}#lootlabs_done=${postbackValue}` : `${FRONTEND_BASE_URL}/key.html#lootlabs_done=${postbackValue}`;
 
     try {
         const llResponse = await fetch('https://creators.lootlabs.gg/api/public/content_locker', {
