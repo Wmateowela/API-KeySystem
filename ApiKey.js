@@ -58,14 +58,14 @@ const LINKVERTISE_TARGET_LINK = process.env.LINKVERTISE_TARGET_LINK || 'https://
 
 // LootLabs Configuration
 const LOOTLABS_API_TOKEN = process.env.LOOTLABS_API_TOKEN || '162b3c3519ec02bfbd0fc20ff5d6cd1fb10954357e0be1eeee7f00929c2d17e9';
-const LOOTLABS_TARGET_LINK = process.env.LOOTLABS_TARGET_LINK || 'https://buy-r-bl0x.web.app/key.html';
+const LOOTLABS_TARGET_LINK = process.env.LOOTLABS_TARGET_LINK || 'https://buy-robl0x.netlify.app/key.html';
 const LOOTLABS_TIER_ID = parseInt(process.env.LOOTLABS_TIER_ID || '1', 10);
 const LOOTLABS_NUM_TASKS = parseInt(process.env.LOOTLABS_NUM_TASKS || '3', 10);
 const LOOTLABS_THEME = parseInt(process.env.LOOTLABS_THEME || '1', 10);
 const LOOTLABS_POSTBACK_SECRET = process.env.LOOTLABS_POSTBACK_SECRET || 'buyroblox_lootlabs_secret_2026';
 
 // Frontend base URL (for postback redirects)
-const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || 'https://buy-r-bl0x.web.app';
+const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || 'https://buy-robl0x.netlify.app';
 
 // Middleware
 app.use(cors());
