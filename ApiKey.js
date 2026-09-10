@@ -12,6 +12,8 @@ const path = require('path');
 const memoryKeys = new Map();
 const memoryUsedHashes = new Map();
 const memoryLootlabsPending = new Map(); // postbackValue -> { userId, time, redeemed }
+const memoryBans = new Map();           // ip -> { ip, reason, banUntil, bannedAt, active }
+const onlineUsers = new Map();          // userId -> lastSeen (ms)
 
 // Initialize Firebase Admin
 let db = null;
@@ -181,6 +183,145 @@ async function getCountry(ip) {
     }
 }
 
+// ---------------- BAN HELPERS ----------------
+function normalizeIp(ip) {
+    if (!ip) return '';
+    // x-forwarded-for may contain a list
+    return String(ip).split(',')[0].trim();
+}
+
+// Returns ban record if this IP is currently banned, else null
+async function isIpBanned(rawIp) {
+    const ip = normalizeIp(rawIp);
+    if (!ip || ip === 'unknown' || ip === '127.0.0.1' || ip === '::1') return null;
+
+    const checkExpiry = (ban) => {
+        if (!ban || !ban.active) return null;
+        if (ban.banUntil && ban.banUntil > 0 && ban.banUntil <= Date.now()) return null; // expired
+        return ban;
+    };
+
+    // 1. Memory
+    const memBan = checkExpiry(memoryBans.get(ip));
+    if (memBan) return memBan;
+
+    // 2. Firestore
+    if (db) {
+        try {
+            const doc = await db.collection('bans').doc(encodeURIComponent(ip)).get();
+            if (doc.exists) {
+                const ban = { ip, ...doc.data() };
+                memoryBans.set(ip, ban);
+                return checkExpiry(ban);
+            }
+        } catch (e) { /* ignore */ }
+    }
+    return null;
+}
+
+async function saveBan(ip, durationMs, reason, bannedBy) {
+    const cleanIp = normalizeIp(ip);
+    const now = Date.now();
+    const banUntil = durationMs && durationMs > 0 ? now + durationMs : 0; // 0 = permanent
+    const ban = {
+        ip: cleanIp,
+        reason: reason || '',
+        bannedAt: now,
+        banUntil,
+        active: true,
+        bannedBy: bannedBy || 'admin'
+    };
+    memoryBans.set(cleanIp, ban);
+    if (db) {
+        try {
+            await db.collection('bans').doc(encodeURIComponent(cleanIp)).set(ban);
+        } catch (e) {
+            console.warn("Firestore ban save failed:", e.message);
+        }
+    }
+    return ban;
+}
+
+async function clearBan(ip) {
+    const cleanIp = normalizeIp(ip);
+    memoryBans.delete(cleanIp);
+    if (db) {
+        try {
+            await db.collection('bans').doc(encodeURIComponent(cleanIp)).delete();
+        } catch (e) { /* ignore */ }
+    }
+}
+
+// ---------------- ONLINE TRACKING ----------------
+const ONLINE_WINDOW_MS = 70 * 1000; // considered online if seen within 70s
+function markOnline(userId, ip) {
+    if (!userId) return;
+    onlineUsers.set(userId, Date.now());
+    if (ip) {
+        const key = `ip:${normalizeIp(ip)}`;
+        onlineUsers.set(key, Date.now());
+    }
+}
+function isUserOnline(userId) {
+    if (!userId) return false;
+    const t = onlineUsers.get(userId);
+    return !!t && (Date.now() - t) < ONLINE_WINDOW_MS;
+}
+function getOnlineUserIds() {
+    const now = Date.now();
+    const ids = [];
+    for (const [k, t] of onlineUsers.entries()) {
+        if (k.startsWith('ip:')) continue;
+        if (now - t < ONLINE_WINDOW_MS) ids.push(k);
+    }
+    return ids;
+}
+
+// ---------------- BAN ENFORCEMENT MIDDLEWARE ----------------
+// These routes are blocked when the caller's IP is banned.
+const BAN_PROTECTED_PATHS = new Set([
+    '/api/verify-key',
+    '/api/claim-key',
+    '/api/claim-lootlabs-key',
+    '/api/create-lootlabs-locker',
+    '/api/get-link'
+]);
+app.use(async (req, res, next) => {
+    if (req.method === 'POST' && BAN_PROTECTED_PATHS.has(req.path)) {
+        const ban = await isIpBanned(getClientIp(req));
+        if (ban) {
+            return res.status(403).json({
+                success: false,
+                valid: false,
+                banned: true,
+                reason: ban.reason || 'Violation of terms',
+                banUntil: ban.banUntil || 0,
+                error: 'Your access has been banned.'
+            });
+        }
+    }
+    next();
+});
+
+// Public: check if the current visitor is banned
+app.get('/api/check-ban', async (req, res) => {
+    const ban = await isIpBanned(getClientIp(req));
+    if (ban) {
+        return res.json({ banned: true, reason: ban.reason || '', banUntil: ban.banUntil || 0 });
+    }
+    res.json({ banned: false });
+});
+
+// Heartbeat: frontend pings this to appear "online" (real tracking)
+app.post('/api/heartbeat', rateLimit('verify'), (req, res) => {
+    const { userId } = req.body || {};
+    if (!userId || typeof userId !== 'string' || userId.length > 128 || !/^[a-zA-Z0-9_-]+$/.test(userId)) {
+        return res.status(400).json({ success: false, error: 'Invalid userId' });
+    }
+    markOnline(userId, getClientIp(req));
+    res.json({ success: true });
+});
+
 // Health Check Endpoint (Render & Frontend Health Probe)
 app.get(['/', '/health', '/api/health'], (req, res) => {
     res.json({
@@ -223,12 +364,16 @@ app.post('/api/create-lootlabs-locker', async (req, res) => {
 
     // Unique postbackValue that will be returned in postback GET request
     const postbackValue = crypto.randomBytes(16).toString('hex');
+    const userIp = getClientIp(req);
+    const userCountry = await getCountry(userIp);
 
-    // Store pending entry
+    // Store pending entry with user's real browser IP & country
     memoryLootlabsPending.set(postbackValue, {
         userId,
         time: Date.now(),
-        redeemed: false
+        redeemed: false,
+        ip: userIp,
+        country: userCountry
     });
     if (db) {
         try {
@@ -236,7 +381,9 @@ app.post('/api/create-lootlabs-locker', async (req, res) => {
                 userId,
                 createdAt: FieldValue.serverTimestamp(),
                 timestamp: Date.now(),
-                redeemed: false
+                redeemed: false,
+                ip: userIp,
+                country: userCountry
             });
         } catch (e) {}
     }
@@ -365,7 +512,7 @@ async function redeemLootlabsPostback(postbackValue, req) {
         } catch (e) {}
     }
 
-    const issued = await issueLootlabsKey(userId, matchedDocId, req);
+    const issued = await issueLootlabsKey(userId, matchedDocId, req, pending);
     console.log(`[LootLabs Postback] Key issued ${issued.key} for user ${userId}`);
     return { status: 200, message: "OK", key: issued.key, expiresAt: issued.expiresAt, userId };
 }
@@ -455,12 +602,16 @@ app.post('/api/dev/simulate-lootlabs-complete', async (req, res) => {
 });
 
 // Helper: issue a fresh LootLabs key for a user (shared by postback + claim)
-async function issueLootlabsKey(userId, postbackValue, req) {
+async function issueLootlabsKey(userId, postbackValue, req, pending = null) {
     const keyString = [1, 2, 3].map(() => crypto.randomBytes(2).toString('hex').toUpperCase()).join('-');
     const now = Date.now();
     const expiresAt = now + (12 * 60 * 60 * 1000);
-    const ip = getClientIp(req);
-    const country = await getCountry(ip);
+    
+    // Prefer the real user's IP and Country captured when they created the locker,
+    // instead of LootLabs postback server's US datacenter IP.
+    let ip = (pending && pending.ip && pending.ip !== 'unknown') ? pending.ip : getClientIp(req);
+    let country = (pending && pending.country && pending.country !== 'Unknown') ? pending.country : await getCountry(ip);
+
     const newKeyDoc = {
         key: keyString,
         userId: userId,
@@ -751,8 +902,29 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
         if (keyData.adminCreated) {
             let usedBy = Array.isArray(keyData.usedBy) ? [...keyData.usedBy] : [];
             const maxUsers = parseInt(keyData.maxUsers, 10) || 1;
+            const reqIp = normalizeIp(getClientIp(req));
 
-            if (usedBy.includes(userId)) {
+            if (keyData.ipCheck) {
+                // Sharing counted per unique IP -> people on the same home/wifi can share freely.
+                let usedIps = Array.isArray(keyData.usedIps) ? [...keyData.usedIps] : [];
+                if (usedIps.includes(reqIp)) {
+                    // same network -> allowed
+                } else if (usedIps.length >= maxUsers) {
+                    return res.status(403).json({ valid: false, error: `This key has reached its sharing limit (Max ${maxUsers} networks).` });
+                } else {
+                    usedIps.push(reqIp);
+                    if (!usedBy.includes(userId)) usedBy.push(userId);
+                    keyData.usedIps = usedIps;
+                    keyData.usedBy = usedBy;
+                    keyData.usedUsers = usedBy.length;
+                    memoryKeys.set(cleanKey, keyData);
+                    if (db) {
+                        try {
+                            await db.collection('keys').doc(cleanKey).update({ usedIps, usedBy, usedUsers: usedBy.length });
+                        } catch (e) {}
+                    }
+                }
+            } else if (usedBy.includes(userId)) {
                 // User already recognized
             } else {
                 if (usedBy.length >= maxUsers) {
@@ -887,7 +1059,26 @@ app.get('/api/admin/stats', verifyAdmin, rateLimit('admin'), async (req, res) =>
         const lootlabsCount = allKeys.filter(k => k.provider === 'lootlabs' || k.lootlabsPostback || k.lootlabsLocal).length;
         const adminCount = allKeys.filter(k => k.provider === 'admin' || k.adminCreated).length;
 
-        res.json({ totalKeys, activeKeys, expiredKeys, uniqueUsers, linkvertiseCount, lootlabsCount, adminCount });
+        // Online (real): users seen within the last window
+        const onlineUserIds = getOnlineUserIds();
+        const onlineCount = onlineUserIds.length;
+
+        // Banned: keys whose IP is currently banned (plus revoked)
+        let bannedCount = 0;
+        allKeys.forEach(k => {
+            const ban = k.ip ? memoryBans.get(normalizeIp(k.ip)) : null;
+            const ipBanned = !!(ban && ban.active && (!ban.banUntil || ban.banUntil > now));
+            if (k.revoked || ipBanned) bannedCount++;
+        });
+
+        const tierCounts = { basic: 0, plus: 0, vip: 0 };
+        allKeys.forEach(k => { if (tierCounts[k.tier] !== undefined) tierCounts[k.tier]++; });
+
+        res.json({
+            totalKeys, activeKeys, expiredKeys, uniqueUsers,
+            linkvertiseCount, lootlabsCount, adminCount,
+            onlineCount, bannedCount, tierCounts
+        });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -896,6 +1087,7 @@ app.get('/api/admin/stats', verifyAdmin, rateLimit('admin'), async (req, res) =>
 app.get('/api/admin/keys', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
         const search = (req.query.search || '').toLowerCase();
+        const sort = (req.query.sort || 'newest').toLowerCase();
         let keys = [];
 
         if (db) {
@@ -919,14 +1111,19 @@ app.get('/api/admin/keys', verifyAdmin, rateLimit('admin'), async (req, res) => 
                 (k.userId && k.userId.toLowerCase().includes(search)) ||
                 (k.note && k.note.toLowerCase().includes(search)) ||
                 (k.country && k.country.toLowerCase().includes(search)) ||
+                (k.tier && k.tier.toLowerCase().includes(search)) ||
                 (k.ip && k.ip.toLowerCase().includes(search))
             );
         }
 
-        keys.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-
-        const enriched = keys.map(k => {
+        const now = Date.now();
+        const enrichOne = (k) => {
             const provider = k.provider || (k.linkvertiseHash ? 'linkvertise' : (k.lootlabsPostback || k.lootlabsLocal ? 'lootlabs' : (k.adminCreated ? 'admin' : 'unknown')));
+            const isLifetime = !k.expiresAt || k.expiresAt === 0;
+            const expired = !isLifetime && k.expiresAt <= now;
+            const online = isUserOnline(k.userId) || (Array.isArray(k.usedBy) && k.usedBy.some(u => isUserOnline(u)));
+            const ipBan = k.ip ? memoryBans.get(normalizeIp(k.ip)) : null;
+            const ipBanned = !!(ipBan && ipBan.active && (!ipBan.banUntil || ipBan.banUntil > now));
             return {
                 key: k.key,
                 provider: provider,
@@ -935,13 +1132,57 @@ app.get('/api/admin/keys', verifyAdmin, rateLimit('admin'), async (req, res) => 
                 country: k.country || '-',
                 expiresAt: k.expiresAt || 0,
                 revoked: k.revoked || false,
+                expired: expired,
+                online: online,
+                banned: (k.revoked || false) || ipBanned,
+                banUntil: ipBan ? (ipBan.banUntil || 0) : 0,
                 createdAt: k.createdAt || 0,
                 maxUsers: k.maxUsers || 1,
                 usedUsers: Array.isArray(k.usedBy) ? k.usedBy.length : (k.usedUsers || 0),
                 usedBy: k.usedBy || [],
+                usedIps: k.usedIps || [],
+                ipCheck: !!k.ipCheck,
+                tier: k.tier || 'none',
                 note: k.note || ''
             };
-        });
+        };
+
+        let enriched = keys.map(enrichOne);
+
+        // Sorting / grouping. Most options group matching keys first, then newest.
+        const newest = (a, b) => (b.createdAt || 0) - (a.createdAt || 0);
+        const isActive = (k) => !k.revoked && !k.expired && (k.expiresAt === 0 || k.expiresAt > now);
+        switch (sort) {
+            case 'expire':
+                enriched.sort((a, b) => {
+                    const ae = (a.expiresAt === 0) ? Infinity : a.expiresAt;
+                    const be = (b.expiresAt === 0) ? Infinity : b.expiresAt;
+                    return ae - be;
+                });
+                break;
+            case 'active':
+                enriched.sort((a, b) => (isActive(b) ? 1 : 0) - (isActive(a) ? 1 : 0) || newest(a, b));
+                break;
+            case 'online':
+                enriched.sort((a, b) => (b.online ? 1 : 0) - (a.online ? 1 : 0) || newest(a, b));
+                break;
+            case 'ban':
+                enriched.sort((a, b) => (b.banned ? 1 : 0) - (a.banned ? 1 : 0) || newest(a, b));
+                break;
+            case 'vip':
+            case 'basic':
+            case 'plus':
+                enriched.sort((a, b) => ((b.tier === sort) ? 1 : 0) - ((a.tier === sort) ? 1 : 0) || newest(a, b));
+                break;
+            case 'admin':
+            case 'lootlabs':
+            case 'linkvertise':
+            case 'advertise':
+                enriched.sort((a, b) => ((b.provider === sort) ? 1 : 0) - ((a.provider === sort) ? 1 : 0) || newest(a, b));
+                break;
+            default:
+                enriched.sort(newest);
+        }
 
         res.json({ keys: enriched });
     } catch (e) {
@@ -951,13 +1192,35 @@ app.get('/api/admin/keys', verifyAdmin, rateLimit('admin'), async (req, res) => 
 
 app.post('/api/admin/create-key', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
-        const { prefix, duration, maxUsers, note } = req.body;
-        const keyString = (prefix || '') + [1,2,3].map(() => crypto.randomBytes(2).toString('hex').toUpperCase()).join('-');
+        const { prefix, name, duration, maxUsers, note, customKey, useCustomKey, ipCheck, tier } = req.body;
         const now = Date.now();
         const durationNum = parseInt(duration, 10);
         const expiresAt = (durationNum === 0 || isNaN(durationNum)) ? 0 : now + durationNum;
+
+        // Custom key support (user typed / pre-filled a specific key)
+        let keyString;
+        if (useCustomKey && customKey && String(customKey).trim()) {
+            keyString = String(customKey).trim().toUpperCase().replace(/[^A-Z0-9-]/g, '');
+            if (keyString.length < 6 || keyString.length > 64) {
+                return res.status(400).json({ error: 'Custom key must be 6-64 characters (A-Z, 0-9, dash).' });
+            }
+            if (memoryKeys.has(keyString)) {
+                return res.status(409).json({ error: 'A key with this value already exists.' });
+            }
+            if (db) {
+                try {
+                    const existing = await db.collection('keys').doc(keyString).get();
+                    if (existing.exists) return res.status(409).json({ error: 'A key with this value already exists.' });
+                } catch (e) { /* ignore */ }
+            }
+        } else {
+            const keyName = (name || prefix || '').toString().trim().toUpperCase().replace(/[^A-Z0-9-]/g, '');
+            keyString = keyName + [1,2,3].map(() => crypto.randomBytes(2).toString('hex').toUpperCase()).join('-');
+        }
+
         const ip = getClientIp(req);
         const country = await getCountry(ip);
+        const cleanTier = ['basic', 'plus', 'vip'].includes(String(tier || '').toLowerCase()) ? String(tier).toLowerCase() : 'none';
 
         const newKey = {
             key: keyString,
@@ -970,6 +1233,9 @@ app.post('/api/admin/create-key', verifyAdmin, rateLimit('admin'), async (req, r
             maxUsers: parseInt(maxUsers, 10) || 1,
             usedBy: [],
             usedUsers: 0,
+            usedIps: [],
+            ipCheck: !!ipCheck,   // when true -> sharing counted per unique IP (same home/wifi allowed)
+            tier: cleanTier,
             note: note || '',
             ip: ip,
             country: country
@@ -983,7 +1249,7 @@ app.post('/api/admin/create-key', verifyAdmin, rateLimit('admin'), async (req, r
                 console.warn("Firestore create-key write failed, key retained in memory:", fsErr.message);
             }
         }
-        res.json({ success: true, key: keyString, expiresAt });
+        res.json({ success: true, key: keyString, expiresAt, tier: cleanTier, ipCheck: !!ipCheck });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -1051,34 +1317,127 @@ app.delete('/api/admin/delete-key/:key', verifyAdmin, rateLimit('admin'), async 
     }
 });
 
-app.post('/api/admin/extend-key/:key', verifyAdmin, rateLimit('admin'), async (req, res) => {
+// BAN: revoke a key AND ban its associated IP (with optional timer)
+app.post('/api/admin/ban-key/:key', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
         const key = req.params.key.toUpperCase();
-        const { hours } = req.body;
-        if (!hours || hours <= 0) return res.status(400).json({ error: 'Invalid hours' });
-        
+        const { durationMs, reason } = req.body || {};
         let data = memoryKeys.get(key);
         if (!data && db) {
             const doc = await db.collection('keys').doc(key).get();
             if (doc.exists) data = doc.data();
         }
-
         if (!data) return res.status(404).json({ error: 'Key not found' });
-        
-        // If already expired, extend from now; otherwise extend from expiresAt
-        const baseTime = (data.expiresAt && data.expiresAt > Date.now()) ? data.expiresAt : Date.now();
-        data.expiresAt = baseTime + (hours * 3600000);
-        data.revoked = false; // unrevoke if extended
+
+        // Revoke the key
+        data.revoked = true;
+        memoryKeys.set(key, data);
+        if (db) {
+            try { await db.collection('keys').doc(key).update({ revoked: true }); } catch (e) {}
+        }
+
+        // Ban the IP if available
+        const banIp = data.ip && data.ip !== '-' ? data.ip : null;
+        let ban = null;
+        if (banIp) {
+            ban = await saveBan(banIp, parseInt(durationMs, 10) || 0, reason || 'Key banned by admin', req.adminEmail);
+        }
+        res.json({ success: true, bannedIp: banIp, ban });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// BAN an arbitrary IP
+app.post('/api/admin/ban-ip', verifyAdmin, rateLimit('admin'), async (req, res) => {
+    try {
+        const { ip, durationMs, reason } = req.body || {};
+        if (!ip || !normalizeIp(ip)) return res.status(400).json({ error: 'IP is required' });
+        const ban = await saveBan(ip, parseInt(durationMs, 10) || 0, reason || 'Banned by admin', req.adminEmail);
+        res.json({ success: true, ban });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/admin/unban-ip', verifyAdmin, rateLimit('admin'), async (req, res) => {
+    try {
+        const { ip } = req.body || {};
+        if (!ip) return res.status(400).json({ error: 'IP is required' });
+        await clearBan(ip);
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/admin/bans', verifyAdmin, rateLimit('admin'), async (req, res) => {
+    try {
+        const now = Date.now();
+        let bans = [];
+        if (db) {
+            try {
+                const snapshot = await db.collection('bans').get();
+                snapshot.forEach(doc => {
+                    const b = doc.data();
+                    if (b.active && (!b.banUntil || b.banUntil > now)) {
+                        bans.push({ ip: b.ip, ...b });
+                        memoryBans.set(b.ip, b);
+                    }
+                });
+            } catch (e) {
+                bans = Array.from(memoryBans.values());
+            }
+        } else {
+            bans = Array.from(memoryBans.values());
+        }
+        bans = bans.filter(b => b.active && (!b.banUntil || b.banUntil > now));
+        bans.sort((a, b) => (b.bannedAt || 0) - (a.bannedAt || 0));
+        res.json({ bans });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/admin/extend-key/:key', verifyAdmin, rateLimit('admin'), async (req, res) => {
+    try {
+        const key = req.params.key.toUpperCase();
+        let { hours, minutes, deltaMs } = req.body || {};
+        hours = parseInt(hours, 10) || 0;
+        minutes = parseInt(minutes, 10) || 0;
+
+        let changeMs = (typeof deltaMs === 'number') ? deltaMs : (hours * 3600000 + minutes * 60000);
+        if (!changeMs) return res.status(400).json({ error: 'No time change provided. Use hours/minutes (can be negative).' });
+
+        let data = memoryKeys.get(key);
+        if (!data && db) {
+            const doc = await db.collection('keys').doc(key).get();
+            if (doc.exists) data = doc.data();
+        }
+        if (!data) return res.status(404).json({ error: 'Key not found' });
+
+        // Lifetime keys (expiresAt === 0) cannot be reduced; allow positive to convert to timed? Keep simple: skip.
+        if (!data.expiresAt || data.expiresAt === 0) {
+            if (changeMs <= 0) return res.status(400).json({ error: 'Cannot reduce a lifetime key.' });
+            data.expiresAt = Date.now() + changeMs;
+        } else {
+            // If already expired, base is "now"; otherwise base is current expiry (so +/- applied to remaining time)
+            const baseTime = (data.expiresAt > Date.now()) ? data.expiresAt : Date.now();
+            data.expiresAt = baseTime + changeMs;
+        }
+
+        // Only un-revoke when time is added
+        if (changeMs > 0) data.revoked = false;
 
         memoryKeys.set(key, data);
         if (db) {
             try {
-                await db.collection('keys').doc(key).update({ expiresAt: data.expiresAt, revoked: false });
+                await db.collection('keys').doc(key).update({ expiresAt: data.expiresAt, revoked: data.revoked });
             } catch (fsErr) {
                 console.warn("Firestore extend write failed:", fsErr.message);
             }
         }
-        res.json({ success: true, expiresAt: data.expiresAt });
+        res.json({ success: true, expiresAt: data.expiresAt, changeMs });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -1087,8 +1446,10 @@ app.post('/api/admin/extend-key/:key', verifyAdmin, rateLimit('admin'), async (r
 app.post('/api/admin/purge-expired', verifyAdmin, async (req, res) => {
     try {
         const now = Date.now();
-        const sevenDays = 7 * 24 * 3600000;
-        const cutoff = now - sevenDays;
+        const force = !!(req.body && req.body.force);
+        // Default: remove keys expired for more than 3 days.
+        // force=true (manual click): remove ALL currently expired keys immediately.
+        const cutoff = force ? now : (now - 3 * 24 * 3600000);
         let deletedCount = 0;
 
         if (db) {
@@ -1117,7 +1478,7 @@ app.post('/api/admin/purge-expired', verifyAdmin, async (req, res) => {
             }
         }
 
-        res.json({ success: true, deleted: deletedCount });
+        res.json({ success: true, deleted: deletedCount, force });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -1232,12 +1593,177 @@ app.get('/api/announcements/active', async (req, res) => {
     }
 });
 
-// Background Auto-Purge job: runs every 6 hours to clean expired keys > 7 days
+// ============================================================
+// SUPPORT: BUG REPORTS & FEATURE SUGGESTIONS
+// ============================================================
+function todayKey() {
+    return new Date().toISOString().slice(0, 10);
+}
+
+// Public: submit a bug report or feature suggestion (max 1 of each per user per day)
+app.post('/api/support/submit', rateLimit('claim'), async (req, res) => {
+    try {
+        const { userId, type, message, email } = req.body || {};
+        if (!userId || typeof userId !== 'string' || userId.length > 128 || !/^[a-zA-Z0-9_-]+$/.test(userId)) {
+            return res.status(400).json({ success: false, error: 'Invalid userId.' });
+        }
+        const kind = (type === 'suggestion') ? 'suggestion' : 'bug';
+        const text = String(message || '').trim();
+        if (text.length < 5 || text.length > 2000) {
+            return res.status(400).json({ success: false, error: 'Message must be between 5 and 2000 characters.' });
+        }
+        const emailClean = email ? String(email).trim().slice(0, 160) : '';
+
+        if (!db) {
+            return res.status(503).json({ success: false, error: 'Submissions are temporarily unavailable. Please try later.' });
+        }
+
+        const day = todayKey();
+        // Enforce 1 per type per user per day
+        const existingSnap = await db.collection('supportRequests')
+            .where('userId', '==', userId)
+            .where('type', '==', kind)
+            .where('dayKey', '==', day)
+            .limit(1)
+            .get();
+        if (!existingSnap.empty) {
+            return res.status(429).json({ success: false, error: `You can send only one ${kind === 'bug' ? 'bug report' : 'feature suggestion'} per day.` });
+        }
+
+        // Uniqueness check for suggestions (exact normalized match)
+        let unique = false;
+        if (kind === 'suggestion') {
+            const norm = text.toLowerCase().replace(/\s+/g, ' ');
+            const dupSnap = await db.collection('supportRequests')
+                .where('type', '==', 'suggestion')
+                .where('normalizedMessage', '==', norm)
+                .limit(1)
+                .get();
+            unique = dupSnap.empty;
+        }
+
+        const doc = {
+            userId,
+            type: kind,
+            message: text,
+            normalizedMessage: text.toLowerCase().replace(/\s+/g, ' '),
+            email: emailClean,
+            status: 'pending',
+            unique,
+            keyIssued: false,
+            issuedKey: null,
+            createdAt: Date.now(),
+            createdAtIso: new Date().toISOString(),
+            dayKey: day
+        };
+        const ref = await db.collection('supportRequests').add(doc);
+
+        let note = '';
+        if (kind === 'suggestion') {
+            note = unique
+                ? 'Thanks! Your suggestion is unique. If approved, you will get a FREE 24-hour key.'
+                : 'Thanks! This idea was already suggested before, so it may not qualify for the free key.';
+            note += emailClean
+                ? ' We will contact you at ' + emailClean + ' if approved.'
+                : ' Add your email next time so we can send you the reward key if approved.';
+        } else {
+            note = 'Thanks for the bug report! Our team will review it soon.';
+            if (emailClean) note += ' We will contact you at ' + emailClean + ' if needed.';
+        }
+
+        res.json({ success: true, id: ref.id, unique, message: note });
+    } catch (e) {
+        console.error('Support submit error:', e.message);
+        res.status(500).json({ success: false, error: 'Server error. Please try again.' });
+    }
+});
+
+// Public: view my own submissions (so user can see if a key was issued)
+app.get('/api/support/mine', async (req, res) => {
+    try {
+        const userId = req.query.userId;
+        if (!userId || !/^[a-zA-Z0-9_-]+$/.test(userId)) return res.status(400).json({ success: false, error: 'Invalid userId' });
+        if (!db) return res.json({ requests: [] });
+        const snap = await db.collection('supportRequests').where('userId', '==', userId).limit(50).get();
+        const requests = [];
+        snap.forEach(d => requests.push({ id: d.id, ...d.data() }));
+        requests.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        res.json({ requests });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// Admin: list all support requests
+app.get('/api/admin/support', verifyAdmin, rateLimit('admin'), async (req, res) => {
+    try {
+        if (!db) return res.json({ requests: [] });
+        const snap = await db.collection('supportRequests').get();
+        const requests = [];
+        snap.forEach(d => requests.push({ id: d.id, ...d.data() }));
+        requests.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        res.json({ requests });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Admin: approve / reject a request (approve issues a FREE 24h key to that user)
+app.post('/api/admin/support/:id/action', verifyAdmin, rateLimit('admin'), async (req, res) => {
+    try {
+        if (!db) return res.status(503).json({ error: 'Firestore unavailable' });
+        const { action } = req.body || {};
+        const ref = db.collection('supportRequests').doc(req.params.id);
+        const doc = await ref.get();
+        if (!doc.exists) return res.status(404).json({ error: 'Request not found' });
+        const data = doc.data();
+
+        if (action === 'reject') {
+            await ref.update({ status: 'rejected', resolvedAt: Date.now() });
+            return res.json({ success: true, status: 'rejected' });
+        }
+
+        if (action === 'approve') {
+            // Issue a free 24h key for this user
+            const keyString = [1,2,3].map(() => crypto.randomBytes(2).toString('hex').toUpperCase()).join('-');
+            const now = Date.now();
+            const expiresAt = now + (24 * 60 * 60 * 1000);
+            const newKey = {
+                key: keyString,
+                userId: data.userId,
+                createdAt: now,
+                expiresAt,
+                revoked: false,
+                adminCreated: true,
+                provider: 'admin',
+                maxUsers: 1,
+                usedBy: [],
+                usedUsers: 0,
+                usedIps: [],
+                ipCheck: false,
+                tier: 'none',
+                note: `Reward for approved ${data.type} (${data.userId})`,
+                ip: '-',
+                country: '-'
+            };
+            memoryKeys.set(keyString, newKey);
+            try { await db.collection('keys').doc(keyString).set(newKey); } catch (e) {}
+            await ref.update({ status: 'approved', keyIssued: true, issuedKey: keyString, issuedExpiresAt: expiresAt, resolvedAt: now });
+            return res.json({ success: true, status: 'approved', key: keyString, expiresAt });
+        }
+
+        return res.status(400).json({ error: 'Invalid action. Use approve or reject.' });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Background Auto-Purge job: runs every 6 hours to clean expired keys > 3 days
 setInterval(async () => {
     try {
         const now = Date.now();
-        const sevenDays = 7 * 24 * 3600000;
-        const cutoff = now - sevenDays;
+        const threeDays = 3 * 24 * 3600000;
+        const cutoff = now - threeDays;
 
         if (db) {
             const snapshot = await db.collection('keys').get();
@@ -1252,7 +1778,7 @@ setInterval(async () => {
             });
             if (count > 0) {
                 await batch.commit();
-                console.log(`🧹 [Auto-Purge Job] Removed ${count} keys older than 7 days.`);
+                console.log(`🧹 [Auto-Purge Job] Removed ${count} keys expired more than 3 days ago.`);
             }
         }
 
