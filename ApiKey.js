@@ -122,7 +122,7 @@ const RATE_LIMITS = {
     claim:        { windowMs: 60 * 1000,     max: 5  }, // 5 claims per minute per IP
     verify:       { windowMs: 60 * 1000,     max: 30 }, // 30 verifies per minute per IP
     admin:        { windowMs: 60 * 1000,     max: 60 }, // 60 admin calls per minute
-    lootlabsPost: { windowMs: 60 * 1000,     max: 25 }  // 25 postback/poll requests/min (frontend polls while waiting)
+    lootlabsPost: { windowMs: 60 * 1000,     max: 60 }  // 60 postback/poll requests/min for fast polling
 };
 
 function rateLimit(category) {
@@ -298,11 +298,50 @@ app.post('/api/create-lootlabs-locker', async (req, res) => {
 // Used by BOTH the real postback endpoint AND the dev-only simulate endpoint.
 async function redeemLootlabsPostback(postbackValue, req) {
     let pending = memoryLootlabsPending.get(postbackValue);
+    let matchedDocId = postbackValue;
+
     if (!pending && db) {
         try {
             const doc = await db.collection('lootlabsPending').doc(postbackValue).get();
-            if (doc.exists) pending = doc.data();
+            if (doc.exists) {
+                pending = doc.data();
+                matchedDocId = postbackValue;
+            }
         } catch (e) {}
+    }
+
+    // Fallback: If not found by direct doc ID, search recent unredeemed pending records (last 15 mins)
+    if (!pending && db) {
+        try {
+            const fifteenMinsAgo = Date.now() - (15 * 60 * 1000);
+            const snapshot = await db.collection('lootlabsPending')
+                .where('redeemed', '==', false)
+                .where('timestamp', '>=', fifteenMinsAgo)
+                .orderBy('timestamp', 'desc')
+                .limit(1)
+                .get();
+
+            if (!snapshot.empty) {
+                const doc = snapshot.docs[0];
+                pending = doc.data();
+                matchedDocId = doc.id;
+                console.log(`[LootLabs Postback] Found unredeemed pending record via fallback: ${matchedDocId} for user ${pending.userId}`);
+            }
+        } catch (e) {
+            console.warn("[LootLabs Postback fallback search error]:", e.message);
+        }
+    }
+
+    // Memory fallback if still not found
+    if (!pending) {
+        for (const [key, val] of memoryLootlabsPending.entries()) {
+            if (key.startsWith('__')) continue;
+            if (!val.redeemed && val.time > Date.now() - (15 * 60 * 1000)) {
+                pending = val;
+                matchedDocId = key;
+                break;
+            }
+        }
     }
 
     if (!pending) {
@@ -319,23 +358,21 @@ async function redeemLootlabsPostback(postbackValue, req) {
 
     // Mark redeemed FIRST (prevents any double issue)
     pending.redeemed = true;
-    memoryLootlabsPending.set(postbackValue, pending);
+    memoryLootlabsPending.set(matchedDocId, pending);
     if (db) {
         try {
-            await db.collection('lootlabsPending').doc(postbackValue).update({ redeemed: true, redeemedAt: FieldValue.serverTimestamp() });
+            await db.collection('lootlabsPending').doc(matchedDocId).update({ redeemed: true, redeemedAt: FieldValue.serverTimestamp() });
         } catch (e) {}
     }
 
-    const issued = await issueLootlabsKey(userId, postbackValue, req);
+    const issued = await issueLootlabsKey(userId, matchedDocId, req);
     console.log(`[LootLabs Postback] Key issued ${issued.key} for user ${userId}`);
     return { status: 200, message: "OK", key: issued.key, expiresAt: issued.expiresAt, userId };
 }
 
 // LootLabs Postback - LootLabs server sends GET request here when user completes the locker.
 // Configure this URL in your LootLabs panel postback settings:
-//   https://api-keysystem.onrender.com/api/lootlabs-postback?postbackValue={postbackValue}&secret=buyroblox_lootlabs_secret_2026
-// If LootLabs dashboard doesn't allow custom params, set STRICT_LOOTLABS_POSTBACK=false
-// (less secure, but more compatible).
+//   https://api-keysystem.onrender.com/api/lootlabs-postback?postbackValue={UNIQUE_ID}&clickId={CLICK_ID}&secret=buyroblox_lootlabs_secret_2026
 const recentLootlabsPostbacks = []; // last 20 postback attempts (for debugging)
 app.get('/api/lootlabs-postback', async (req, res) => {
     // Log EVERY postback attempt for debugging
@@ -348,8 +385,17 @@ app.get('/api/lootlabs-postback', async (req, res) => {
     if (recentLootlabsPostbacks.length > 20) recentLootlabsPostbacks.shift();
     console.log(`[LootLabs Postback RECEIVED] query=${JSON.stringify(req.query)} ip=${logEntry.ip}`);
 
-    // Accept postbackValue from any of these common param names
-    const postbackValue = req.query.postbackValue || req.query.postback || req.query.pbv || req.query.id;
+    // Accept postbackValue from any possible param name LootLabs might send
+    const postbackValue = req.query.postbackValue || 
+                          req.query.unique_id || 
+                          req.query.uniqueId || 
+                          req.query.UNIQUE_ID || 
+                          req.query.postback || 
+                          req.query.pbv || 
+                          req.query.clickId || 
+                          req.query.click_id || 
+                          req.query.CLICK_ID || 
+                          req.query.id;
     const { secret } = req.query;
 
     if (!postbackValue) {
@@ -361,7 +407,7 @@ app.get('/api/lootlabs-postback', async (req, res) => {
     const strictMode = process.env.STRICT_LOOTLABS_POSTBACK !== 'false';
     if (strictMode && LOOTLABS_POSTBACK_SECRET) {
         if (!secret || secret !== LOOTLABS_POSTBACK_SECRET) {
-            console.warn(`[LootLabs Postback] Invalid/missing secret. Got secret: ${secret ? 'present' : 'MISSING'}. Tip: add &secret=... to your LootLabs postback URL, or set STRICT_LOOTLABS_POSTBACK=false in env.`);
+            console.warn(`[LootLabs Postback] Invalid/missing secret. Got secret: ${secret ? 'present' : 'MISSING'}.`);
             return res.status(403).send("Invalid secret");
         }
     }
