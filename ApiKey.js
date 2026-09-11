@@ -12,8 +12,50 @@ const path = require('path');
 const memoryKeys = new Map();
 const memoryUsedHashes = new Map();
 const memoryLootlabsPending = new Map(); // postbackValue -> { userId, time, redeemed }
+const memoryWorkinkPending = new Map();  // postbackValue -> { userId, time, redeemed }
 const memoryBans = new Map();           // ip -> { ip, reason, banUntil, bannedAt, active }
 const onlineUsers = new Map();          // userId -> lastSeen (ms)
+
+// Provider key-duration config (admin-managed). Values are in hours.
+const DEFAULT_PROVIDER_DURATIONS = {
+    linkvertise: 6,
+    lootlabs: 2,
+    workink: 12
+};
+const memorySettings = {
+    providerDurations: { ...DEFAULT_PROVIDER_DURATIONS }
+};
+const PROVIDER_KEYS = ['linkvertise', 'lootlabs', 'workink'];
+const MIN_PROVIDER_HOURS = 1;
+const MAX_PROVIDER_HOURS = 24 * 365; // 1 year cap
+
+function getProviderDurationMs(provider) {
+    const hours = memorySettings.providerDurations[provider];
+    const safeHours = (typeof hours === 'number' && hours > 0) ? hours : (DEFAULT_PROVIDER_DURATIONS[provider] || 12);
+    return safeHours * 60 * 60 * 1000;
+}
+
+function getProviderDurationHours(provider) {
+    const hours = memorySettings.providerDurations[provider];
+    return (typeof hours === 'number' && hours > 0) ? hours : (DEFAULT_PROVIDER_DURATIONS[provider] || 12);
+}
+
+async function loadSettingsFromFirestore() {
+    if (!db) return;
+    try {
+        const doc = await db.collection('settings').doc('providerDurations').get();
+        if (doc.exists) {
+            const data = doc.data() || {};
+            PROVIDER_KEYS.forEach(p => {
+                const h = parseInt(data[p], 10);
+                if (!isNaN(h) && h > 0) memorySettings.providerDurations[p] = h;
+            });
+            console.log('✅ Loaded provider durations from Firestore:', memorySettings.providerDurations);
+        }
+    } catch (e) {
+        console.warn('Could not load provider durations:', e.message);
+    }
+}
 
 // Initialize Firebase Admin
 let db = null;
@@ -71,6 +113,7 @@ try {
                 firestoreAvailable = true;
                 console.log("✅ Firebase Admin initialized successfully.");
                 loadKeysFromFirestore();
+                loadSettingsFromFirestore();
             })
             .catch((e) => {
                 console.warn("⚠️ Firebase Admin initialized but Firestore unreachable:", e.message);
@@ -99,6 +142,13 @@ const LOOTLABS_NUM_TASKS = parseInt(process.env.LOOTLABS_NUM_TASKS || '5', 10);
 const LOOTLABS_THEME = parseInt(process.env.LOOTLABS_THEME || '1', 10);
 const LOOTLABS_POSTBACK_SECRET = process.env.LOOTLABS_POSTBACK_SECRET || 'buyroblox_lootlabs_secret_2026';
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'admin1234';
+
+// Work.ink Configuration
+const WORKINK_API_TOKEN = process.env.WORKINK_API_TOKEN || '264a4745-074d-4071-99ca-b7f4a34f1f37';
+const WORKINK_TARGET_LINK = process.env.WORKINK_TARGET_LINK || 'https://work.ink/2Dqp/unlock-the-12h-key';
+const WORKINK_LOCAL_LINK = process.env.WORKINK_LOCAL_LINK || 'https://work.ink/2Dqp/key-bylocal-side';
+const WORKINK_POSTBACK_SECRET = process.env.WORKINK_POSTBACK_SECRET || 'buyroblox_workink_secret_2026';
+const WORKINK_MIN_COMPLETE_SECS = parseInt(process.env.WORKINK_MIN_COMPLETE_SECS || '15', 10);
 
 // Frontend base URL (for postback redirects)
 const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || 'https://buy-robl0x.netlify.app';
@@ -284,6 +334,8 @@ const BAN_PROTECTED_PATHS = new Set([
     '/api/claim-key',
     '/api/claim-lootlabs-key',
     '/api/create-lootlabs-locker',
+    '/api/claim-workink-key',
+    '/api/create-workink-task',
     '/api/get-link'
 ]);
 app.use(async (req, res, next) => {
@@ -341,6 +393,65 @@ app.get('/api/get-link', (req, res) => {
 // Return target lootlabs url for frontend to navigate to
 app.get('/api/get-lootlabs-link', (req, res) => {
     res.json({ url: LOOTLABS_TARGET_LINK });
+});
+
+// Return target workink url for frontend to navigate to
+app.get('/api/get-workink-link', (req, res) => {
+    res.json({ url: WORKINK_TARGET_LINK });
+});
+
+// Public: provider key durations (hours) for the key page cards
+app.get('/api/provider-config', (req, res) => {
+    res.json({
+        success: true,
+        durations: {
+            linkvertise: getProviderDurationHours('linkvertise'),
+            lootlabs: getProviderDurationHours('lootlabs'),
+            workink: getProviderDurationHours('workink')
+        }
+    });
+});
+
+// Admin: get provider durations
+app.get('/api/admin/provider-config', verifyAdmin, rateLimit('admin'), (req, res) => {
+    res.json({
+        success: true,
+        durations: {
+            linkvertise: getProviderDurationHours('linkvertise'),
+            lootlabs: getProviderDurationHours('lootlabs'),
+            workink: getProviderDurationHours('workink')
+        }
+    });
+});
+
+// Admin: update provider durations (hours)
+app.post('/api/admin/provider-config', verifyAdmin, rateLimit('admin'), async (req, res) => {
+    try {
+        const body = req.body || {};
+        const updated = {};
+        for (const p of PROVIDER_KEYS) {
+            if (body[p] === undefined) continue;
+            const h = parseInt(body[p], 10);
+            if (isNaN(h) || h < MIN_PROVIDER_HOURS || h > MAX_PROVIDER_HOURS) {
+                return res.status(400).json({ success: false, error: `Invalid ${p} duration. Use ${MIN_PROVIDER_HOURS}-${MAX_PROVIDER_HOURS} hours.` });
+            }
+            memorySettings.providerDurations[p] = h;
+            updated[p] = h;
+        }
+        if (Object.keys(updated).length === 0) {
+            return res.status(400).json({ success: false, error: 'No valid durations provided.' });
+        }
+        if (db) {
+            try {
+                await db.collection('settings').doc('providerDurations').set(memorySettings.providerDurations, { merge: true });
+            } catch (e) {
+                console.warn('Could not persist provider durations:', e.message);
+            }
+        }
+        res.json({ success: true, durations: { ...memorySettings.providerDurations } });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
 });
 
 // Browser GET helper for claim-key
@@ -605,7 +716,7 @@ app.post('/api/dev/simulate-lootlabs-complete', async (req, res) => {
 async function issueLootlabsKey(userId, postbackValue, req, pending = null) {
     const keyString = [1, 2, 3].map(() => crypto.randomBytes(2).toString('hex').toUpperCase()).join('-');
     const now = Date.now();
-    const expiresAt = now + (12 * 60 * 60 * 1000);
+    const expiresAt = now + getProviderDurationMs('lootlabs');
     
     // Prefer the real user's IP and Country captured when they created the locker,
     // instead of LootLabs postback server's US datacenter IP.
@@ -711,6 +822,360 @@ app.post('/api/claim-lootlabs-key', rateLimit('lootlabsPost'), async (req, res) 
     }
 });
 
+// ============================================================
+// WORK.INK INTEGRATION
+// ============================================================
+
+// Create a Work.ink task for the current user
+app.post('/api/create-workink-task', async (req, res) => {
+    const { userId } = req.body;
+    if (!userId) {
+        return res.status(400).json({ success: false, error: "Missing userId." });
+    }
+
+    const postbackValue = crypto.randomBytes(16).toString('hex');
+    const userIp = getClientIp(req);
+    const userCountry = await getCountry(userIp);
+
+    memoryWorkinkPending.set(postbackValue, {
+        userId,
+        time: Date.now(),
+        redeemed: false,
+        ip: userIp,
+        country: userCountry
+    });
+    if (db) {
+        try {
+            await db.collection('workinkPending').doc(postbackValue).set({
+                userId,
+                createdAt: FieldValue.serverTimestamp(),
+                timestamp: Date.now(),
+                redeemed: false,
+                ip: userIp,
+                country: userCountry
+            });
+        } catch (e) {}
+    }
+
+    const requestedUrl = (req.body && typeof req.body.destinationUrl === 'string' && req.body.destinationUrl.trim()) ? req.body.destinationUrl.trim() : null;
+    const destinationUrl = requestedUrl ? `${requestedUrl}#workink_done=${postbackValue}` : `${FRONTEND_BASE_URL}/key.html#workink_done=${postbackValue}`;
+
+    try {
+        const wiResponse = await fetch('https://api.work.ink/v1/links', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Authorization': `Bearer ${WORKINK_API_TOKEN}`
+            },
+            body: JSON.stringify({
+                destination: destinationUrl,
+                title: 'Buy Roblox Key Verification',
+                postback: postbackValue
+            })
+        });
+
+        const wiData = await wiResponse.json().catch(() => ({}));
+        console.log("[Work.ink create-task]", wiResponse.status, JSON.stringify(wiData).slice(0, 300));
+
+        const taskUrl = wiData.url || wiData.link || wiData.short_url || (wiData.data && (wiData.data.url || wiData.data.link || wiData.data.short_url));
+
+        if (wiResponse.ok && taskUrl) {
+            return res.json({
+                success: true,
+                taskUrl: taskUrl,
+                postbackValue
+            });
+        }
+
+        // Fallback: use configured direct link or default
+        const directUrl = (WORKINK_TARGET_LINK && WORKINK_TARGET_LINK !== 'https://work.ink/') ? WORKINK_TARGET_LINK : `https://work.ink/`;
+        return res.json({
+            success: true,
+            taskUrl: directUrl,
+            postbackValue
+        });
+    } catch (err) {
+        console.error("Work.ink create error:", err.message);
+        const directUrl = (WORKINK_TARGET_LINK && WORKINK_TARGET_LINK !== 'https://work.ink/') ? WORKINK_TARGET_LINK : `https://work.ink/`;
+        return res.json({
+            success: true,
+            taskUrl: directUrl,
+            postbackValue
+        });
+    }
+});
+
+// Shared: process a verified Work.ink postback and issue the key.
+async function redeemWorkinkPostback(postbackValue, req) {
+    let pending = memoryWorkinkPending.get(postbackValue);
+    let matchedDocId = postbackValue;
+
+    if (!pending && db) {
+        try {
+            const doc = await db.collection('workinkPending').doc(postbackValue).get();
+            if (doc.exists) {
+                pending = doc.data();
+                matchedDocId = postbackValue;
+            }
+        } catch (e) {}
+    }
+
+    if (!pending && db) {
+        try {
+            const fifteenMinsAgo = Date.now() - (15 * 60 * 1000);
+            const snapshot = await db.collection('workinkPending')
+                .where('redeemed', '==', false)
+                .where('timestamp', '>=', fifteenMinsAgo)
+                .orderBy('timestamp', 'desc')
+                .limit(1)
+                .get();
+
+            if (!snapshot.empty) {
+                const doc = snapshot.docs[0];
+                pending = doc.data();
+                matchedDocId = doc.id;
+                console.log(`[Work.ink Postback] Found unredeemed pending record via fallback: ${matchedDocId} for user ${pending.userId}`);
+            }
+        } catch (e) {
+            console.warn("[Work.ink Postback fallback search error]:", e.message);
+        }
+    }
+
+    if (!pending) {
+        for (const [key, val] of memoryWorkinkPending.entries()) {
+            if (key.startsWith('__')) continue;
+            if (!val.redeemed && val.time > Date.now() - (15 * 60 * 1000)) {
+                pending = val;
+                matchedDocId = key;
+                break;
+            }
+        }
+    }
+
+    if (!pending) {
+        return { status: 404, message: "Unknown postbackValue" };
+    }
+    if (pending.redeemed) {
+        return { status: 200, message: "ALREADY_REDEEMED" };
+    }
+
+    const userId = pending.userId;
+    if (!userId) {
+        return { status: 400, message: "Missing userId in pending entry" };
+    }
+
+    pending.redeemed = true;
+    memoryWorkinkPending.set(matchedDocId, pending);
+    if (db) {
+        try {
+            await db.collection('workinkPending').doc(matchedDocId).update({ redeemed: true, redeemedAt: FieldValue.serverTimestamp() });
+        } catch (e) {}
+    }
+
+    const issued = await issueWorkinkKey(userId, matchedDocId, req, pending);
+    console.log(`[Work.ink Postback] Key issued ${issued.key} for user ${userId}`);
+    return { status: 200, message: "OK", key: issued.key, expiresAt: issued.expiresAt, userId };
+}
+
+// Work.ink Postback - Work.ink server sends GET/POST request here when user completes tasks.
+app.all('/api/workink-postback', async (req, res) => {
+    const params = { ...req.query, ...(req.body || {}) };
+    console.log(`[Work.ink Postback RECEIVED] params=${JSON.stringify(params)} ip=${getClientIp(req)}`);
+
+    const postbackValue = params.postbackValue ||
+                          params.postback ||
+                          params.unique_id ||
+                          params.uniqueId ||
+                          params.id ||
+                          params.token ||
+                          params.tx_id ||
+                          params.pbv;
+    const { secret } = params;
+
+    if (!postbackValue) {
+        console.warn(`[Work.ink Postback] No postbackValue in request. Got: ${JSON.stringify(params)}`);
+        return res.status(400).send("Missing postbackValue");
+    }
+
+    const strictMode = process.env.STRICT_WORKINK_POSTBACK === 'true';
+    if (strictMode && WORKINK_POSTBACK_SECRET) {
+        if (!secret || secret !== WORKINK_POSTBACK_SECRET) {
+            console.warn(`[Work.ink Postback] Invalid/missing secret.`);
+            return res.status(403).send("Invalid secret");
+        }
+    }
+
+    try {
+        const result = await redeemWorkinkPostback(postbackValue, req);
+        return res.status(result.status).send(result.message);
+    } catch (err) {
+        console.error("Work.ink postback error:", err);
+        return res.status(500).send("Server error");
+    }
+});
+
+// DEV ONLY: simulate a Work.ink postback for local testing.
+app.post('/api/dev/simulate-workink-complete', async (req, res) => {
+    const isCloudHost = !!(process.env.RENDER || process.env.RENDER_EXTERNAL_URL || process.env.DYNO || process.env.NODE_ENV === 'production');
+    const isDev = process.env.ENABLE_LOCAL_KEY_GEN === 'true' && !isCloudHost;
+    if (!isDev) {
+        return res.status(404).json({ success: false, error: "Endpoint not available." });
+    }
+
+    const { postbackValue } = req.body;
+    if (!postbackValue || typeof postbackValue !== 'string') {
+        return res.status(400).json({ success: false, error: "Missing postbackValue." });
+    }
+
+    try {
+        const result = await redeemWorkinkPostback(postbackValue, req);
+        return res.status(result.status).json({ success: result.status === 200, message: result.message, key: result.key, expiresAt: result.expiresAt });
+    } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// Helper: issue a fresh Work.ink key for a user
+async function issueWorkinkKey(userId, postbackValue, req, pending = null) {
+    const keyString = [1, 2, 3].map(() => crypto.randomBytes(2).toString('hex').toUpperCase()).join('-');
+    const now = Date.now();
+    const expiresAt = now + getProviderDurationMs('workink');
+
+    let ip = (pending && pending.ip && pending.ip !== 'unknown') ? pending.ip : getClientIp(req);
+    let country = (pending && pending.country && pending.country !== 'Unknown') ? pending.country : await getCountry(ip);
+
+    const newKeyDoc = {
+        key: keyString,
+        userId: userId,
+        createdAt: now,
+        expiresAt: expiresAt,
+        revoked: false,
+        provider: 'workink',
+        ip: ip,
+        country: country,
+        maxUsers: 1,
+        usedUsers: 1,
+        usedBy: [userId],
+        note: 'Generated via Work.ink',
+        workinkPostback: postbackValue || null
+    };
+    memoryKeys.set(keyString, newKeyDoc);
+    let firestoreOk = true;
+    if (db) {
+        try {
+            await db.collection('keys').doc(keyString).set(newKeyDoc);
+        } catch (e) {
+            console.error(`[Firestore] Failed to persist key ${keyString}:`, e.message);
+            firestoreOk = false;
+        }
+        try {
+            await db.collection('workinkClaimed').doc(userId).set({
+                key: keyString,
+                expiresAt: expiresAt,
+                issuedAt: FieldValue.serverTimestamp()
+            });
+        } catch (e) {
+            console.error(`[Firestore] Failed to persist claim for ${userId}:`, e.message);
+        }
+    } else {
+        console.warn('[Firestore] db not initialized - key only in memory');
+        firestoreOk = false;
+    }
+    memoryWorkinkPending.set(`__claimed_${userId}`, { key: keyString, expiresAt, time: now });
+    console.log(`[Key Issued] ${keyString} for ${userId} via Work.ink (firestore: ${firestoreOk})`);
+    return { key: keyString, expiresAt };
+}
+
+// Frontend polls / claims a Work.ink-issued key after being redirected back
+app.post('/api/claim-workink-key', rateLimit('lootlabsPost'), async (req, res) => {
+    const { userId, postbackValue } = req.body;
+    if (!userId) {
+        return res.status(400).json({ success: false, error: "Missing userId." });
+    }
+
+    if (typeof userId !== 'string' || userId.length > 128 || !/^[a-zA-Z0-9_-]+$/.test(userId)) {
+        return res.status(400).json({ success: false, error: "Invalid userId format." });
+    }
+    if (!postbackValue || typeof postbackValue !== 'string' || postbackValue.length > 128) {
+        return res.status(400).json({ success: false, error: "Missing or invalid postbackValue." });
+    }
+
+    try {
+        // 1. Already claimed? Return cached key
+        const memClaimed = memoryWorkinkPending.get(`__claimed_${userId}`);
+        if (memClaimed && memClaimed.expiresAt > Date.now()) {
+            return res.json({ success: true, key: memClaimed.key, expiresAt: memClaimed.expiresAt });
+        }
+
+        if (db) {
+            try {
+                const doc = await db.collection('workinkClaimed').doc(userId).get();
+                if (doc.exists) {
+                    const data = doc.data();
+                    if (data.expiresAt && data.expiresAt > Date.now()) {
+                        memoryWorkinkPending.set(`__claimed_${userId}`, { key: data.key, expiresAt: data.expiresAt, time: Date.now() });
+                        return res.json({ success: true, key: data.key, expiresAt: data.expiresAt });
+                    }
+                }
+            } catch (e) {}
+        }
+
+        // 2. Already issued via server postback? Scan memory keys
+        for (const [k, v] of memoryKeys.entries()) {
+            if (v.userId === userId && v.workinkPostback === postbackValue && v.expiresAt > Date.now()) {
+                return res.json({ success: true, key: k, expiresAt: v.expiresAt });
+            }
+        }
+
+        // 3. Scan Firestore keys collection if not in memory (in case server restarted)
+        if (db && postbackValue) {
+            try {
+                const snap = await db.collection('keys')
+                    .where('workinkPostback', '==', postbackValue)
+                    .where('userId', '==', userId)
+                    .limit(1)
+                    .get();
+                if (!snap.empty) {
+                    const doc = snap.docs[0].data();
+                    if (doc.expiresAt > Date.now() && !doc.revoked) {
+                        memoryKeys.set(doc.key, doc);
+                        return res.json({ success: true, key: doc.key, expiresAt: doc.expiresAt });
+                    }
+                }
+            } catch (e) {}
+        }
+
+        // 4. Verify with Work.ink Key System API:
+        // When Work.ink redirects to key.html#token={TOKEN}, postbackValue is the token.
+        // Check validity with Work.ink: GET https://work.ink/_api/v2/token/isValid/{token}?deleteToken=1
+        if (postbackValue) {
+            try {
+                const wiRes = await fetch(`https://work.ink/_api/v2/token/isValid/${encodeURIComponent(postbackValue)}?deleteToken=1`);
+                const wiData = await wiRes.json().catch(() => ({}));
+                console.log(`[Work.ink Token Check] ${postbackValue} ->`, wiData);
+
+                if (wiData && wiData.valid === true) {
+                    const issued = await issueWorkinkKey(userId, postbackValue, req);
+                    console.log(`[Work.ink Key Issued] ${issued.key} for ${userId} via verified Work.ink token`);
+                    return res.json({ success: true, key: issued.key, expiresAt: issued.expiresAt });
+                }
+            } catch (err) {
+                console.warn("[Work.ink Token Check Error]:", err.message);
+            }
+        }
+
+        // 5. Not verified yet and no valid key found
+        return res.status(404).json({
+            success: false,
+            error: "No Work.ink key found yet. Please complete all tasks and try again."
+        });
+    } catch (err) {
+        console.error("Work.ink claim error:", err);
+        return res.status(500).json({ success: false, error: "Server error: " + err.message });
+    }
+});
+
 // Browser GET helper for verify-key
 app.get('/api/verify-key', (req, res) => {
     res.json({ 
@@ -810,7 +1275,7 @@ app.post('/api/claim-key', rateLimit('claim'), async (req, res) => {
         const keyString = [1,2,3].map(() => crypto.randomBytes(2).toString('hex').toUpperCase()).join('-'); 
         
         const now = Date.now();
-        const expiresAt = now + (12 * 60 * 60 * 1000); // 12 hours from now
+        const expiresAt = now + getProviderDurationMs('linkvertise'); // provider-configurable
         const ip = getClientIp(req);
         const country = await getCountry(ip);
 
@@ -1057,6 +1522,7 @@ app.get('/api/admin/stats', verifyAdmin, rateLimit('admin'), async (req, res) =>
 
         const linkvertiseCount = allKeys.filter(k => k.provider === 'linkvertise' || k.linkvertiseHash).length;
         const lootlabsCount = allKeys.filter(k => k.provider === 'lootlabs' || k.lootlabsPostback || k.lootlabsLocal).length;
+        const workinkCount = allKeys.filter(k => k.provider === 'workink' || k.workinkPostback).length;
         const adminCount = allKeys.filter(k => k.provider === 'admin' || k.adminCreated).length;
 
         // Online (real): users seen within the last window
@@ -1076,7 +1542,7 @@ app.get('/api/admin/stats', verifyAdmin, rateLimit('admin'), async (req, res) =>
 
         res.json({
             totalKeys, activeKeys, expiredKeys, uniqueUsers,
-            linkvertiseCount, lootlabsCount, adminCount,
+            linkvertiseCount, lootlabsCount, workinkCount, adminCount,
             onlineCount, bannedCount, tierCounts
         });
     } catch (e) {
@@ -1118,7 +1584,7 @@ app.get('/api/admin/keys', verifyAdmin, rateLimit('admin'), async (req, res) => 
 
         const now = Date.now();
         const enrichOne = (k) => {
-            const provider = k.provider || (k.linkvertiseHash ? 'linkvertise' : (k.lootlabsPostback || k.lootlabsLocal ? 'lootlabs' : (k.adminCreated ? 'admin' : 'unknown')));
+            const provider = k.provider || (k.linkvertiseHash ? 'linkvertise' : (k.lootlabsPostback || k.lootlabsLocal ? 'lootlabs' : (k.workinkPostback ? 'workink' : (k.adminCreated ? 'admin' : 'unknown'))));
             const isLifetime = !k.expiresAt || k.expiresAt === 0;
             const expired = !isLifetime && k.expiresAt <= now;
             const online = isUserOnline(k.userId) || (Array.isArray(k.usedBy) && k.usedBy.some(u => isUserOnline(u)));
@@ -1177,6 +1643,7 @@ app.get('/api/admin/keys', verifyAdmin, rateLimit('admin'), async (req, res) => 
             case 'admin':
             case 'lootlabs':
             case 'linkvertise':
+            case 'workink':
             case 'advertise':
                 enriched.sort((a, b) => ((b.provider === sort) ? 1 : 0) - ((a.provider === sort) ? 1 : 0) || newest(a, b));
                 break;
