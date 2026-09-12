@@ -8,13 +8,25 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-// Local fallback store for 100% uptime reliability
+// Local in-memory caches for lightning-fast lookups & 0-read operations
 const memoryKeys = new Map();
 const memoryUsedHashes = new Map();
-const memoryLootlabsPending = new Map(); // postbackValue -> { userId, time, redeemed }
-const memoryWorkinkPending = new Map();  // postbackValue -> { userId, time, redeemed }
+const memoryLootlabsPending = new Map(); // postbackValue -> { userId, time, redeemed, ip, country }
+const memoryWorkinkPending = new Map();  // postbackValue -> { userId, time, redeemed, ip, country }
 const memoryBans = new Map();           // ip -> { ip, reason, banUntil, bannedAt, active }
+const memoryAnnouncements = new Map();  // id -> announcementDoc
+const memorySupportRequests = new Map(); // id -> supportDoc
+const memoryInvalidKeys = new Map();     // key -> timestamp (negative cache to prevent 404 DB spam)
 const onlineUsers = new Map();          // userId -> lastSeen (ms)
+
+let announcementsLastLoaded = 0;
+const ANNOUNCEMENTS_CACHE_TTL = 10 * 60 * 1000; // 10 mins
+let supportLastLoaded = 0;
+const SUPPORT_CACHE_TTL = 10 * 60 * 1000; // 10 mins
+let keysLastLoaded = 0;
+let bansLastLoaded = 0;
+let usedHashesLastLoaded = 0;
+const STARTUP_CACHE_TTL = 15 * 60 * 1000; // 15 min guard: skip full reload if recently loaded
 
 // Provider key-duration config (admin-managed). Values are in hours.
 const DEFAULT_PROVIDER_DURATIONS = {
@@ -61,9 +73,11 @@ async function loadSettingsFromFirestore() {
 let db = null;
 let firestoreAvailable = false;
 
-// Helper to pre-warm cache from Firestore on startup / wake from sleep
-async function loadKeysFromFirestore() {
+// Helpers to pre-warm cache from Firestore on startup / wake from sleep
+async function loadKeysFromFirestore(force = false) {
     if (!db) return;
+    const now = Date.now();
+    if (!force && keysLastLoaded && (now - keysLastLoaded) < STARTUP_CACHE_TTL && memoryKeys.size > 0) return;
     try {
         const snapshot = await db.collection('keys').get();
         let loaded = 0;
@@ -74,10 +88,89 @@ async function loadKeysFromFirestore() {
                 loaded++;
             }
         });
+        keysLastLoaded = Date.now();
         console.log(`✅ Loaded ${loaded} keys from Firestore into memory cache.`);
     } catch (e) {
         console.warn("Could not pre-load keys from Firestore:", e.message);
     }
+}
+
+async function loadBansFromFirestore(force = false) {
+    if (!db) return;
+    const now = Date.now();
+    if (!force && bansLastLoaded && (now - bansLastLoaded) < STARTUP_CACHE_TTL && memoryBans.size > 0) return;
+    try {
+        const snapshot = await db.collection('bans').get();
+        let loaded = 0;
+        const nowTime = Date.now();
+        snapshot.forEach(doc => {
+            const data = doc.data();
+            if (data && data.active && (!data.banUntil || data.banUntil > nowTime)) {
+                memoryBans.set(data.ip || decodeURIComponent(doc.id), data);
+                loaded++;
+            }
+        });
+        bansLastLoaded = Date.now();
+        console.log(`✅ Loaded ${loaded} active bans from Firestore into memory cache.`);
+    } catch (e) {
+        console.warn("Could not pre-load bans from Firestore:", e.message);
+    }
+}
+
+async function loadAnnouncementsFromFirestore(force = false) {
+    if (!db) return Array.from(memoryAnnouncements.values());
+    const now = Date.now();
+    if (!force && (now - announcementsLastLoaded) < ANNOUNCEMENTS_CACHE_TTL && memoryAnnouncements.size > 0) {
+        return Array.from(memoryAnnouncements.values());
+    }
+    try {
+        const snapshot = await db.collection('announcements').get();
+        memoryAnnouncements.clear();
+        snapshot.forEach(doc => {
+            memoryAnnouncements.set(doc.id, { id: doc.id, ...doc.data() });
+        });
+        announcementsLastLoaded = now;
+        console.log(`✅ Loaded ${memoryAnnouncements.size} announcements from Firestore into memory cache.`);
+    } catch (e) {
+        console.warn("Could not load announcements from Firestore:", e.message);
+    }
+    return Array.from(memoryAnnouncements.values());
+}
+
+async function loadUsedHashesFromFirestore(force = false) {
+    if (!db) return;
+    const now = Date.now();
+    if (!force && usedHashesLastLoaded && (now - usedHashesLastLoaded) < STARTUP_CACHE_TTL && memoryUsedHashes.size > 0) return;
+    try {
+        const snapshot = await db.collection('usedHashes').get();
+        let loaded = 0;
+        snapshot.forEach(doc => {
+            memoryUsedHashes.set(doc.id, doc.data() || { time: Date.now() });
+            loaded++;
+        });
+        usedHashesLastLoaded = Date.now();
+        console.log(`✅ Loaded ${loaded} used hashes from Firestore into memory cache.`);
+    } catch (e) {
+        console.warn("Could not pre-load used hashes from Firestore:", e.message);
+    }
+}
+
+async function loadSupportFromFirestore(force = false) {
+    if (!db) return Array.from(memorySupportRequests.values());
+    const now = Date.now();
+    if (!force && (now - supportLastLoaded) < SUPPORT_CACHE_TTL && memorySupportRequests.size > 0) {
+        return Array.from(memorySupportRequests.values());
+    }
+    try {
+        const snap = await db.collection('supportRequests').get();
+        memorySupportRequests.clear();
+        snap.forEach(d => memorySupportRequests.set(d.id, { id: d.id, ...d.data() }));
+        supportLastLoaded = now;
+        console.log(`✅ Loaded ${memorySupportRequests.size} support requests from Firestore into memory cache.`);
+    } catch (e) {
+        console.warn("Could not load support requests from Firestore:", e.message);
+    }
+    return Array.from(memorySupportRequests.values());
 }
 
 try {
@@ -114,6 +207,9 @@ try {
                 console.log("✅ Firebase Admin initialized successfully.");
                 loadKeysFromFirestore();
                 loadSettingsFromFirestore();
+                loadBansFromFirestore();
+                loadAnnouncementsFromFirestore(true);
+                loadUsedHashesFromFirestore();
             })
             .catch((e) => {
                 console.warn("⚠️ Firebase Admin initialized but Firestore unreachable:", e.message);
@@ -568,29 +664,7 @@ async function redeemLootlabsPostback(postbackValue, req) {
         } catch (e) {}
     }
 
-    // Fallback: If not found by direct doc ID, search recent unredeemed pending records (last 15 mins)
-    if (!pending && db) {
-        try {
-            const fifteenMinsAgo = Date.now() - (15 * 60 * 1000);
-            const snapshot = await db.collection('lootlabsPending')
-                .where('redeemed', '==', false)
-                .where('timestamp', '>=', fifteenMinsAgo)
-                .orderBy('timestamp', 'desc')
-                .limit(1)
-                .get();
-
-            if (!snapshot.empty) {
-                const doc = snapshot.docs[0];
-                pending = doc.data();
-                matchedDocId = doc.id;
-                console.log(`[LootLabs Postback] Found unredeemed pending record via fallback: ${matchedDocId} for user ${pending.userId}`);
-            }
-        } catch (e) {
-            console.warn("[LootLabs Postback fallback search error]:", e.message);
-        }
-    }
-
-    // Memory fallback if still not found
+    // Memory fallback if not found by exact key
     if (!pending) {
         for (const [key, val] of memoryLootlabsPending.entries()) {
             if (key.startsWith('__')) continue;
@@ -789,7 +863,16 @@ app.post('/api/claim-lootlabs-key', rateLimit('lootlabsPost'), async (req, res) 
             return res.json({ success: true, key: memClaimed.key, expiresAt: memClaimed.expiresAt });
         }
 
-        // 2. Check Firestore claimed collection
+        // 2. Scan memory keys for a key tied to this user + postbackValue
+        if (postbackValue) {
+            for (const [k, v] of memoryKeys.entries()) {
+                if (v.userId === userId && v.lootlabsPostback === postbackValue && v.expiresAt > Date.now()) {
+                    return res.json({ success: true, key: k, expiresAt: v.expiresAt });
+                }
+            }
+        }
+
+        // 3. Fallback: Check Firestore claimed collection only if not found in memory
         if (db) {
             try {
                 const doc = await db.collection('lootlabsClaimed').doc(userId).get();
@@ -801,15 +884,6 @@ app.post('/api/claim-lootlabs-key', rateLimit('lootlabsPost'), async (req, res) 
                     }
                 }
             } catch (e) {}
-        }
-
-        // 3. Scan memory keys for a key tied to this user + postbackValue
-        if (postbackValue) {
-            for (const [k, v] of memoryKeys.entries()) {
-                if (v.userId === userId && v.lootlabsPostback === postbackValue && v.expiresAt > Date.now()) {
-                    return res.json({ success: true, key: k, expiresAt: v.expiresAt });
-                }
-            }
         }
 
         // 4. NO client-side fallback. Keys are issued ONLY by the verified
@@ -921,27 +995,7 @@ async function redeemWorkinkPostback(postbackValue, req) {
         } catch (e) {}
     }
 
-    if (!pending && db) {
-        try {
-            const fifteenMinsAgo = Date.now() - (15 * 60 * 1000);
-            const snapshot = await db.collection('workinkPending')
-                .where('redeemed', '==', false)
-                .where('timestamp', '>=', fifteenMinsAgo)
-                .orderBy('timestamp', 'desc')
-                .limit(1)
-                .get();
-
-            if (!snapshot.empty) {
-                const doc = snapshot.docs[0];
-                pending = doc.data();
-                matchedDocId = doc.id;
-                console.log(`[Work.ink Postback] Found unredeemed pending record via fallback: ${matchedDocId} for user ${pending.userId}`);
-            }
-        } catch (e) {
-            console.warn("[Work.ink Postback fallback search error]:", e.message);
-        }
-    }
-
+    // Memory fallback if not found by exact key
     if (!pending) {
         for (const [key, val] of memoryWorkinkPending.entries()) {
             if (key.startsWith('__')) continue;
@@ -1108,6 +1162,14 @@ app.post('/api/claim-workink-key', rateLimit('lootlabsPost'), async (req, res) =
             return res.json({ success: true, key: memClaimed.key, expiresAt: memClaimed.expiresAt });
         }
 
+        // 2. Already issued via server postback? Scan memory keys (0 Firestore reads)
+        for (const [k, v] of memoryKeys.entries()) {
+            if (v.userId === userId && v.workinkPostback === postbackValue && v.expiresAt > Date.now()) {
+                return res.json({ success: true, key: k, expiresAt: v.expiresAt });
+            }
+        }
+
+        // 3. Firestore fallback only if not found in memory
         if (db) {
             try {
                 const doc = await db.collection('workinkClaimed').doc(userId).get();
@@ -1119,13 +1181,6 @@ app.post('/api/claim-workink-key', rateLimit('lootlabsPost'), async (req, res) =
                     }
                 }
             } catch (e) {}
-        }
-
-        // 2. Already issued via server postback? Scan memory keys
-        for (const [k, v] of memoryKeys.entries()) {
-            if (v.userId === userId && v.workinkPostback === postbackValue && v.expiresAt > Date.now()) {
-                return res.json({ success: true, key: k, expiresAt: v.expiresAt });
-            }
         }
 
         // 3. Scan Firestore keys collection if not in memory (in case server restarted)
@@ -1333,6 +1388,13 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
 
     try {
         const cleanKey = key.trim().toUpperCase();
+
+        // 1. Negative cache: if known invalid, reject immediately (0 Firestore reads)
+        const invalidSince = memoryInvalidKeys.get(cleanKey);
+        if (invalidSince && (Date.now() - invalidSince) < 10 * 60 * 1000) {
+            return res.status(404).json({ valid: false, error: "Key not found. Please verify you entered it correctly." });
+        }
+
         let keyData = memoryKeys.get(cleanKey);
 
         // If not in memory, check Firestore
@@ -1342,6 +1404,8 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
                 if (keyDoc.exists) {
                     keyData = keyDoc.data();
                     memoryKeys.set(cleanKey, keyData); // Cache in memory
+                } else {
+                    memoryInvalidKeys.set(cleanKey, Date.now()); // Cache negative result for 10 mins
                 }
             } catch (dbErr) {
                 console.warn("Firestore verify lookup skipped:", dbErr.message);
@@ -1493,17 +1557,8 @@ app.post('/api/admin/login', rateLimit('admin'), (req, res) => {
 
 app.get('/api/admin/stats', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
-        let allKeys = [];
-        if (db) {
-            try {
-                const snapshot = await db.collection('keys').get();
-                snapshot.forEach(doc => allKeys.push(doc.data()));
-            } catch (e) {
-                allKeys = Array.from(memoryKeys.values());
-            }
-        } else {
-            allKeys = Array.from(memoryKeys.values());
-        }
+        // Fast in-memory stats calculation (0 Firestore reads)
+        const allKeys = Array.from(memoryKeys.values());
 
         const now = Date.now();
         const totalKeys = allKeys.length;
@@ -1554,22 +1609,8 @@ app.get('/api/admin/keys', verifyAdmin, rateLimit('admin'), async (req, res) => 
     try {
         const search = (req.query.search || '').toLowerCase();
         const sort = (req.query.sort || 'newest').toLowerCase();
-        let keys = [];
-
-        if (db) {
-            try {
-                const snapshot = await db.collection('keys').get();
-                snapshot.forEach(doc => {
-                    const data = doc.data();
-                    keys.push(data);
-                    memoryKeys.set(data.key.toUpperCase(), data);
-                });
-            } catch (e) {
-                keys = Array.from(memoryKeys.values());
-            }
-        } else {
-            keys = Array.from(memoryKeys.values());
-        }
+        // Fast in-memory key listing (0 Firestore reads)
+        let keys = Array.from(memoryKeys.values());
 
         if (search) {
             keys = keys.filter(k => 
@@ -1841,25 +1882,11 @@ app.post('/api/admin/unban-ip', verifyAdmin, rateLimit('admin'), async (req, res
 app.get('/api/admin/bans', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
         const now = Date.now();
-        let bans = [];
-        if (db) {
-            try {
-                const snapshot = await db.collection('bans').get();
-                snapshot.forEach(doc => {
-                    const b = doc.data();
-                    if (b.active && (!b.banUntil || b.banUntil > now)) {
-                        bans.push({ ip: b.ip, ...b });
-                        memoryBans.set(b.ip, b);
-                    }
-                });
-            } catch (e) {
-                bans = Array.from(memoryBans.values());
-            }
-        } else {
-            bans = Array.from(memoryBans.values());
-        }
+        // Fast in-memory ban listing (0 Firestore reads)
+        let bans = Array.from(memoryBans.values());
         bans = bans.filter(b => b.active && (!b.banUntil || b.banUntil > now));
         bans.sort((a, b) => (b.bannedAt || 0) - (a.bannedAt || 0));
+
         res.json({ bans });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -1919,31 +1946,30 @@ app.post('/api/admin/purge-expired', verifyAdmin, async (req, res) => {
         const cutoff = force ? now : (now - 3 * 24 * 3600000);
         let deletedCount = 0;
 
-        if (db) {
+        const toDelete = [];
+        for (const [key, data] of memoryKeys.entries()) {
+            if (data.expiresAt && data.expiresAt > 0 && data.expiresAt < cutoff) {
+                toDelete.push(key);
+            }
+        }
+
+        if (db && toDelete.length > 0) {
             try {
-                const snapshot = await db.collection('keys').get();
-                const batch = db.batch();
-                snapshot.forEach(doc => {
-                    const data = doc.data();
-                    if (data.expiresAt && data.expiresAt > 0 && data.expiresAt < cutoff) {
-                        batch.delete(doc.ref);
-                        deletedCount++;
-                    }
-                });
-                if (deletedCount > 0) {
+                const chunkSize = 450;
+                for (let i = 0; i < toDelete.length; i += chunkSize) {
+                    const chunk = toDelete.slice(i, i + chunkSize);
+                    const batch = db.batch();
+                    chunk.forEach(k => batch.delete(db.collection('keys').doc(k)));
                     await batch.commit();
                 }
+                deletedCount = toDelete.length;
             } catch (e) {
                 console.warn("Firestore purge error:", e.message);
             }
         }
 
-        for (const [key, data] of memoryKeys) {
-            if (data.expiresAt && data.expiresAt > 0 && data.expiresAt < cutoff) {
-                memoryKeys.delete(key);
-                if (!db) deletedCount++;
-            }
-        }
+        toDelete.forEach(k => memoryKeys.delete(k));
+        if (!db) deletedCount = toDelete.length;
 
         res.json({ success: true, deleted: deletedCount, force });
     } catch (e) {
@@ -1956,21 +1982,15 @@ app.post('/api/admin/purge-expired', verifyAdmin, async (req, res) => {
 // ============================================================
 app.get('/api/admin/announcements', verifyAdmin, async (req, res) => {
     try {
-        if (!firestoreAvailable) {
-            return res.status(503).json({ error: 'Firestore unavailable - cannot load announcements' });
-        }
-        const snapshot = await db.collection('announcements').get();
-        const announcements = [];
-        snapshot.forEach(doc => {
-            announcements.push({ id: doc.id, ...doc.data() });
-        });
+        const list = await loadAnnouncementsFromFirestore(false);
+        const announcements = [...list];
         announcements.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
-
         res.json({ announcements });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
 });
+
 app.post('/api/admin/announcements', verifyAdmin, async (req, res) => {
     try {
         const { heading, content, startAt, endAt, theme } = req.body;
@@ -1990,6 +2010,8 @@ app.post('/api/admin/announcements', verifyAdmin, async (req, res) => {
         if (db) {
             try {
                 const ref = await db.collection('announcements').add(data);
+                const saved = { id: ref.id, ...data };
+                memoryAnnouncements.set(ref.id, saved);
                 return res.json({ success: true, id: ref.id, data });
             } catch (fsErr) {
                 console.warn("Firestore announcement create failed:", fsErr.message);
@@ -2012,6 +2034,8 @@ app.put('/api/admin/announcements/:id', verifyAdmin, async (req, res) => {
         if (endAt) updates.endAt = new Date(endAt).toISOString();
         if (theme) updates.theme = theme;
         await db.collection('announcements').doc(req.params.id).update(updates);
+        const existing = memoryAnnouncements.get(req.params.id) || {};
+        memoryAnnouncements.set(req.params.id, { ...existing, ...updates });
         res.json({ success: true });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -2022,6 +2046,7 @@ app.delete('/api/admin/announcements/:id', verifyAdmin, async (req, res) => {
     try {
         if (!db) return res.status(503).json({ error: 'Firestore unavailable' });
         await db.collection('announcements').doc(req.params.id).delete();
+        memoryAnnouncements.delete(req.params.id);
         res.json({ success: true });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -2031,27 +2056,32 @@ app.delete('/api/admin/announcements/:id', verifyAdmin, async (req, res) => {
 app.post('/api/admin/announcements/:id/toggle', verifyAdmin, async (req, res) => {
     try {
         if (!db) return res.status(503).json({ error: 'Firestore unavailable' });
-        const doc = await db.collection('announcements').doc(req.params.id).get();
-        if (!doc.exists) return res.status(404).json({ error: 'Announcement not found' });
-        const current = doc.data().active;
+        let current = true;
+        const inMem = memoryAnnouncements.get(req.params.id);
+        if (inMem) {
+            current = inMem.active;
+        } else {
+            const doc = await db.collection('announcements').doc(req.params.id).get();
+            if (!doc.exists) return res.status(404).json({ error: 'Announcement not found' });
+            current = doc.data().active;
+        }
         await db.collection('announcements').doc(req.params.id).update({ active: !current });
+        if (inMem) inMem.active = !current;
         res.json({ success: true, active: !current });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
 });
 
-// Public endpoint for frontend to fetch active announcements
+// Public endpoint for frontend to fetch active announcements (cached in memory)
 app.get('/api/announcements/active', async (req, res) => {
     try {
-        if (!db) return res.json({ announcements: [] });
+        const all = await loadAnnouncementsFromFirestore(false);
         const nowIso = new Date().toISOString();
-        const snapshot = await db.collection('announcements').where('active', '==', true).get();
         const announcements = [];
-        snapshot.forEach(doc => {
-            const data = doc.data();
-            if (data.startAt <= nowIso && data.endAt >= nowIso) {
-                announcements.push({ id: doc.id, ...data });
+        all.forEach(data => {
+            if (data.active && data.startAt <= nowIso && data.endAt >= nowIso) {
+                announcements.push(data);
             }
         });
         res.json({ announcements });
@@ -2086,21 +2116,41 @@ app.post('/api/support/submit', rateLimit('claim'), async (req, res) => {
         }
 
         const day = todayKey();
-        // Enforce 1 per type per user per day
-        const existingSnap = await db.collection('supportRequests')
-            .where('userId', '==', userId)
-            .where('type', '==', kind)
-            .where('dayKey', '==', day)
-            .limit(1)
-            .get();
-        if (!existingSnap.empty) {
+        const norm = text.toLowerCase().replace(/\s+/g, ' ');
+
+        // Enforce 1 per type per user per day (Check in-memory first for 0 Firestore reads)
+        let alreadySubmittedToday = false;
+        let isDuplicateSuggestion = false;
+        for (const reqDoc of memorySupportRequests.values()) {
+            if (reqDoc.userId === userId && reqDoc.type === kind && reqDoc.dayKey === day) {
+                alreadySubmittedToday = true;
+                break;
+            }
+            if (kind === 'suggestion' && reqDoc.type === 'suggestion' && reqDoc.normalizedMessage === norm) {
+                isDuplicateSuggestion = true;
+            }
+        }
+
+        if (alreadySubmittedToday) {
             return res.status(429).json({ success: false, error: `You can send only one ${kind === 'bug' ? 'bug report' : 'feature suggestion'} per day.` });
         }
 
-        // Uniqueness check for suggestions (exact normalized match)
-        let unique = false;
-        if (kind === 'suggestion') {
-            const norm = text.toLowerCase().replace(/\s+/g, ' ');
+        // Only query Firestore if memory cache is completely empty
+        if (memorySupportRequests.size === 0) {
+            const existingSnap = await db.collection('supportRequests')
+                .where('userId', '==', userId)
+                .where('type', '==', kind)
+                .where('dayKey', '==', day)
+                .limit(1)
+                .get();
+            if (!existingSnap.empty) {
+                return res.status(429).json({ success: false, error: `You can send only one ${kind === 'bug' ? 'bug report' : 'feature suggestion'} per day.` });
+            }
+        }
+
+        // Uniqueness check for suggestions
+        let unique = !isDuplicateSuggestion;
+        if (kind === 'suggestion' && unique && memorySupportRequests.size === 0) {
             const dupSnap = await db.collection('supportRequests')
                 .where('type', '==', 'suggestion')
                 .where('normalizedMessage', '==', norm)
@@ -2124,6 +2174,7 @@ app.post('/api/support/submit', rateLimit('claim'), async (req, res) => {
             dayKey: day
         };
         const ref = await db.collection('supportRequests').add(doc);
+        memorySupportRequests.set(ref.id, { id: ref.id, ...doc });
 
         let note = '';
         if (kind === 'suggestion') {
@@ -2150,12 +2201,12 @@ app.get('/api/support/mine', async (req, res) => {
     try {
         const userId = req.query.userId;
         if (!userId || !/^[a-zA-Z0-9_-]+$/.test(userId)) return res.status(400).json({ success: false, error: 'Invalid userId' });
-        if (!db) return res.json({ requests: [] });
-        const snap = await db.collection('supportRequests').where('userId', '==', userId).limit(50).get();
-        const requests = [];
-        snap.forEach(d => requests.push({ id: d.id, ...d.data() }));
+        
+        // Fast in-memory check
+        const all = await loadSupportFromFirestore(false);
+        const requests = all.filter(r => r.userId === userId);
         requests.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-        res.json({ requests });
+        res.json({ requests: requests.slice(0, 50) });
     } catch (e) {
         res.status(500).json({ success: false, error: e.message });
     }
@@ -2164,10 +2215,8 @@ app.get('/api/support/mine', async (req, res) => {
 // Admin: list all support requests
 app.get('/api/admin/support', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
-        if (!db) return res.json({ requests: [] });
-        const snap = await db.collection('supportRequests').get();
-        const requests = [];
-        snap.forEach(d => requests.push({ id: d.id, ...d.data() }));
+        const all = await loadSupportFromFirestore(false);
+        const requests = [...all];
         requests.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
         res.json({ requests });
     } catch (e) {
@@ -2181,12 +2230,20 @@ app.post('/api/admin/support/:id/action', verifyAdmin, rateLimit('admin'), async
         if (!db) return res.status(503).json({ error: 'Firestore unavailable' });
         const { action } = req.body || {};
         const ref = db.collection('supportRequests').doc(req.params.id);
-        const doc = await ref.get();
-        if (!doc.exists) return res.status(404).json({ error: 'Request not found' });
-        const data = doc.data();
+        const inMem = memorySupportRequests.get(req.params.id);
+        let data = inMem;
+        if (!data) {
+            const doc = await ref.get();
+            if (!doc.exists) return res.status(404).json({ error: 'Request not found' });
+            data = doc.data();
+        }
 
         if (action === 'reject') {
             await ref.update({ status: 'rejected', resolvedAt: Date.now() });
+            if (inMem) {
+                inMem.status = 'rejected';
+                inMem.resolvedAt = Date.now();
+            }
             return res.json({ success: true, status: 'rejected' });
         }
 
@@ -2216,6 +2273,13 @@ app.post('/api/admin/support/:id/action', verifyAdmin, rateLimit('admin'), async
             memoryKeys.set(keyString, newKey);
             try { await db.collection('keys').doc(keyString).set(newKey); } catch (e) {}
             await ref.update({ status: 'approved', keyIssued: true, issuedKey: keyString, issuedExpiresAt: expiresAt, resolvedAt: now });
+            if (inMem) {
+                inMem.status = 'approved';
+                inMem.keyIssued = true;
+                inMem.issuedKey = keyString;
+                inMem.issuedExpiresAt = expiresAt;
+                inMem.resolvedAt = now;
+            }
             return res.json({ success: true, status: 'approved', key: keyString, expiresAt });
         }
 
@@ -2225,35 +2289,32 @@ app.post('/api/admin/support/:id/action', verifyAdmin, rateLimit('admin'), async
     }
 });
 
-// Background Auto-Purge job: runs every 6 hours to clean expired keys > 3 days
+// Background Auto-Purge job: runs every 6 hours to clean expired keys > 3 days (0 Firestore reads)
 setInterval(async () => {
     try {
         const now = Date.now();
         const threeDays = 3 * 24 * 3600000;
         const cutoff = now - threeDays;
 
-        if (db) {
-            const snapshot = await db.collection('keys').get();
-            const batch = db.batch();
-            let count = 0;
-            snapshot.forEach(doc => {
-                const data = doc.data();
-                if (data.expiresAt && data.expiresAt > 0 && data.expiresAt < cutoff) {
-                    batch.delete(doc.ref);
-                    count++;
-                }
-            });
-            if (count > 0) {
-                await batch.commit();
-                console.log(`🧹 [Auto-Purge Job] Removed ${count} keys expired more than 3 days ago.`);
+        const toDelete = [];
+        for (const [key, data] of memoryKeys.entries()) {
+            if (data.expiresAt && data.expiresAt > 0 && data.expiresAt < cutoff) {
+                toDelete.push(key);
             }
         }
 
-        for (const [key, data] of memoryKeys) {
-            if (data.expiresAt && data.expiresAt > 0 && data.expiresAt < cutoff) {
-                memoryKeys.delete(key);
+        if (db && toDelete.length > 0) {
+            const chunkSize = 450;
+            for (let i = 0; i < toDelete.length; i += chunkSize) {
+                const chunk = toDelete.slice(i, i + chunkSize);
+                const batch = db.batch();
+                chunk.forEach(k => batch.delete(db.collection('keys').doc(k)));
+                await batch.commit();
             }
+            console.log(`🧹 [Auto-Purge Job] Removed ${toDelete.length} keys expired more than 3 days ago.`);
         }
+
+        toDelete.forEach(k => memoryKeys.delete(k));
     } catch (err) {
         console.warn("[Auto-Purge Job Error]:", err.message);
     }
