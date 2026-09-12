@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const { initializeApp, cert, getApps } = require('firebase-admin/app');
 const { getFirestore, FieldValue } = require('firebase-admin/firestore');
+const { getDatabase } = require('firebase-admin/database');
 const { getAuth } = require('firebase-admin/auth');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -27,6 +28,8 @@ let keysLastLoaded = 0;
 let bansLastLoaded = 0;
 let usedHashesLastLoaded = 0;
 const STARTUP_CACHE_TTL = 15 * 60 * 1000; // 15 min guard: skip full reload if recently loaded
+
+const FIREBASE_DATABASE_URL = process.env.FIREBASE_DATABASE_URL || 'https://buy-r-bl0x-default-rtdb.asia-southeast1.firebasedatabase.app/';
 
 // Provider key-duration config (admin-managed). Values are in hours.
 const DEFAULT_PROVIDER_DURATIONS = {
@@ -69,29 +72,179 @@ async function loadSettingsFromFirestore() {
     }
 }
 
-// Initialize Firebase Admin
+// Initialize Firebase Admin (Firestore + Realtime Database)
 let db = null;
+let rtdb = null;
 let firestoreAvailable = false;
+let rtdbAvailable = false;
 
-// Helpers to pre-warm cache from Firestore on startup / wake from sleep
-async function loadKeysFromFirestore(force = false) {
-    if (!db) return;
+// ============================================================
+// STORAGE HELPERS (RAM + RTDB + FIRESTORE DUAL-STORE)
+// ============================================================
+async function saveKeyToStorage(key, keyData) {
+    const cleanKey = (key || '').toUpperCase();
+    if (!cleanKey) return;
+    
+    // 1. RAM Cache (Instant 0ms access)
+    memoryKeys.set(cleanKey, keyData);
+
+    // 2. Realtime Database (Primary persistent store, unlimited reads)
+    if (rtdb) {
+        try {
+            await rtdb.ref(`keys/${cleanKey}`).set(keyData);
+        } catch (rtdbErr) {
+            console.warn(`[RTDB] Failed to save key ${cleanKey}:`, rtdbErr.message);
+        }
+    }
+
+    // 3. Firestore (Backup)
+    if (db) {
+        try {
+            await db.collection('keys').doc(cleanKey).set(keyData);
+        } catch (fsErr) {
+            console.warn(`[Firestore] Failed to save key ${cleanKey}:`, fsErr.message);
+        }
+    }
+}
+
+async function updateKeyInStorage(key, updates) {
+    const cleanKey = (key || '').toUpperCase();
+    if (!cleanKey) return;
+
+    // 1. RAM Cache
+    const existing = memoryKeys.get(cleanKey) || {};
+    const merged = { ...existing, ...updates };
+    memoryKeys.set(cleanKey, merged);
+
+    // 2. RTDB
+    if (rtdb) {
+        try {
+            await rtdb.ref(`keys/${cleanKey}`).update(updates);
+        } catch (rtdbErr) {
+            console.warn(`[RTDB] Failed to update key ${cleanKey}:`, rtdbErr.message);
+        }
+    }
+
+    // 3. Firestore
+    if (db) {
+        try {
+            await db.collection('keys').doc(cleanKey).update(updates);
+        } catch (fsErr) {
+            console.warn(`[Firestore] Failed to update key ${cleanKey}:`, fsErr.message);
+        }
+    }
+}
+
+async function deleteKeyFromStorage(key) {
+    const cleanKey = (key || '').toUpperCase();
+    if (!cleanKey) return;
+
+    // 1. RAM Cache
+    memoryKeys.delete(cleanKey);
+
+    // 2. RTDB
+    if (rtdb) {
+        try {
+            await rtdb.ref(`keys/${cleanKey}`).remove();
+        } catch (rtdbErr) {
+            console.warn(`[RTDB] Failed to delete key ${cleanKey}:`, rtdbErr.message);
+        }
+    }
+
+    // 3. Firestore
+    if (db) {
+        try {
+            await db.collection('keys').doc(cleanKey).delete();
+        } catch (fsErr) {
+            console.warn(`[Firestore] Failed to delete key ${cleanKey}:`, fsErr.message);
+        }
+    }
+}
+
+// Helpers to pre-warm cache on startup / wake from sleep
+async function loadKeysFromStorage(force = false) {
     const now = Date.now();
     if (!force && keysLastLoaded && (now - keysLastLoaded) < STARTUP_CACHE_TTL && memoryKeys.size > 0) return;
+
+    let loaded = 0;
+
+    // 1. Load from Realtime Database first (0 Firestore reads!)
+    if (rtdb) {
+        try {
+            const snap = await rtdb.ref('keys').once('value');
+            const val = snap.val();
+            if (val && typeof val === 'object') {
+                Object.keys(val).forEach(k => {
+                    const data = val[k];
+                    if (data && (data.key || k)) {
+                        const keyName = (data.key || k).toUpperCase();
+                        memoryKeys.set(keyName, data);
+                        loaded++;
+                    }
+                });
+                keysLastLoaded = Date.now();
+                console.log(`✅ Loaded ${loaded} keys from Realtime Database (RTDB) into memory.`);
+                return;
+            }
+        } catch (e) {
+            console.warn("Could not load keys from RTDB:", e.message);
+        }
+    }
+
+    // 2. Fallback: Load from Firestore and migrate to RTDB if RTDB was empty
+    if (db) {
+        try {
+            const snapshot = await db.collection('keys').get();
+            const rtdbBatch = {};
+            snapshot.forEach(doc => {
+                const data = doc.data();
+                if (data && data.key) {
+                    const keyName = data.key.toUpperCase();
+                    memoryKeys.set(keyName, data);
+                    rtdbBatch[`keys/${keyName}`] = data;
+                    loaded++;
+                }
+            });
+            keysLastLoaded = Date.now();
+            console.log(`✅ Loaded ${loaded} keys from Firestore into memory.`);
+
+            if (rtdb && Object.keys(rtdbBatch).length > 0) {
+                try {
+                    await rtdb.ref().update(rtdbBatch);
+                    console.log(`✅ Auto-migrated ${Object.keys(rtdbBatch).length} keys from Firestore to RTDB.`);
+                } catch (migrateErr) {
+                    console.warn("RTDB migration warning:", migrateErr.message);
+                }
+            }
+        } catch (e) {
+            console.warn("Could not pre-load keys from Firestore:", e.message);
+        }
+    }
+}
+
+function setupRTDBListeners() {
+    if (!rtdb) return;
     try {
-        const snapshot = await db.collection('keys').get();
-        let loaded = 0;
-        snapshot.forEach(doc => {
-            const data = doc.data();
+        rtdb.ref('keys').on('child_added', (snap) => {
+            const data = snap.val();
             if (data && data.key) {
                 memoryKeys.set(data.key.toUpperCase(), data);
-                loaded++;
             }
         });
-        keysLastLoaded = Date.now();
-        console.log(`✅ Loaded ${loaded} keys from Firestore into memory cache.`);
+        rtdb.ref('keys').on('child_changed', (snap) => {
+            const data = snap.val();
+            if (data && data.key) {
+                memoryKeys.set(data.key.toUpperCase(), data);
+            }
+        });
+        rtdb.ref('keys').on('child_removed', (snap) => {
+            const data = snap.val();
+            const keyName = (data && data.key) ? data.key.toUpperCase() : (snap.key || '').toUpperCase();
+            if (keyName) memoryKeys.delete(keyName);
+        });
+        console.log("✅ Realtime Database (RTDB) live sync listener active.");
     } catch (e) {
-        console.warn("Could not pre-load keys from Firestore:", e.message);
+        console.warn("RTDB listener setup warning:", e.message);
     }
 }
 
@@ -198,24 +351,22 @@ try {
     }
 
     if (credential) {
-        initializeApp({ credential });
+        initializeApp({ 
+            credential,
+            databaseURL: FIREBASE_DATABASE_URL
+        });
         db = getFirestore();
-        // Test if Firestore is actually reachable
-        db.collection('keys').limit(1).get()
-            .then(() => {
-                firestoreAvailable = true;
-                console.log("✅ Firebase Admin initialized successfully.");
-                loadKeysFromFirestore();
-                loadSettingsFromFirestore();
-                loadBansFromFirestore();
-                loadAnnouncementsFromFirestore(true);
-                loadUsedHashesFromFirestore();
-            })
-            .catch((e) => {
-                console.warn("⚠️ Firebase Admin initialized but Firestore unreachable:", e.message);
-                console.log("⚡ Falling back to in-memory store for admin operations.");
-                firestoreAvailable = false;
-            });
+        rtdb = getDatabase();
+        rtdbAvailable = true;
+        console.log("✅ Firebase Admin (Firestore + Realtime Database) initialized.");
+
+        // Start loading data
+        loadKeysFromStorage();
+        setupRTDBListeners();
+        loadSettingsFromFirestore();
+        loadBansFromFirestore();
+        loadAnnouncementsFromFirestore(true);
+        loadUsedHashesFromFirestore();
     } else {
         console.log("⚡ Running with internal key management engine.");
     }
@@ -812,17 +963,10 @@ async function issueLootlabsKey(userId, postbackValue, req, pending = null) {
         note: 'Generated via LootLabs',
         lootlabsPostback: postbackValue || null
     };
-    // Always set in memory first (instant access)
-    memoryKeys.set(keyString, newKeyDoc);
-    // Persist to Firestore (so it survives server restart)
-    let firestoreOk = true;
+    // Save to RAM + RTDB + Firestore
+    await saveKeyToStorage(keyString, newKeyDoc);
+
     if (db) {
-        try {
-            await db.collection('keys').doc(keyString).set(newKeyDoc);
-        } catch (e) {
-            console.error(`[Firestore] Failed to persist key ${keyString}:`, e.message);
-            firestoreOk = false;
-        }
         try {
             await db.collection('lootlabsClaimed').doc(userId).set({
                 key: keyString,
@@ -832,12 +976,9 @@ async function issueLootlabsKey(userId, postbackValue, req, pending = null) {
         } catch (e) {
             console.error(`[Firestore] Failed to persist claim for ${userId}:`, e.message);
         }
-    } else {
-        console.warn('[Firestore] db not initialized - key only in memory');
-        firestoreOk = false;
     }
     memoryLootlabsPending.set(`__claimed_${userId}`, { key: keyString, expiresAt, time: now });
-    console.log(`[Key Issued] ${keyString} for ${userId} (firestore: ${firestoreOk})`);
+    console.log(`[Key Issued] ${keyString} for ${userId} via LootLabs`);
     return { key: keyString, expiresAt };
 }
 
@@ -1114,15 +1255,10 @@ async function issueWorkinkKey(userId, postbackValue, req, pending = null) {
         note: 'Generated via Work.ink',
         workinkPostback: postbackValue || null
     };
-    memoryKeys.set(keyString, newKeyDoc);
-    let firestoreOk = true;
+    // Save to RAM + RTDB + Firestore
+    await saveKeyToStorage(keyString, newKeyDoc);
+
     if (db) {
-        try {
-            await db.collection('keys').doc(keyString).set(newKeyDoc);
-        } catch (e) {
-            console.error(`[Firestore] Failed to persist key ${keyString}:`, e.message);
-            firestoreOk = false;
-        }
         try {
             await db.collection('workinkClaimed').doc(userId).set({
                 key: keyString,
@@ -1132,12 +1268,9 @@ async function issueWorkinkKey(userId, postbackValue, req, pending = null) {
         } catch (e) {
             console.error(`[Firestore] Failed to persist claim for ${userId}:`, e.message);
         }
-    } else {
-        console.warn('[Firestore] db not initialized - key only in memory');
-        firestoreOk = false;
     }
     memoryWorkinkPending.set(`__claimed_${userId}`, { key: keyString, expiresAt, time: now });
-    console.log(`[Key Issued] ${keyString} for ${userId} via Work.ink (firestore: ${firestoreOk})`);
+    console.log(`[Key Issued] ${keyString} for ${userId} via Work.ink`);
     return { key: keyString, expiresAt };
 }
 
@@ -1350,15 +1483,8 @@ app.post('/api/claim-key', rateLimit('claim'), async (req, res) => {
             linkvertiseHash: hash
         };
 
-        // Save in memory store
-        memoryKeys.set(keyString, newKeyDoc);
-
-        // Sync with Firestore if available
-        if (db) {
-            try {
-                await db.collection('keys').doc(keyString).set(newKeyDoc);
-            } catch (e) {}
-        }
+        // Save to RAM + RTDB + Firestore
+        await saveKeyToStorage(keyString, newKeyDoc);
 
         console.log(`✅ [Key Created] Successfully issued key ${keyString} for user ${userId}`);
 
@@ -1443,15 +1569,7 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
                 } else {
                     usedIps.push(reqIp);
                     if (!usedBy.includes(userId)) usedBy.push(userId);
-                    keyData.usedIps = usedIps;
-                    keyData.usedBy = usedBy;
-                    keyData.usedUsers = usedBy.length;
-                    memoryKeys.set(cleanKey, keyData);
-                    if (db) {
-                        try {
-                            await db.collection('keys').doc(cleanKey).update({ usedIps, usedBy, usedUsers: usedBy.length });
-                        } catch (e) {}
-                    }
+                    await updateKeyInStorage(cleanKey, { usedIps, usedBy, usedUsers: usedBy.length });
                 }
             } else if (usedBy.includes(userId)) {
                 // User already recognized
@@ -1461,17 +1579,7 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
                 }
                 // Register user
                 usedBy.push(userId);
-                keyData.usedBy = usedBy;
-                keyData.usedUsers = usedBy.length;
-                memoryKeys.set(cleanKey, keyData);
-                if (db) {
-                    try {
-                        await db.collection('keys').doc(cleanKey).update({
-                            usedBy: usedBy,
-                            usedUsers: usedBy.length
-                        });
-                    } catch (e) {}
-                }
+                await updateKeyInStorage(cleanKey, { usedBy, usedUsers: usedBy.length });
             }
         } else {
             // Normal gateway key
@@ -1749,14 +1857,7 @@ app.post('/api/admin/create-key', verifyAdmin, rateLimit('admin'), async (req, r
             country: country
         };
 
-        memoryKeys.set(keyString, newKey);
-        if (db) {
-            try {
-                await db.collection('keys').doc(keyString).set(newKey);
-            } catch (fsErr) {
-                console.warn("Firestore create-key write failed, key retained in memory:", fsErr.message);
-            }
-        }
+        await saveKeyToStorage(keyString, newKey);
         res.json({ success: true, key: keyString, expiresAt, tier: cleanTier, ipCheck: !!ipCheck });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -1775,20 +1876,7 @@ app.post('/api/admin/revoke-key/:key', verifyAdmin, rateLimit('admin'), async (r
 
         if (!data) return res.status(404).json({ error: 'Key not found' });
 
-        // Write to Firestore first
-        if (db) {
-            try {
-                await db.collection('keys').doc(key).update({ revoked: true });
-            } catch (fsErr) {
-                return res.status(500).json({ error: 'Firestore revoke failed: ' + fsErr.message });
-            }
-        } else {
-            return res.status(503).json({ error: 'Firestore unavailable' });
-        }
-
-        // Only update memory after Firestore success
-        data.revoked = true;
-        memoryKeys.set(key, data);
+        await updateKeyInStorage(key, { revoked: true, revokedAt: Date.now() });
         res.json({ success: true });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -1798,28 +1886,15 @@ app.post('/api/admin/revoke-key/:key', verifyAdmin, rateLimit('admin'), async (r
 app.delete('/api/admin/delete-key/:key', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
         const key = req.params.key.toUpperCase();
-
-        // Step 1: Delete from Firestore FIRST (persistent)
-        // If this fails, we keep the key in memory so it doesn't resurrect
-        if (db) {
-            try {
-                await db.collection('keys').doc(key).delete();
-            } catch (fsErr) {
-                console.error("Firestore delete failed for key", key, ":", fsErr.message);
-                return res.status(500).json({
-                    error: 'Firestore delete failed: ' + fsErr.message + '. Key was NOT deleted. Please retry.'
-                });
-            }
-        } else {
-            return res.status(503).json({
-                error: 'Firestore unavailable. Cannot delete key permanently. Please check Firebase connection.'
-            });
+        let data = memoryKeys.get(key);
+        if (!data && db) {
+            const doc = await db.collection('keys').doc(key).get();
+            if (doc.exists) data = doc.data();
         }
+        if (!data) return res.status(404).json({ error: 'Key not found' });
 
-        // Step 2: Only after Firestore success, remove from memory
-        memoryKeys.delete(key);
-
-        res.json({ success: true, key, source: 'firestore+memory' });
+        await deleteKeyFromStorage(key);
+        res.json({ success: true, key, source: 'rtdb+firestore+memory' });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -1837,12 +1912,8 @@ app.post('/api/admin/ban-key/:key', verifyAdmin, rateLimit('admin'), async (req,
         }
         if (!data) return res.status(404).json({ error: 'Key not found' });
 
-        // Revoke the key
-        data.revoked = true;
-        memoryKeys.set(key, data);
-        if (db) {
-            try { await db.collection('keys').doc(key).update({ revoked: true }); } catch (e) {}
-        }
+        // Revoke the key across RAM + RTDB + Firestore
+        await updateKeyInStorage(key, { revoked: true, revokedAt: Date.now() });
 
         // Ban the IP if available
         const banIp = data.ip && data.ip !== '-' ? data.ip : null;
@@ -1911,27 +1982,21 @@ app.post('/api/admin/extend-key/:key', verifyAdmin, rateLimit('admin'), async (r
         if (!data) return res.status(404).json({ error: 'Key not found' });
 
         // Lifetime keys (expiresAt === 0) cannot be reduced; allow positive to convert to timed? Keep simple: skip.
+        let newExpiresAt = data.expiresAt;
         if (!data.expiresAt || data.expiresAt === 0) {
             if (changeMs <= 0) return res.status(400).json({ error: 'Cannot reduce a lifetime key.' });
-            data.expiresAt = Date.now() + changeMs;
+            newExpiresAt = Date.now() + changeMs;
         } else {
             // If already expired, base is "now"; otherwise base is current expiry (so +/- applied to remaining time)
             const baseTime = (data.expiresAt > Date.now()) ? data.expiresAt : Date.now();
-            data.expiresAt = baseTime + changeMs;
+            newExpiresAt = baseTime + changeMs;
         }
 
-        // Only un-revoke when time is added
-        if (changeMs > 0) data.revoked = false;
+        const updates = { expiresAt: newExpiresAt };
+        if (changeMs > 0) updates.revoked = false;
 
-        memoryKeys.set(key, data);
-        if (db) {
-            try {
-                await db.collection('keys').doc(key).update({ expiresAt: data.expiresAt, revoked: data.revoked });
-            } catch (fsErr) {
-                console.warn("Firestore extend write failed:", fsErr.message);
-            }
-        }
-        res.json({ success: true, expiresAt: data.expiresAt, changeMs });
+        await updateKeyInStorage(key, updates);
+        res.json({ success: true, expiresAt: newExpiresAt, changeMs });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -1941,9 +2006,9 @@ app.post('/api/admin/purge-expired', verifyAdmin, async (req, res) => {
     try {
         const now = Date.now();
         const force = !!(req.body && req.body.force);
-        // Default: remove keys expired for more than 3 days.
+        // Default: remove keys expired for more than 2 days (48 hours).
         // force=true (manual click): remove ALL currently expired keys immediately.
-        const cutoff = force ? now : (now - 3 * 24 * 3600000);
+        const cutoff = force ? now : (now - 2 * 24 * 3600000);
         let deletedCount = 0;
 
         const toDelete = [];
@@ -1953,23 +2018,38 @@ app.post('/api/admin/purge-expired', verifyAdmin, async (req, res) => {
             }
         }
 
-        if (db && toDelete.length > 0) {
-            try {
-                const chunkSize = 450;
-                for (let i = 0; i < toDelete.length; i += chunkSize) {
-                    const chunk = toDelete.slice(i, i + chunkSize);
-                    const batch = db.batch();
-                    chunk.forEach(k => batch.delete(db.collection('keys').doc(k)));
-                    await batch.commit();
+        if (toDelete.length > 0) {
+            // 1. Delete from RTDB
+            if (rtdb) {
+                const rtdbUpdates = {};
+                toDelete.forEach(k => {
+                    rtdbUpdates[`keys/${k}`] = null;
+                });
+                try {
+                    await rtdb.ref().update(rtdbUpdates);
+                } catch (e) {
+                    console.warn("RTDB purge error:", e.message);
                 }
-                deletedCount = toDelete.length;
-            } catch (e) {
-                console.warn("Firestore purge error:", e.message);
             }
-        }
 
-        toDelete.forEach(k => memoryKeys.delete(k));
-        if (!db) deletedCount = toDelete.length;
+            // 2. Delete from Firestore
+            if (db) {
+                try {
+                    const chunkSize = 450;
+                    for (let i = 0; i < toDelete.length; i += chunkSize) {
+                        const chunk = toDelete.slice(i, i + chunkSize);
+                        const batch = db.batch();
+                        chunk.forEach(k => batch.delete(db.collection('keys').doc(k)));
+                        await batch.commit();
+                    }
+                } catch (e) {
+                    console.warn("Firestore purge error:", e.message);
+                }
+            }
+
+            toDelete.forEach(k => memoryKeys.delete(k));
+            deletedCount = toDelete.length;
+        }
 
         res.json({ success: true, deleted: deletedCount, force });
     } catch (e) {
@@ -2270,8 +2350,7 @@ app.post('/api/admin/support/:id/action', verifyAdmin, rateLimit('admin'), async
                 ip: '-',
                 country: '-'
             };
-            memoryKeys.set(keyString, newKey);
-            try { await db.collection('keys').doc(keyString).set(newKey); } catch (e) {}
+            await saveKeyToStorage(keyString, newKey);
             await ref.update({ status: 'approved', keyIssued: true, issuedKey: keyString, issuedExpiresAt: expiresAt, resolvedAt: now });
             if (inMem) {
                 inMem.status = 'approved';
@@ -2289,12 +2368,12 @@ app.post('/api/admin/support/:id/action', verifyAdmin, rateLimit('admin'), async
     }
 });
 
-// Background Auto-Purge job: runs every 6 hours to clean expired keys > 3 days (0 Firestore reads)
+// Background Auto-Purge job: runs every 6 hours to clean expired keys > 2 days (48h) (RTDB + Firestore)
 setInterval(async () => {
     try {
         const now = Date.now();
-        const threeDays = 3 * 24 * 3600000;
-        const cutoff = now - threeDays;
+        const twoDays = 2 * 24 * 3600000;
+        const cutoff = now - twoDays;
 
         const toDelete = [];
         for (const [key, data] of memoryKeys.entries()) {
@@ -2303,15 +2382,31 @@ setInterval(async () => {
             }
         }
 
-        if (db && toDelete.length > 0) {
-            const chunkSize = 450;
-            for (let i = 0; i < toDelete.length; i += chunkSize) {
-                const chunk = toDelete.slice(i, i + chunkSize);
-                const batch = db.batch();
-                chunk.forEach(k => batch.delete(db.collection('keys').doc(k)));
-                await batch.commit();
+        if (toDelete.length > 0) {
+            // 1. Delete from RTDB
+            if (rtdb) {
+                const rtdbUpdates = {};
+                toDelete.forEach(k => {
+                    rtdbUpdates[`keys/${k}`] = null;
+                });
+                try {
+                    await rtdb.ref().update(rtdbUpdates);
+                } catch (e) {
+                    console.warn("[Auto-Purge RTDB Error]:", e.message);
+                }
             }
-            console.log(`🧹 [Auto-Purge Job] Removed ${toDelete.length} keys expired more than 3 days ago.`);
+
+            // 2. Delete from Firestore
+            if (db) {
+                const chunkSize = 450;
+                for (let i = 0; i < toDelete.length; i += chunkSize) {
+                    const chunk = toDelete.slice(i, i + chunkSize);
+                    const batch = db.batch();
+                    chunk.forEach(k => batch.delete(db.collection('keys').doc(k)));
+                    await batch.commit();
+                }
+            }
+            console.log(`🧹 [Auto-Purge Job] Removed ${toDelete.length} keys expired more than 2 days ago from RTDB & Firestore.`);
         }
 
         toDelete.forEach(k => memoryKeys.delete(k));
