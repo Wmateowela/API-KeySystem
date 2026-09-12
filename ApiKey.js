@@ -55,7 +55,27 @@ function getProviderDurationHours(provider) {
     return (typeof hours === 'number' && hours > 0) ? hours : (DEFAULT_PROVIDER_DURATIONS[provider] || 12);
 }
 
-async function loadSettingsFromFirestore() {
+function ipToRtdbKey(ip) {
+    return String(ip || '').replace(/\./g, '_').replace(/:/g, '-');
+}
+
+async function loadSettingsFromStorage() {
+    if (rtdb) {
+        try {
+            const snap = await rtdb.ref('settings/providerDurations').once('value');
+            if (snap.exists()) {
+                const data = snap.val() || {};
+                PROVIDER_KEYS.forEach(p => {
+                    const h = parseInt(data[p], 10);
+                    if (!isNaN(h) && h > 0) memorySettings.providerDurations[p] = h;
+                });
+                console.log('✅ Loaded provider durations from RTDB:', memorySettings.providerDurations);
+                return;
+            }
+        } catch (e) {
+            console.warn('RTDB provider durations warning:', e.message);
+        }
+    }
     if (!db) return;
     try {
         const doc = await db.collection('settings').doc('providerDurations').get();
@@ -97,13 +117,11 @@ async function saveKeyToStorage(key, keyData) {
         }
     }
 
-    // 3. Firestore (Backup)
+    // 3. Firestore (Background Backup - non-blocking)
     if (db) {
-        try {
-            await db.collection('keys').doc(cleanKey).set(keyData);
-        } catch (fsErr) {
-            console.warn(`[Firestore] Failed to save key ${cleanKey}:`, fsErr.message);
-        }
+        db.collection('keys').doc(cleanKey).set(keyData).catch(fsErr => {
+            // firestore quota or network error ignored
+        });
     }
 }
 
@@ -125,13 +143,11 @@ async function updateKeyInStorage(key, updates) {
         }
     }
 
-    // 3. Firestore
+    // 3. Firestore (Background Backup - non-blocking)
     if (db) {
-        try {
-            await db.collection('keys').doc(cleanKey).update(updates);
-        } catch (fsErr) {
-            console.warn(`[Firestore] Failed to update key ${cleanKey}:`, fsErr.message);
-        }
+        db.collection('keys').doc(cleanKey).update(updates).catch(fsErr => {
+            // firestore quota or network error ignored
+        });
     }
 }
 
@@ -151,13 +167,11 @@ async function deleteKeyFromStorage(key) {
         }
     }
 
-    // 3. Firestore
+    // 3. Firestore (Background Backup - non-blocking)
     if (db) {
-        try {
-            await db.collection('keys').doc(cleanKey).delete();
-        } catch (fsErr) {
-            console.warn(`[Firestore] Failed to delete key ${cleanKey}:`, fsErr.message);
-        }
+        db.collection('keys').doc(cleanKey).delete().catch(fsErr => {
+            // firestore quota or network error ignored
+        });
     }
 }
 
@@ -249,9 +263,31 @@ function setupRTDBListeners() {
 }
 
 async function loadBansFromFirestore(force = false) {
-    if (!db) return;
     const now = Date.now();
     if (!force && bansLastLoaded && (now - bansLastLoaded) < STARTUP_CACHE_TTL && memoryBans.size > 0) return;
+
+    if (rtdb) {
+        try {
+            const snap = await rtdb.ref('bans').once('value');
+            if (snap.exists()) {
+                const dataObj = snap.val() || {};
+                let loaded = 0;
+                Object.values(dataObj).forEach(data => {
+                    if (data && data.active && (!data.banUntil || data.banUntil > now)) {
+                        memoryBans.set(data.ip, data);
+                        loaded++;
+                    }
+                });
+                bansLastLoaded = Date.now();
+                console.log(`✅ Loaded ${loaded} active bans from RTDB into memory cache.`);
+                return;
+            }
+        } catch (e) {
+            console.warn("RTDB load bans warning:", e.message);
+        }
+    }
+
+    if (!db) return;
     try {
         const snapshot = await db.collection('bans').get();
         let loaded = 0;
@@ -271,11 +307,31 @@ async function loadBansFromFirestore(force = false) {
 }
 
 async function loadAnnouncementsFromFirestore(force = false) {
-    if (!db) return Array.from(memoryAnnouncements.values());
     const now = Date.now();
     if (!force && (now - announcementsLastLoaded) < ANNOUNCEMENTS_CACHE_TTL && memoryAnnouncements.size > 0) {
         return Array.from(memoryAnnouncements.values());
     }
+
+    if (rtdb) {
+        try {
+            const snap = await rtdb.ref('announcements').once('value');
+            if (snap.exists()) {
+                memoryAnnouncements.clear();
+                const dataObj = snap.val() || {};
+                Object.keys(dataObj).forEach(id => {
+                    const item = dataObj[id];
+                    if (item) memoryAnnouncements.set(id, { id, ...item });
+                });
+                announcementsLastLoaded = now;
+                console.log(`✅ Loaded ${memoryAnnouncements.size} announcements from RTDB into memory cache.`);
+                return Array.from(memoryAnnouncements.values());
+            }
+        } catch (e) {
+            console.warn("RTDB load announcements warning:", e.message);
+        }
+    }
+
+    if (!db) return Array.from(memoryAnnouncements.values());
     try {
         const snapshot = await db.collection('announcements').get();
         memoryAnnouncements.clear();
@@ -291,9 +347,29 @@ async function loadAnnouncementsFromFirestore(force = false) {
 }
 
 async function loadUsedHashesFromFirestore(force = false) {
-    if (!db) return;
     const now = Date.now();
     if (!force && usedHashesLastLoaded && (now - usedHashesLastLoaded) < STARTUP_CACHE_TTL && memoryUsedHashes.size > 0) return;
+
+    if (rtdb) {
+        try {
+            const snap = await rtdb.ref('usedHashes').once('value');
+            if (snap.exists()) {
+                const dataObj = snap.val() || {};
+                let loaded = 0;
+                Object.keys(dataObj).forEach(h => {
+                    memoryUsedHashes.set(h, dataObj[h] || { time: Date.now() });
+                    loaded++;
+                });
+                usedHashesLastLoaded = Date.now();
+                console.log(`✅ Loaded ${loaded} used hashes from RTDB into memory cache.`);
+                return;
+            }
+        } catch (e) {
+            console.warn("RTDB load used hashes warning:", e.message);
+        }
+    }
+
+    if (!db) return;
     try {
         const snapshot = await db.collection('usedHashes').get();
         let loaded = 0;
@@ -363,7 +439,7 @@ try {
         // Start loading data
         loadKeysFromStorage();
         setupRTDBListeners();
-        loadSettingsFromFirestore();
+        loadSettingsFromStorage();
         loadBansFromFirestore();
         loadAnnouncementsFromFirestore(true);
         loadUsedHashesFromFirestore();
@@ -502,7 +578,19 @@ async function isIpBanned(rawIp) {
     const memBan = checkExpiry(memoryBans.get(ip));
     if (memBan) return memBan;
 
-    // 2. Firestore
+    // 2. RTDB
+    if (rtdb) {
+        try {
+            const snap = await rtdb.ref(`bans/${ipToRtdbKey(ip)}`).once('value');
+            if (snap.exists()) {
+                const ban = snap.val();
+                memoryBans.set(ip, ban);
+                return checkExpiry(ban);
+            }
+        } catch (e) {}
+    }
+
+    // 3. Firestore
     if (db) {
         try {
             const doc = await db.collection('bans').doc(encodeURIComponent(ip)).get();
@@ -529,6 +617,13 @@ async function saveBan(ip, durationMs, reason, bannedBy) {
         bannedBy: bannedBy || 'admin'
     };
     memoryBans.set(cleanIp, ban);
+    if (rtdb) {
+        try {
+            await rtdb.ref(`bans/${ipToRtdbKey(cleanIp)}`).set(ban);
+        } catch (e) {
+            console.warn("RTDB ban save failed:", e.message);
+        }
+    }
     if (db) {
         try {
             await db.collection('bans').doc(encodeURIComponent(cleanIp)).set(ban);
@@ -542,6 +637,11 @@ async function saveBan(ip, durationMs, reason, bannedBy) {
 async function clearBan(ip) {
     const cleanIp = normalizeIp(ip);
     memoryBans.delete(cleanIp);
+    if (rtdb) {
+        try {
+            await rtdb.ref(`bans/${ipToRtdbKey(cleanIp)}`).remove();
+        } catch (e) {}
+    }
     if (db) {
         try {
             await db.collection('bans').doc(encodeURIComponent(cleanIp)).delete();
@@ -2077,7 +2177,9 @@ app.post('/api/admin/announcements', verifyAdmin, async (req, res) => {
         if (!heading || !content || !startAt || !endAt) {
             return res.status(400).json({ error: 'Missing required announcement fields' });
         }
+        const id = `ann_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
         const data = {
+            id,
             heading,
             content,
             startAt: new Date(startAt).toISOString(),
@@ -2087,17 +2189,19 @@ app.post('/api/admin/announcements', verifyAdmin, async (req, res) => {
             createdAt: new Date().toISOString(),
             createdBy: 'admin'
         };
-        if (db) {
+        memoryAnnouncements.set(id, data);
+
+        if (rtdb) {
             try {
-                const ref = await db.collection('announcements').add(data);
-                const saved = { id: ref.id, ...data };
-                memoryAnnouncements.set(ref.id, saved);
-                return res.json({ success: true, id: ref.id, data });
-            } catch (fsErr) {
-                console.warn("Firestore announcement create failed:", fsErr.message);
+                await rtdb.ref(`announcements/${id}`).set(data);
+            } catch (e) {
+                console.warn("RTDB announcement save error:", e.message);
             }
         }
-        res.status(503).json({ error: 'Firestore unavailable - cannot persist announcements' });
+        if (db) {
+            db.collection('announcements').doc(id).set(data).catch(() => {});
+        }
+        return res.json({ success: true, id, data });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -2105,7 +2209,7 @@ app.post('/api/admin/announcements', verifyAdmin, async (req, res) => {
 
 app.put('/api/admin/announcements/:id', verifyAdmin, async (req, res) => {
     try {
-        if (!db) return res.status(503).json({ error: 'Firestore unavailable' });
+        const id = req.params.id;
         const { heading, content, startAt, endAt, theme } = req.body;
         const updates = {};
         if (heading) updates.heading = heading;
@@ -2113,9 +2217,19 @@ app.put('/api/admin/announcements/:id', verifyAdmin, async (req, res) => {
         if (startAt) updates.startAt = new Date(startAt).toISOString();
         if (endAt) updates.endAt = new Date(endAt).toISOString();
         if (theme) updates.theme = theme;
-        await db.collection('announcements').doc(req.params.id).update(updates);
-        const existing = memoryAnnouncements.get(req.params.id) || {};
-        memoryAnnouncements.set(req.params.id, { ...existing, ...updates });
+
+        const existing = memoryAnnouncements.get(id) || {};
+        const merged = { ...existing, ...updates };
+        memoryAnnouncements.set(id, merged);
+
+        if (rtdb) {
+            try {
+                await rtdb.ref(`announcements/${id}`).update(updates);
+            } catch (e) {}
+        }
+        if (db) {
+            db.collection('announcements').doc(id).update(updates).catch(() => {});
+        }
         res.json({ success: true });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -2124,9 +2238,17 @@ app.put('/api/admin/announcements/:id', verifyAdmin, async (req, res) => {
 
 app.delete('/api/admin/announcements/:id', verifyAdmin, async (req, res) => {
     try {
-        if (!db) return res.status(503).json({ error: 'Firestore unavailable' });
-        await db.collection('announcements').doc(req.params.id).delete();
-        memoryAnnouncements.delete(req.params.id);
+        const id = req.params.id;
+        memoryAnnouncements.delete(id);
+
+        if (rtdb) {
+            try {
+                await rtdb.ref(`announcements/${id}`).remove();
+            } catch (e) {}
+        }
+        if (db) {
+            db.collection('announcements').doc(id).delete().catch(() => {});
+        }
         res.json({ success: true });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -2135,19 +2257,24 @@ app.delete('/api/admin/announcements/:id', verifyAdmin, async (req, res) => {
 
 app.post('/api/admin/announcements/:id/toggle', verifyAdmin, async (req, res) => {
     try {
-        if (!db) return res.status(503).json({ error: 'Firestore unavailable' });
+        const id = req.params.id;
         let current = true;
-        const inMem = memoryAnnouncements.get(req.params.id);
+        const inMem = memoryAnnouncements.get(id);
         if (inMem) {
             current = inMem.active;
-        } else {
-            const doc = await db.collection('announcements').doc(req.params.id).get();
-            if (!doc.exists) return res.status(404).json({ error: 'Announcement not found' });
-            current = doc.data().active;
         }
-        await db.collection('announcements').doc(req.params.id).update({ active: !current });
-        if (inMem) inMem.active = !current;
-        res.json({ success: true, active: !current });
+        const newActive = !current;
+        if (inMem) inMem.active = newActive;
+
+        if (rtdb) {
+            try {
+                await rtdb.ref(`announcements/${id}`).update({ active: newActive });
+            } catch (e) {}
+        }
+        if (db) {
+            db.collection('announcements').doc(id).update({ active: newActive }).catch(() => {});
+        }
+        res.json({ success: true, active: newActive });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
