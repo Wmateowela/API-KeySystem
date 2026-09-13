@@ -205,35 +205,7 @@ async function loadKeysFromStorage(force = false) {
         }
     }
 
-    // 2. Fallback: Load from Firestore and migrate to RTDB if RTDB was empty
-    if (db) {
-        try {
-            const snapshot = await db.collection('keys').get();
-            const rtdbBatch = {};
-            snapshot.forEach(doc => {
-                const data = doc.data();
-                if (data && data.key) {
-                    const keyName = data.key.toUpperCase();
-                    memoryKeys.set(keyName, data);
-                    rtdbBatch[`keys/${keyName}`] = data;
-                    loaded++;
-                }
-            });
-            keysLastLoaded = Date.now();
-            console.log(`✅ Loaded ${loaded} keys from Firestore into memory.`);
 
-            if (rtdb && Object.keys(rtdbBatch).length > 0) {
-                try {
-                    await rtdb.ref().update(rtdbBatch);
-                    console.log(`✅ Auto-migrated ${Object.keys(rtdbBatch).length} keys from Firestore to RTDB.`);
-                } catch (migrateErr) {
-                    console.warn("RTDB migration warning:", migrateErr.message);
-                }
-            }
-        } catch (e) {
-            console.warn("Could not pre-load keys from Firestore:", e.message);
-        }
-    }
 }
 
 function setupRTDBListeners() {
