@@ -76,20 +76,6 @@ async function loadSettingsFromStorage() {
             console.warn('RTDB provider durations warning:', e.message);
         }
     }
-    if (!db) return;
-    try {
-        const doc = await db.collection('settings').doc('providerDurations').get();
-        if (doc.exists) {
-            const data = doc.data() || {};
-            PROVIDER_KEYS.forEach(p => {
-                const h = parseInt(data[p], 10);
-                if (!isNaN(h) && h > 0) memorySettings.providerDurations[p] = h;
-            });
-            console.log('✅ Loaded provider durations from Firestore:', memorySettings.providerDurations);
-        }
-    } catch (e) {
-        console.warn('Could not load provider durations:', e.message);
-    }
 }
 
 // Initialize Firebase Admin (Firestore + Realtime Database)
@@ -175,6 +161,26 @@ async function deleteKeyFromStorage(key) {
     }
 }
 
+async function getKeyFromStorage(key) {
+    const cleanKey = (key || '').toUpperCase();
+    if (!cleanKey) return null;
+    let data = memoryKeys.get(cleanKey);
+    if (data) return data;
+    if (rtdb) {
+        try {
+            const snap = await rtdb.ref(`keys/${cleanKey}`).once('value');
+            if (snap.exists()) {
+                data = snap.val();
+                if (data) {
+                    memoryKeys.set(cleanKey, data);
+                    return data;
+                }
+            }
+        } catch (e) {}
+    }
+    return null;
+}
+
 // Helpers to pre-warm cache on startup / wake from sleep
 async function loadKeysFromStorage(force = false) {
     const now = Date.now();
@@ -258,24 +264,6 @@ async function loadBansFromFirestore(force = false) {
             console.warn("RTDB load bans warning:", e.message);
         }
     }
-
-    if (!db) return;
-    try {
-        const snapshot = await db.collection('bans').get();
-        let loaded = 0;
-        const nowTime = Date.now();
-        snapshot.forEach(doc => {
-            const data = doc.data();
-            if (data && data.active && (!data.banUntil || data.banUntil > nowTime)) {
-                memoryBans.set(data.ip || decodeURIComponent(doc.id), data);
-                loaded++;
-            }
-        });
-        bansLastLoaded = Date.now();
-        console.log(`✅ Loaded ${loaded} active bans from Firestore into memory cache.`);
-    } catch (e) {
-        console.warn("Could not pre-load bans from Firestore:", e.message);
-    }
 }
 
 async function loadAnnouncementsFromFirestore(force = false) {
@@ -302,19 +290,6 @@ async function loadAnnouncementsFromFirestore(force = false) {
             console.warn("RTDB load announcements warning:", e.message);
         }
     }
-
-    if (!db) return Array.from(memoryAnnouncements.values());
-    try {
-        const snapshot = await db.collection('announcements').get();
-        memoryAnnouncements.clear();
-        snapshot.forEach(doc => {
-            memoryAnnouncements.set(doc.id, { id: doc.id, ...doc.data() });
-        });
-        announcementsLastLoaded = now;
-        console.log(`✅ Loaded ${memoryAnnouncements.size} announcements from Firestore into memory cache.`);
-    } catch (e) {
-        console.warn("Could not load announcements from Firestore:", e.message);
-    }
     return Array.from(memoryAnnouncements.values());
 }
 
@@ -340,36 +315,30 @@ async function loadUsedHashesFromFirestore(force = false) {
             console.warn("RTDB load used hashes warning:", e.message);
         }
     }
-
-    if (!db) return;
-    try {
-        const snapshot = await db.collection('usedHashes').get();
-        let loaded = 0;
-        snapshot.forEach(doc => {
-            memoryUsedHashes.set(doc.id, doc.data() || { time: Date.now() });
-            loaded++;
-        });
-        usedHashesLastLoaded = Date.now();
-        console.log(`✅ Loaded ${loaded} used hashes from Firestore into memory cache.`);
-    } catch (e) {
-        console.warn("Could not pre-load used hashes from Firestore:", e.message);
-    }
 }
 
 async function loadSupportFromFirestore(force = false) {
-    if (!db) return Array.from(memorySupportRequests.values());
     const now = Date.now();
     if (!force && (now - supportLastLoaded) < SUPPORT_CACHE_TTL && memorySupportRequests.size > 0) {
         return Array.from(memorySupportRequests.values());
     }
-    try {
-        const snap = await db.collection('supportRequests').get();
-        memorySupportRequests.clear();
-        snap.forEach(d => memorySupportRequests.set(d.id, { id: d.id, ...d.data() }));
-        supportLastLoaded = now;
-        console.log(`✅ Loaded ${memorySupportRequests.size} support requests from Firestore into memory cache.`);
-    } catch (e) {
-        console.warn("Could not load support requests from Firestore:", e.message);
+    if (rtdb) {
+        try {
+            const snap = await rtdb.ref('supportRequests').once('value');
+            if (snap.exists()) {
+                memorySupportRequests.clear();
+                const dataObj = snap.val() || {};
+                Object.keys(dataObj).forEach(id => {
+                    const item = dataObj[id];
+                    if (item) memorySupportRequests.set(id, { id, ...item });
+                });
+                supportLastLoaded = now;
+                console.log(`✅ Loaded ${memorySupportRequests.size} support requests from RTDB into memory cache.`);
+                return Array.from(memorySupportRequests.values());
+            }
+        } catch (e) {
+            console.warn("RTDB load support warning:", e.message);
+        }
     }
     return Array.from(memorySupportRequests.values());
 }
@@ -561,18 +530,6 @@ async function isIpBanned(rawIp) {
             }
         } catch (e) {}
     }
-
-    // 3. Firestore
-    if (db) {
-        try {
-            const doc = await db.collection('bans').doc(encodeURIComponent(ip)).get();
-            if (doc.exists) {
-                const ban = { ip, ...doc.data() };
-                memoryBans.set(ip, ban);
-                return checkExpiry(ban);
-            }
-        } catch (e) { /* ignore */ }
-    }
     return null;
 }
 
@@ -597,11 +554,7 @@ async function saveBan(ip, durationMs, reason, bannedBy) {
         }
     }
     if (db) {
-        try {
-            await db.collection('bans').doc(encodeURIComponent(cleanIp)).set(ban);
-        } catch (e) {
-            console.warn("Firestore ban save failed:", e.message);
-        }
+        db.collection('bans').doc(encodeURIComponent(cleanIp)).set(ban).catch(() => {});
     }
     return ban;
 }
@@ -615,9 +568,7 @@ async function clearBan(ip) {
         } catch (e) {}
     }
     if (db) {
-        try {
-            await db.collection('bans').doc(encodeURIComponent(cleanIp)).delete();
-        } catch (e) { /* ignore */ }
+        db.collection('bans').doc(encodeURIComponent(cleanIp)).delete().catch(() => {});
     }
 }
 
@@ -760,12 +711,15 @@ app.post('/api/admin/provider-config', verifyAdmin, rateLimit('admin'), async (r
         if (Object.keys(updated).length === 0) {
             return res.status(400).json({ success: false, error: 'No valid durations provided.' });
         }
-        if (db) {
+        if (rtdb) {
             try {
-                await db.collection('settings').doc('providerDurations').set(memorySettings.providerDurations, { merge: true });
+                await rtdb.ref('settings/providerDurations').set(memorySettings.providerDurations);
             } catch (e) {
-                console.warn('Could not persist provider durations:', e.message);
+                console.warn('Could not persist provider durations to RTDB:', e.message);
             }
+        }
+        if (db) {
+            db.collection('settings').doc('providerDurations').set(memorySettings.providerDurations, { merge: true }).catch(() => {});
         }
         res.json({ success: true, durations: { ...memorySettings.providerDurations } });
     } catch (e) {
@@ -798,24 +752,26 @@ app.post('/api/create-lootlabs-locker', async (req, res) => {
     const userCountry = await getCountry(userIp);
 
     // Store pending entry with user's real browser IP & country
-    memoryLootlabsPending.set(postbackValue, {
+    const pendingData = {
         userId,
         time: Date.now(),
         redeemed: false,
         ip: userIp,
         country: userCountry
-    });
+    };
+    memoryLootlabsPending.set(postbackValue, pendingData);
+    if (rtdb) {
+        rtdb.ref(`lootlabsPending/${postbackValue}`).set(pendingData).catch(() => {});
+    }
     if (db) {
-        try {
-            await db.collection('lootlabsPending').doc(postbackValue).set({
-                userId,
-                createdAt: FieldValue.serverTimestamp(),
-                timestamp: Date.now(),
-                redeemed: false,
-                ip: userIp,
-                country: userCountry
-            });
-        } catch (e) {}
+        db.collection('lootlabsPending').doc(postbackValue).set({
+            userId,
+            createdAt: FieldValue.serverTimestamp(),
+            timestamp: Date.now(),
+            redeemed: false,
+            ip: userIp,
+            country: userCountry
+        }).catch(() => {});
     }
 
     // Destination URL LootLabs will redirect user to after completion
@@ -877,11 +833,11 @@ async function redeemLootlabsPostback(postbackValue, req) {
     let pending = memoryLootlabsPending.get(postbackValue);
     let matchedDocId = postbackValue;
 
-    if (!pending && db) {
+    if (!pending && rtdb) {
         try {
-            const doc = await db.collection('lootlabsPending').doc(postbackValue).get();
-            if (doc.exists) {
-                pending = doc.data();
+            const snap = await rtdb.ref(`lootlabsPending/${postbackValue}`).once('value');
+            if (snap.exists()) {
+                pending = snap.val();
                 matchedDocId = postbackValue;
             }
         } catch (e) {}
@@ -914,10 +870,11 @@ async function redeemLootlabsPostback(postbackValue, req) {
     // Mark redeemed FIRST (prevents any double issue)
     pending.redeemed = true;
     memoryLootlabsPending.set(matchedDocId, pending);
+    if (rtdb) {
+        rtdb.ref(`lootlabsPending/${matchedDocId}`).update({ redeemed: true, redeemedAt: Date.now() }).catch(() => {});
+    }
     if (db) {
-        try {
-            await db.collection('lootlabsPending').doc(matchedDocId).update({ redeemed: true, redeemedAt: FieldValue.serverTimestamp() });
-        } catch (e) {}
+        db.collection('lootlabsPending').doc(matchedDocId).update({ redeemed: true, redeemedAt: FieldValue.serverTimestamp() }).catch(() => {});
     }
 
     const issued = await issueLootlabsKey(userId, matchedDocId, req, pending);
@@ -1038,16 +995,20 @@ async function issueLootlabsKey(userId, postbackValue, req, pending = null) {
     // Save to RAM + RTDB + Firestore
     await saveKeyToStorage(keyString, newKeyDoc);
 
+    const claimDoc = {
+        key: keyString,
+        expiresAt: expiresAt,
+        issuedAt: now
+    };
+    if (rtdb) {
+        rtdb.ref(`lootlabsClaimed/${userId}`).set(claimDoc).catch(() => {});
+    }
     if (db) {
-        try {
-            await db.collection('lootlabsClaimed').doc(userId).set({
-                key: keyString,
-                expiresAt: expiresAt,
-                issuedAt: FieldValue.serverTimestamp()
-            });
-        } catch (e) {
-            console.error(`[Firestore] Failed to persist claim for ${userId}:`, e.message);
-        }
+        db.collection('lootlabsClaimed').doc(userId).set({
+            key: keyString,
+            expiresAt: expiresAt,
+            issuedAt: FieldValue.serverTimestamp()
+        }).catch(() => {});
     }
     memoryLootlabsPending.set(`__claimed_${userId}`, { key: keyString, expiresAt, time: now });
     console.log(`[Key Issued] ${keyString} for ${userId} via LootLabs`);
@@ -1085,13 +1046,13 @@ app.post('/api/claim-lootlabs-key', rateLimit('lootlabsPost'), async (req, res) 
             }
         }
 
-        // 3. Fallback: Check Firestore claimed collection only if not found in memory
-        if (db) {
+        // 3. Fallback: Check RTDB claimed node
+        if (rtdb) {
             try {
-                const doc = await db.collection('lootlabsClaimed').doc(userId).get();
-                if (doc.exists) {
-                    const data = doc.data();
-                    if (data.expiresAt && data.expiresAt > Date.now()) {
+                const snap = await rtdb.ref(`lootlabsClaimed/${userId}`).once('value');
+                if (snap.exists()) {
+                    const data = snap.val();
+                    if (data && data.expiresAt && data.expiresAt > Date.now()) {
                         memoryLootlabsPending.set(`__claimed_${userId}`, { key: data.key, expiresAt: data.expiresAt, time: Date.now() });
                         return res.json({ success: true, key: data.key, expiresAt: data.expiresAt });
                     }
@@ -1124,24 +1085,26 @@ app.post('/api/create-workink-task', async (req, res) => {
     const userIp = getClientIp(req);
     const userCountry = await getCountry(userIp);
 
-    memoryWorkinkPending.set(postbackValue, {
+    const pendingData = {
         userId,
         time: Date.now(),
         redeemed: false,
         ip: userIp,
         country: userCountry
-    });
+    };
+    memoryWorkinkPending.set(postbackValue, pendingData);
+    if (rtdb) {
+        rtdb.ref(`workinkPending/${postbackValue}`).set(pendingData).catch(() => {});
+    }
     if (db) {
-        try {
-            await db.collection('workinkPending').doc(postbackValue).set({
-                userId,
-                createdAt: FieldValue.serverTimestamp(),
-                timestamp: Date.now(),
-                redeemed: false,
-                ip: userIp,
-                country: userCountry
-            });
-        } catch (e) {}
+        db.collection('workinkPending').doc(postbackValue).set({
+            userId,
+            createdAt: FieldValue.serverTimestamp(),
+            timestamp: Date.now(),
+            redeemed: false,
+            ip: userIp,
+            country: userCountry
+        }).catch(() => {});
     }
 
     const requestedUrl = (req.body && typeof req.body.destinationUrl === 'string' && req.body.destinationUrl.trim()) ? req.body.destinationUrl.trim() : null;
@@ -1198,11 +1161,11 @@ async function redeemWorkinkPostback(postbackValue, req) {
     let pending = memoryWorkinkPending.get(postbackValue);
     let matchedDocId = postbackValue;
 
-    if (!pending && db) {
+    if (!pending && rtdb) {
         try {
-            const doc = await db.collection('workinkPending').doc(postbackValue).get();
-            if (doc.exists) {
-                pending = doc.data();
+            const snap = await rtdb.ref(`workinkPending/${postbackValue}`).once('value');
+            if (snap.exists()) {
+                pending = snap.val();
                 matchedDocId = postbackValue;
             }
         } catch (e) {}
@@ -1234,10 +1197,11 @@ async function redeemWorkinkPostback(postbackValue, req) {
 
     pending.redeemed = true;
     memoryWorkinkPending.set(matchedDocId, pending);
+    if (rtdb) {
+        rtdb.ref(`workinkPending/${matchedDocId}`).update({ redeemed: true, redeemedAt: Date.now() }).catch(() => {});
+    }
     if (db) {
-        try {
-            await db.collection('workinkPending').doc(matchedDocId).update({ redeemed: true, redeemedAt: FieldValue.serverTimestamp() });
-        } catch (e) {}
+        db.collection('workinkPending').doc(matchedDocId).update({ redeemed: true, redeemedAt: FieldValue.serverTimestamp() }).catch(() => {});
     }
 
     const issued = await issueWorkinkKey(userId, matchedDocId, req, pending);
@@ -1330,16 +1294,20 @@ async function issueWorkinkKey(userId, postbackValue, req, pending = null) {
     // Save to RAM + RTDB + Firestore
     await saveKeyToStorage(keyString, newKeyDoc);
 
+    const claimDoc = {
+        key: keyString,
+        expiresAt: expiresAt,
+        issuedAt: now
+    };
+    if (rtdb) {
+        rtdb.ref(`workinkClaimed/${userId}`).set(claimDoc).catch(() => {});
+    }
     if (db) {
-        try {
-            await db.collection('workinkClaimed').doc(userId).set({
-                key: keyString,
-                expiresAt: expiresAt,
-                issuedAt: FieldValue.serverTimestamp()
-            });
-        } catch (e) {
-            console.error(`[Firestore] Failed to persist claim for ${userId}:`, e.message);
-        }
+        db.collection('workinkClaimed').doc(userId).set({
+            key: keyString,
+            expiresAt: expiresAt,
+            issuedAt: FieldValue.serverTimestamp()
+        }).catch(() => {});
     }
     memoryWorkinkPending.set(`__claimed_${userId}`, { key: keyString, expiresAt, time: now });
     console.log(`[Key Issued] ${keyString} for ${userId} via Work.ink`);
@@ -1374,33 +1342,15 @@ app.post('/api/claim-workink-key', rateLimit('lootlabsPost'), async (req, res) =
             }
         }
 
-        // 3. Firestore fallback only if not found in memory
-        if (db) {
+        // 3. Check RTDB claimed node
+        if (rtdb) {
             try {
-                const doc = await db.collection('workinkClaimed').doc(userId).get();
-                if (doc.exists) {
-                    const data = doc.data();
-                    if (data.expiresAt && data.expiresAt > Date.now()) {
+                const snap = await rtdb.ref(`workinkClaimed/${userId}`).once('value');
+                if (snap.exists()) {
+                    const data = snap.val();
+                    if (data && data.expiresAt && data.expiresAt > Date.now()) {
                         memoryWorkinkPending.set(`__claimed_${userId}`, { key: data.key, expiresAt: data.expiresAt, time: Date.now() });
                         return res.json({ success: true, key: data.key, expiresAt: data.expiresAt });
-                    }
-                }
-            } catch (e) {}
-        }
-
-        // 3. Scan Firestore keys collection if not in memory (in case server restarted)
-        if (db && postbackValue) {
-            try {
-                const snap = await db.collection('keys')
-                    .where('workinkPostback', '==', postbackValue)
-                    .where('userId', '==', userId)
-                    .limit(1)
-                    .get();
-                if (!snap.empty) {
-                    const doc = snap.docs[0].data();
-                    if (doc.expiresAt > Date.now() && !doc.revoked) {
-                        memoryKeys.set(doc.key, doc);
-                        return res.json({ success: true, key: doc.key, expiresAt: doc.expiresAt });
                     }
                 }
             } catch (e) {}
@@ -1463,21 +1413,19 @@ app.post('/api/claim-key', rateLimit('claim'), async (req, res) => {
     try {
         console.log(`[Claim Key] Processing hash: ${hash} for user: ${userId}`);
 
-        // 1. Check if hash was already used (Memory & Firebase)
+        // 1. Check if hash was already used (Memory & RTDB)
         if (memoryUsedHashes.has(hash)) {
             return res.status(403).json({ success: false, error: "This completion hash has already been used. Please get a new key." });
         }
 
-        if (db) {
+        if (rtdb) {
             try {
-                const hashRef = db.collection('usedHashes').doc(hash);
-                const hashDoc = await hashRef.get();
-                if (hashDoc.exists) {
+                const snap = await rtdb.ref(`usedHashes/${hash}`).once('value');
+                if (snap.exists()) {
+                    memoryUsedHashes.set(hash, snap.val() || { time: Date.now() });
                     return res.status(403).json({ success: false, error: "This completion hash has already been used. Please get a new key." });
                 }
-            } catch (dbErr) {
-                console.warn("Firestore hash check skipped:", dbErr.message);
-            }
+            } catch (rtdbErr) {}
         }
 
         // 2. Verify hash with Linkvertise Anti-Bypassing API
@@ -1520,15 +1468,17 @@ app.post('/api/claim-key', rateLimit('claim'), async (req, res) => {
         }
 
         // 3. Mark hash as used
-        memoryUsedHashes.set(hash, { userId, time: Date.now() });
+        const usedEntry = { userId, time: Date.now() };
+        memoryUsedHashes.set(hash, usedEntry);
+        if (rtdb) {
+            rtdb.ref(`usedHashes/${hash}`).set(usedEntry).catch(() => {});
+        }
         if (db) {
-            try {
-                await db.collection('usedHashes').doc(hash).set({ 
-                    usedAt: FieldValue.serverTimestamp(), 
-                    userId: userId,
-                    timestamp: Date.now()
-                });
-            } catch (e) {}
+            db.collection('usedHashes').doc(hash).set({ 
+                usedAt: FieldValue.serverTimestamp(), 
+                userId: userId,
+                timestamp: Date.now()
+            }).catch(() => {});
         }
 
         // 4. Generate unique 12-hour key (e.g. 8A3F-D1E2-99C4)
@@ -1595,18 +1545,11 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
 
         let keyData = memoryKeys.get(cleanKey);
 
-        // If not in memory, check Firestore
-        if (!keyData && db) {
-            try {
-                const keyDoc = await db.collection('keys').doc(cleanKey).get();
-                if (keyDoc.exists) {
-                    keyData = keyDoc.data();
-                    memoryKeys.set(cleanKey, keyData); // Cache in memory
-                } else {
-                    memoryInvalidKeys.set(cleanKey, Date.now()); // Cache negative result for 10 mins
-                }
-            } catch (dbErr) {
-                console.warn("Firestore verify lookup skipped:", dbErr.message);
+        // If not in memory, check RTDB
+        if (!keyData) {
+            keyData = await getKeyFromStorage(cleanKey);
+            if (!keyData) {
+                memoryInvalidKeys.set(cleanKey, Date.now()); // Cache negative result for 10 mins
             }
         }
 
@@ -1892,14 +1835,9 @@ app.post('/api/admin/create-key', verifyAdmin, rateLimit('admin'), async (req, r
             if (keyString.length < 6 || keyString.length > 64) {
                 return res.status(400).json({ error: 'Custom key must be 6-64 characters (A-Z, 0-9, dash).' });
             }
-            if (memoryKeys.has(keyString)) {
+            const existing = await getKeyFromStorage(keyString);
+            if (existing) {
                 return res.status(409).json({ error: 'A key with this value already exists.' });
-            }
-            if (db) {
-                try {
-                    const existing = await db.collection('keys').doc(keyString).get();
-                    if (existing.exists) return res.status(409).json({ error: 'A key with this value already exists.' });
-                } catch (e) { /* ignore */ }
             }
         } else {
             const keyName = (name || prefix || '').toString().trim().toUpperCase().replace(/[^A-Z0-9-]/g, '');
@@ -1939,13 +1877,7 @@ app.post('/api/admin/create-key', verifyAdmin, rateLimit('admin'), async (req, r
 app.post('/api/admin/revoke-key/:key', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
         const key = req.params.key.toUpperCase();
-        let data = memoryKeys.get(key);
-
-        if (!data && db) {
-            const doc = await db.collection('keys').doc(key).get();
-            if (doc.exists) data = doc.data();
-        }
-
+        let data = await getKeyFromStorage(key);
         if (!data) return res.status(404).json({ error: 'Key not found' });
 
         await updateKeyInStorage(key, { revoked: true, revokedAt: Date.now() });
@@ -1958,11 +1890,7 @@ app.post('/api/admin/revoke-key/:key', verifyAdmin, rateLimit('admin'), async (r
 app.delete('/api/admin/delete-key/:key', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
         const key = req.params.key.toUpperCase();
-        let data = memoryKeys.get(key);
-        if (!data && db) {
-            const doc = await db.collection('keys').doc(key).get();
-            if (doc.exists) data = doc.data();
-        }
+        let data = await getKeyFromStorage(key);
         if (!data) return res.status(404).json({ error: 'Key not found' });
 
         await deleteKeyFromStorage(key);
@@ -1977,11 +1905,7 @@ app.post('/api/admin/ban-key/:key', verifyAdmin, rateLimit('admin'), async (req,
     try {
         const key = req.params.key.toUpperCase();
         const { durationMs, reason } = req.body || {};
-        let data = memoryKeys.get(key);
-        if (!data && db) {
-            const doc = await db.collection('keys').doc(key).get();
-            if (doc.exists) data = doc.data();
-        }
+        let data = await getKeyFromStorage(key);
         if (!data) return res.status(404).json({ error: 'Key not found' });
 
         // Revoke the key across RAM + RTDB + Firestore
@@ -2046,11 +1970,7 @@ app.post('/api/admin/extend-key/:key', verifyAdmin, rateLimit('admin'), async (r
         let changeMs = (typeof deltaMs === 'number') ? deltaMs : (hours * 3600000 + minutes * 60000);
         if (!changeMs) return res.status(400).json({ error: 'No time change provided. Use hours/minutes (can be negative).' });
 
-        let data = memoryKeys.get(key);
-        if (!data && db) {
-            const doc = await db.collection('keys').doc(key).get();
-            if (doc.exists) data = doc.data();
-        }
+        let data = await getKeyFromStorage(key);
         if (!data) return res.status(404).json({ error: 'Key not found' });
 
         // Lifetime keys (expiresAt === 0) cannot be reduced; allow positive to convert to timed? Keep simple: skip.
@@ -2290,10 +2210,6 @@ app.post('/api/support/submit', rateLimit('claim'), async (req, res) => {
         }
         const emailClean = email ? String(email).trim().slice(0, 160) : '';
 
-        if (!db) {
-            return res.status(503).json({ success: false, error: 'Submissions are temporarily unavailable. Please try later.' });
-        }
-
         const day = todayKey();
         const norm = text.toLowerCase().replace(/\s+/g, ' ');
 
@@ -2314,35 +2230,15 @@ app.post('/api/support/submit', rateLimit('claim'), async (req, res) => {
             return res.status(429).json({ success: false, error: `You can send only one ${kind === 'bug' ? 'bug report' : 'feature suggestion'} per day.` });
         }
 
-        // Only query Firestore if memory cache is completely empty
-        if (memorySupportRequests.size === 0) {
-            const existingSnap = await db.collection('supportRequests')
-                .where('userId', '==', userId)
-                .where('type', '==', kind)
-                .where('dayKey', '==', day)
-                .limit(1)
-                .get();
-            if (!existingSnap.empty) {
-                return res.status(429).json({ success: false, error: `You can send only one ${kind === 'bug' ? 'bug report' : 'feature suggestion'} per day.` });
-            }
-        }
-
-        // Uniqueness check for suggestions
         let unique = !isDuplicateSuggestion;
-        if (kind === 'suggestion' && unique && memorySupportRequests.size === 0) {
-            const dupSnap = await db.collection('supportRequests')
-                .where('type', '==', 'suggestion')
-                .where('normalizedMessage', '==', norm)
-                .limit(1)
-                .get();
-            unique = dupSnap.empty;
-        }
+        const supportId = 'sup_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
 
         const doc = {
+            id: supportId,
             userId,
             type: kind,
             message: text,
-            normalizedMessage: text.toLowerCase().replace(/\s+/g, ' '),
+            normalizedMessage: norm,
             email: emailClean,
             status: 'pending',
             unique,
@@ -2352,8 +2248,25 @@ app.post('/api/support/submit', rateLimit('claim'), async (req, res) => {
             createdAtIso: new Date().toISOString(),
             dayKey: day
         };
-        const ref = await db.collection('supportRequests').add(doc);
-        memorySupportRequests.set(ref.id, { id: ref.id, ...doc });
+
+        // 1. Save to Memory
+        memorySupportRequests.set(supportId, doc);
+
+        // 2. Save to RTDB (Primary persistent store)
+        if (rtdb) {
+            try {
+                await rtdb.ref(`supportRequests/${supportId}`).set(doc);
+            } catch (rtdbErr) {
+                console.warn('RTDB support submit warning:', rtdbErr.message);
+            }
+        }
+
+        // 3. Save to Firestore (Non-blocking backup)
+        if (db) {
+            db.collection('supportRequests').doc(supportId).set(doc).catch(fsErr => {
+                // Ignore quota or network errors
+            });
+        }
 
         let note = '';
         if (kind === 'suggestion') {
@@ -2368,7 +2281,7 @@ app.post('/api/support/submit', rateLimit('claim'), async (req, res) => {
             if (emailClean) note += ' We will contact you at ' + emailClean + ' if needed.';
         }
 
-        res.json({ success: true, id: ref.id, unique, message: note });
+        res.json({ success: true, id: supportId, unique, message: note });
     } catch (e) {
         console.error('Support submit error:', e.message);
         res.status(500).json({ success: false, error: 'Server error. Please try again.' });
@@ -2406,23 +2319,24 @@ app.get('/api/admin/support', verifyAdmin, rateLimit('admin'), async (req, res) 
 // Admin: approve / reject a request (approve issues a FREE 24h key to that user)
 app.post('/api/admin/support/:id/action', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
-        if (!db) return res.status(503).json({ error: 'Firestore unavailable' });
+        const supportId = req.params.id;
         const { action } = req.body || {};
-        const ref = db.collection('supportRequests').doc(req.params.id);
-        const inMem = memorySupportRequests.get(req.params.id);
-        let data = inMem;
-        if (!data) {
-            const doc = await ref.get();
-            if (!doc.exists) return res.status(404).json({ error: 'Request not found' });
-            data = doc.data();
+        let data = memorySupportRequests.get(supportId);
+        
+        if (!data && rtdb) {
+            try {
+                const snap = await rtdb.ref(`supportRequests/${supportId}`).once('value');
+                if (snap.exists()) data = snap.val();
+            } catch (e) {}
         }
+        if (!data) return res.status(404).json({ error: 'Request not found' });
 
         if (action === 'reject') {
-            await ref.update({ status: 'rejected', resolvedAt: Date.now() });
-            if (inMem) {
-                inMem.status = 'rejected';
-                inMem.resolvedAt = Date.now();
-            }
+            const updates = { status: 'rejected', resolvedAt: Date.now() };
+            Object.assign(data, updates);
+            memorySupportRequests.set(supportId, data);
+            if (rtdb) rtdb.ref(`supportRequests/${supportId}`).update(updates).catch(() => {});
+            if (db) db.collection('supportRequests').doc(supportId).update(updates).catch(() => {});
             return res.json({ success: true, status: 'rejected' });
         }
 
@@ -2450,14 +2364,11 @@ app.post('/api/admin/support/:id/action', verifyAdmin, rateLimit('admin'), async
                 country: '-'
             };
             await saveKeyToStorage(keyString, newKey);
-            await ref.update({ status: 'approved', keyIssued: true, issuedKey: keyString, issuedExpiresAt: expiresAt, resolvedAt: now });
-            if (inMem) {
-                inMem.status = 'approved';
-                inMem.keyIssued = true;
-                inMem.issuedKey = keyString;
-                inMem.issuedExpiresAt = expiresAt;
-                inMem.resolvedAt = now;
-            }
+            const updates = { status: 'approved', keyIssued: true, issuedKey: keyString, issuedExpiresAt: expiresAt, resolvedAt: now };
+            Object.assign(data, updates);
+            memorySupportRequests.set(supportId, data);
+            if (rtdb) rtdb.ref(`supportRequests/${supportId}`).update(updates).catch(() => {});
+            if (db) db.collection('supportRequests').doc(supportId).update(updates).catch(() => {});
             return res.json({ success: true, status: 'approved', key: keyString, expiresAt });
         }
 
