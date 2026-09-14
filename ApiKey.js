@@ -16,14 +16,11 @@ const memoryLootlabsPending = new Map(); // postbackValue -> { userId, time, red
 const memoryWorkinkPending = new Map();  // postbackValue -> { userId, time, redeemed, ip, country }
 const memoryBans = new Map();           // ip -> { ip, reason, banUntil, bannedAt, active }
 const memoryAnnouncements = new Map();  // id -> announcementDoc
-const memorySupportRequests = new Map(); // id -> supportDoc
 const memoryInvalidKeys = new Map();     // key -> timestamp (negative cache to prevent 404 DB spam)
 const onlineUsers = new Map();          // userId -> lastSeen (ms)
 
 let announcementsLastLoaded = 0;
 const ANNOUNCEMENTS_CACHE_TTL = 10 * 60 * 1000; // 10 mins
-let supportLastLoaded = 0;
-const SUPPORT_CACHE_TTL = 10 * 60 * 1000; // 10 mins
 let keysLastLoaded = 0;
 let bansLastLoaded = 0;
 let usedHashesLastLoaded = 0;
@@ -103,12 +100,6 @@ async function saveKeyToStorage(key, keyData) {
         }
     }
 
-    // 3. Firestore (Background Backup - non-blocking)
-    if (db) {
-        db.collection('keys').doc(cleanKey).set(keyData).catch(fsErr => {
-            // firestore quota or network error ignored
-        });
-    }
 }
 
 async function updateKeyInStorage(key, updates) {
@@ -129,12 +120,6 @@ async function updateKeyInStorage(key, updates) {
         }
     }
 
-    // 3. Firestore (Background Backup - non-blocking)
-    if (db) {
-        db.collection('keys').doc(cleanKey).update(updates).catch(fsErr => {
-            // firestore quota or network error ignored
-        });
-    }
 }
 
 async function deleteKeyFromStorage(key) {
@@ -153,12 +138,6 @@ async function deleteKeyFromStorage(key) {
         }
     }
 
-    // 3. Firestore (Background Backup - non-blocking)
-    if (db) {
-        db.collection('keys').doc(cleanKey).delete().catch(fsErr => {
-            // firestore quota or network error ignored
-        });
-    }
 }
 
 async function getKeyFromStorage(key) {
@@ -315,32 +294,6 @@ async function loadUsedHashesFromFirestore(force = false) {
             console.warn("RTDB load used hashes warning:", e.message);
         }
     }
-}
-
-async function loadSupportFromFirestore(force = false) {
-    const now = Date.now();
-    if (!force && (now - supportLastLoaded) < SUPPORT_CACHE_TTL && memorySupportRequests.size > 0) {
-        return Array.from(memorySupportRequests.values());
-    }
-    if (rtdb) {
-        try {
-            const snap = await rtdb.ref('supportRequests').once('value');
-            if (snap.exists()) {
-                memorySupportRequests.clear();
-                const dataObj = snap.val() || {};
-                Object.keys(dataObj).forEach(id => {
-                    const item = dataObj[id];
-                    if (item) memorySupportRequests.set(id, { id, ...item });
-                });
-                supportLastLoaded = now;
-                console.log(`✅ Loaded ${memorySupportRequests.size} support requests from RTDB into memory cache.`);
-                return Array.from(memorySupportRequests.values());
-            }
-        } catch (e) {
-            console.warn("RTDB load support warning:", e.message);
-        }
-    }
-    return Array.from(memorySupportRequests.values());
 }
 
 try {
@@ -553,9 +506,6 @@ async function saveBan(ip, durationMs, reason, bannedBy) {
             console.warn("RTDB ban save failed:", e.message);
         }
     }
-    if (db) {
-        db.collection('bans').doc(encodeURIComponent(cleanIp)).set(ban).catch(() => {});
-    }
     return ban;
 }
 
@@ -566,9 +516,6 @@ async function clearBan(ip) {
         try {
             await rtdb.ref(`bans/${ipToRtdbKey(cleanIp)}`).remove();
         } catch (e) {}
-    }
-    if (db) {
-        db.collection('bans').doc(encodeURIComponent(cleanIp)).delete().catch(() => {});
     }
 }
 
@@ -718,9 +665,6 @@ app.post('/api/admin/provider-config', verifyAdmin, rateLimit('admin'), async (r
                 console.warn('Could not persist provider durations to RTDB:', e.message);
             }
         }
-        if (db) {
-            db.collection('settings').doc('providerDurations').set(memorySettings.providerDurations, { merge: true }).catch(() => {});
-        }
         res.json({ success: true, durations: { ...memorySettings.providerDurations } });
     } catch (e) {
         res.status(500).json({ success: false, error: e.message });
@@ -762,16 +706,6 @@ app.post('/api/create-lootlabs-locker', async (req, res) => {
     memoryLootlabsPending.set(postbackValue, pendingData);
     if (rtdb) {
         rtdb.ref(`lootlabsPending/${postbackValue}`).set(pendingData).catch(() => {});
-    }
-    if (db) {
-        db.collection('lootlabsPending').doc(postbackValue).set({
-            userId,
-            createdAt: FieldValue.serverTimestamp(),
-            timestamp: Date.now(),
-            redeemed: false,
-            ip: userIp,
-            country: userCountry
-        }).catch(() => {});
     }
 
     // Destination URL LootLabs will redirect user to after completion
@@ -872,9 +806,6 @@ async function redeemLootlabsPostback(postbackValue, req) {
     memoryLootlabsPending.set(matchedDocId, pending);
     if (rtdb) {
         rtdb.ref(`lootlabsPending/${matchedDocId}`).update({ redeemed: true, redeemedAt: Date.now() }).catch(() => {});
-    }
-    if (db) {
-        db.collection('lootlabsPending').doc(matchedDocId).update({ redeemed: true, redeemedAt: FieldValue.serverTimestamp() }).catch(() => {});
     }
 
     const issued = await issueLootlabsKey(userId, matchedDocId, req, pending);
@@ -1003,13 +934,6 @@ async function issueLootlabsKey(userId, postbackValue, req, pending = null) {
     if (rtdb) {
         rtdb.ref(`lootlabsClaimed/${userId}`).set(claimDoc).catch(() => {});
     }
-    if (db) {
-        db.collection('lootlabsClaimed').doc(userId).set({
-            key: keyString,
-            expiresAt: expiresAt,
-            issuedAt: FieldValue.serverTimestamp()
-        }).catch(() => {});
-    }
     memoryLootlabsPending.set(`__claimed_${userId}`, { key: keyString, expiresAt, time: now });
     console.log(`[Key Issued] ${keyString} for ${userId} via LootLabs`);
     return { key: keyString, expiresAt };
@@ -1095,16 +1019,6 @@ app.post('/api/create-workink-task', async (req, res) => {
     memoryWorkinkPending.set(postbackValue, pendingData);
     if (rtdb) {
         rtdb.ref(`workinkPending/${postbackValue}`).set(pendingData).catch(() => {});
-    }
-    if (db) {
-        db.collection('workinkPending').doc(postbackValue).set({
-            userId,
-            createdAt: FieldValue.serverTimestamp(),
-            timestamp: Date.now(),
-            redeemed: false,
-            ip: userIp,
-            country: userCountry
-        }).catch(() => {});
     }
 
     const requestedUrl = (req.body && typeof req.body.destinationUrl === 'string' && req.body.destinationUrl.trim()) ? req.body.destinationUrl.trim() : null;
@@ -1199,9 +1113,6 @@ async function redeemWorkinkPostback(postbackValue, req) {
     memoryWorkinkPending.set(matchedDocId, pending);
     if (rtdb) {
         rtdb.ref(`workinkPending/${matchedDocId}`).update({ redeemed: true, redeemedAt: Date.now() }).catch(() => {});
-    }
-    if (db) {
-        db.collection('workinkPending').doc(matchedDocId).update({ redeemed: true, redeemedAt: FieldValue.serverTimestamp() }).catch(() => {});
     }
 
     const issued = await issueWorkinkKey(userId, matchedDocId, req, pending);
@@ -1301,13 +1212,6 @@ async function issueWorkinkKey(userId, postbackValue, req, pending = null) {
     };
     if (rtdb) {
         rtdb.ref(`workinkClaimed/${userId}`).set(claimDoc).catch(() => {});
-    }
-    if (db) {
-        db.collection('workinkClaimed').doc(userId).set({
-            key: keyString,
-            expiresAt: expiresAt,
-            issuedAt: FieldValue.serverTimestamp()
-        }).catch(() => {});
     }
     memoryWorkinkPending.set(`__claimed_${userId}`, { key: keyString, expiresAt, time: now });
     console.log(`[Key Issued] ${keyString} for ${userId} via Work.ink`);
@@ -1472,13 +1376,6 @@ app.post('/api/claim-key', rateLimit('claim'), async (req, res) => {
         memoryUsedHashes.set(hash, usedEntry);
         if (rtdb) {
             rtdb.ref(`usedHashes/${hash}`).set(usedEntry).catch(() => {});
-        }
-        if (db) {
-            db.collection('usedHashes').doc(hash).set({ 
-                usedAt: FieldValue.serverTimestamp(), 
-                userId: userId,
-                timestamp: Date.now()
-            }).catch(() => {});
         }
 
         // 4. Generate unique 12-hour key (e.g. 8A3F-D1E2-99C4)
@@ -2024,21 +1921,6 @@ app.post('/api/admin/purge-expired', verifyAdmin, async (req, res) => {
                 }
             }
 
-            // 2. Delete from Firestore
-            if (db) {
-                try {
-                    const chunkSize = 450;
-                    for (let i = 0; i < toDelete.length; i += chunkSize) {
-                        const chunk = toDelete.slice(i, i + chunkSize);
-                        const batch = db.batch();
-                        chunk.forEach(k => batch.delete(db.collection('keys').doc(k)));
-                        await batch.commit();
-                    }
-                } catch (e) {
-                    console.warn("Firestore purge error:", e.message);
-                }
-            }
-
             toDelete.forEach(k => memoryKeys.delete(k));
             deletedCount = toDelete.length;
         }
@@ -2090,9 +1972,6 @@ app.post('/api/admin/announcements', verifyAdmin, async (req, res) => {
                 console.warn("RTDB announcement save error:", e.message);
             }
         }
-        if (db) {
-            db.collection('announcements').doc(id).set(data).catch(() => {});
-        }
         return res.json({ success: true, id, data });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -2119,9 +1998,6 @@ app.put('/api/admin/announcements/:id', verifyAdmin, async (req, res) => {
                 await rtdb.ref(`announcements/${id}`).update(updates);
             } catch (e) {}
         }
-        if (db) {
-            db.collection('announcements').doc(id).update(updates).catch(() => {});
-        }
         res.json({ success: true });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -2137,9 +2013,6 @@ app.delete('/api/admin/announcements/:id', verifyAdmin, async (req, res) => {
             try {
                 await rtdb.ref(`announcements/${id}`).remove();
             } catch (e) {}
-        }
-        if (db) {
-            db.collection('announcements').doc(id).delete().catch(() => {});
         }
         res.json({ success: true });
     } catch (e) {
@@ -2162,9 +2035,6 @@ app.post('/api/admin/announcements/:id/toggle', verifyAdmin, async (req, res) =>
             try {
                 await rtdb.ref(`announcements/${id}`).update({ active: newActive });
             } catch (e) {}
-        }
-        if (db) {
-            db.collection('announcements').doc(id).update({ active: newActive }).catch(() => {});
         }
         res.json({ success: true, active: newActive });
     } catch (e) {
@@ -2196,7 +2066,7 @@ function todayKey() {
     return new Date().toISOString().slice(0, 10);
 }
 
-// Public: submit a bug report or feature suggestion (max 1 of each per user per day)
+// Public: submit a bug report or feature suggestion (stored 100% in Firestore only)
 app.post('/api/support/submit', rateLimit('claim'), async (req, res) => {
     try {
         const { userId, type, message, email } = req.body || {};
@@ -2209,28 +2079,9 @@ app.post('/api/support/submit', rateLimit('claim'), async (req, res) => {
             return res.status(400).json({ success: false, error: 'Message must be between 5 and 2000 characters.' });
         }
         const emailClean = email ? String(email).trim().slice(0, 160) : '';
-
         const day = todayKey();
         const norm = text.toLowerCase().replace(/\s+/g, ' ');
 
-        // Enforce 1 per type per user per day (Check in-memory first for 0 Firestore reads)
-        let alreadySubmittedToday = false;
-        let isDuplicateSuggestion = false;
-        for (const reqDoc of memorySupportRequests.values()) {
-            if (reqDoc.userId === userId && reqDoc.type === kind && reqDoc.dayKey === day) {
-                alreadySubmittedToday = true;
-                break;
-            }
-            if (kind === 'suggestion' && reqDoc.type === 'suggestion' && reqDoc.normalizedMessage === norm) {
-                isDuplicateSuggestion = true;
-            }
-        }
-
-        if (alreadySubmittedToday) {
-            return res.status(429).json({ success: false, error: `You can send only one ${kind === 'bug' ? 'bug report' : 'feature suggestion'} per day.` });
-        }
-
-        let unique = !isDuplicateSuggestion;
         const supportId = 'sup_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
 
         const doc = {
@@ -2241,7 +2092,7 @@ app.post('/api/support/submit', rateLimit('claim'), async (req, res) => {
             normalizedMessage: norm,
             email: emailClean,
             status: 'pending',
-            unique,
+            unique: true,
             keyIssued: false,
             issuedKey: null,
             createdAt: Date.now(),
@@ -2249,30 +2100,16 @@ app.post('/api/support/submit', rateLimit('claim'), async (req, res) => {
             dayKey: day
         };
 
-        // 1. Save to Memory
-        memorySupportRequests.set(supportId, doc);
-
-        // 2. Save to RTDB (Primary persistent store)
-        if (rtdb) {
-            try {
-                await rtdb.ref(`supportRequests/${supportId}`).set(doc);
-            } catch (rtdbErr) {
-                console.warn('RTDB support submit warning:', rtdbErr.message);
-            }
-        }
-
-        // 3. Save to Firestore (Non-blocking backup)
+        // 100% Firestore store for support reports/suggestions
         if (db) {
-            db.collection('supportRequests').doc(supportId).set(doc).catch(fsErr => {
-                // Ignore quota or network errors
-            });
+            await db.collection('supportRequests').doc(supportId).set(doc);
+        } else {
+            console.warn('[Support] Firestore not initialized, support request not persisted.');
         }
 
         let note = '';
         if (kind === 'suggestion') {
-            note = unique
-                ? 'Thanks! Your suggestion is unique. If approved, you will get a FREE 24-hour key.'
-                : 'Thanks! This idea was already suggested before, so it may not qualify for the free key.';
+            note = 'Thanks! Your suggestion has been submitted. If approved, you will get a FREE 24-hour key.';
             note += emailClean
                 ? ' We will contact you at ' + emailClean + ' if approved.'
                 : ' Add your email next time so we can send you the reward key if approved.';
@@ -2281,22 +2118,25 @@ app.post('/api/support/submit', rateLimit('claim'), async (req, res) => {
             if (emailClean) note += ' We will contact you at ' + emailClean + ' if needed.';
         }
 
-        res.json({ success: true, id: supportId, unique, message: note });
+        res.json({ success: true, id: supportId, unique: true, message: note });
     } catch (e) {
         console.error('Support submit error:', e.message);
         res.status(500).json({ success: false, error: 'Server error. Please try again.' });
     }
 });
 
-// Public: view my own submissions (so user can see if a key was issued)
+// Public: view my own submissions (direct from Firestore)
 app.get('/api/support/mine', async (req, res) => {
     try {
         const userId = req.query.userId;
         if (!userId || !/^[a-zA-Z0-9_-]+$/.test(userId)) return res.status(400).json({ success: false, error: 'Invalid userId' });
         
-        // Fast in-memory check
-        const all = await loadSupportFromFirestore(false);
-        const requests = all.filter(r => r.userId === userId);
+        if (!db) return res.json({ requests: [] });
+        const snap = await db.collection('supportRequests').where('userId', '==', userId).get();
+        const requests = [];
+        snap.forEach(docSnap => {
+            requests.push(docSnap.data());
+        });
         requests.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
         res.json({ requests: requests.slice(0, 50) });
     } catch (e) {
@@ -2304,11 +2144,15 @@ app.get('/api/support/mine', async (req, res) => {
     }
 });
 
-// Admin: list all support requests
+// Admin: list all support requests (direct from Firestore)
 app.get('/api/admin/support', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
-        const all = await loadSupportFromFirestore(false);
-        const requests = [...all];
+        if (!db) return res.json({ requests: [] });
+        const snap = await db.collection('supportRequests').get();
+        const requests = [];
+        snap.forEach(docSnap => {
+            requests.push(docSnap.data());
+        });
         requests.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
         res.json({ requests });
     } catch (e) {
@@ -2321,22 +2165,16 @@ app.post('/api/admin/support/:id/action', verifyAdmin, rateLimit('admin'), async
     try {
         const supportId = req.params.id;
         const { action } = req.body || {};
-        let data = memorySupportRequests.get(supportId);
-        
-        if (!data && rtdb) {
-            try {
-                const snap = await rtdb.ref(`supportRequests/${supportId}`).once('value');
-                if (snap.exists()) data = snap.val();
-            } catch (e) {}
-        }
-        if (!data) return res.status(404).json({ error: 'Request not found' });
+        if (!db) return res.status(503).json({ error: 'Firestore database not connected.' });
+
+        const docRef = db.collection('supportRequests').doc(supportId);
+        const docSnap = await docRef.get();
+        if (!docSnap.exists) return res.status(404).json({ error: 'Request not found' });
+        const data = docSnap.data();
 
         if (action === 'reject') {
             const updates = { status: 'rejected', resolvedAt: Date.now() };
-            Object.assign(data, updates);
-            memorySupportRequests.set(supportId, data);
-            if (rtdb) rtdb.ref(`supportRequests/${supportId}`).update(updates).catch(() => {});
-            if (db) db.collection('supportRequests').doc(supportId).update(updates).catch(() => {});
+            await docRef.update(updates);
             return res.json({ success: true, status: 'rejected' });
         }
 
@@ -2365,10 +2203,7 @@ app.post('/api/admin/support/:id/action', verifyAdmin, rateLimit('admin'), async
             };
             await saveKeyToStorage(keyString, newKey);
             const updates = { status: 'approved', keyIssued: true, issuedKey: keyString, issuedExpiresAt: expiresAt, resolvedAt: now };
-            Object.assign(data, updates);
-            memorySupportRequests.set(supportId, data);
-            if (rtdb) rtdb.ref(`supportRequests/${supportId}`).update(updates).catch(() => {});
-            if (db) db.collection('supportRequests').doc(supportId).update(updates).catch(() => {});
+            await docRef.update(updates);
             return res.json({ success: true, status: 'approved', key: keyString, expiresAt });
         }
 
@@ -2405,18 +2240,7 @@ setInterval(async () => {
                     console.warn("[Auto-Purge RTDB Error]:", e.message);
                 }
             }
-
-            // 2. Delete from Firestore
-            if (db) {
-                const chunkSize = 450;
-                for (let i = 0; i < toDelete.length; i += chunkSize) {
-                    const chunk = toDelete.slice(i, i + chunkSize);
-                    const batch = db.batch();
-                    chunk.forEach(k => batch.delete(db.collection('keys').doc(k)));
-                    await batch.commit();
-                }
-            }
-            console.log(`🧹 [Auto-Purge Job] Removed ${toDelete.length} keys expired more than 2 days ago from RTDB & Firestore.`);
+            console.log(`[Auto-Purge Job] Removed ${toDelete.length} keys expired more than 2 days ago from RTDB.`);
         }
 
         toDelete.forEach(k => memoryKeys.delete(k));
@@ -2424,6 +2248,110 @@ setInterval(async () => {
         console.warn("[Auto-Purge Job Error]:", err.message);
     }
 }, 6 * 60 * 60 * 1000);
+
+// ============================================================
+// STORE / CATALOG CONFIGURATION (RTDB-backed)
+// ============================================================
+const DEFAULT_STORE_CONFIG = {
+    avatarItems: [
+        {
+            id: "gold-crown-ozymandias",
+            name: "Gold Crown of Ozymandias",
+            creator: "Roblox",
+            verified: true,
+            tagline: "Custom Player Tag",
+            badgeText: "2 days left",
+            imageUrl: "https://images.rbxcdn.com/192a7bd92c19b511.gif",
+            overlayImageUrl: "",
+            bannerImageUrl: "",
+            bannerBgColor: "#e9ebed",
+            bannerCropX: 50,
+            bannerCropY: 50,
+            bannerScale: 100,
+            bannerFit: "cover",
+            bannerHeight: 230,
+            bannerWidth: 100,
+            bannerAlign: "center",
+            bannerOverlayColor: "#000000",
+            bannerOverlayOpacity: 0,
+            bannerFilterHue: 0,
+            imageOffsetX: 0,
+            imageOffsetY: 0,
+            imageScale: 100,
+            imageAlign: "center",
+            titleColor: "#191b1d",
+            subtitleColor: "#4b5563",
+            titleFontSize: 24,
+            subtitleFontSize: 12,
+            textOffsetX: 0,
+            textOffsetY: 0,
+            textAlign: "left",
+            borderRadius: 16,
+            robux: 24000,
+            originalRobux: 22500,
+            bonusText: "+ 1,500 more",
+            priceUsd: "$199.99",
+            tiers: [
+                { id: "t1", robux: 24000, originalRobux: 22500, bonusText: "+ 1,500 more", priceUsd: "$199.99", enabled: true },
+                { id: "t2", robux: 11000, originalRobux: 10000, bonusText: "+ 1,000 more", priceUsd: "$99.99", enabled: true },
+                { id: "t3", robux: 5250, originalRobux: 4500, bonusText: "+ 750 more", priceUsd: "$49.99", enabled: true },
+                { id: "t4", robux: 3625, originalRobux: 3150, bonusText: "+ 475 more", priceUsd: "$34.99", enabled: true },
+                { id: "t5", robux: 2000, originalRobux: 1700, bonusText: "+ 300 more", priceUsd: "$19.99", enabled: true }
+            ],
+            enabled: true
+        }
+    ],
+    packages: [
+        { id: "pkg-11000", robux: 11000, originalRobux: 10000, priceUsd: "$99.99", bonusText: "", featured: false, forYou: false, enabled: true },
+        { id: "pkg-5250", robux: 5250, originalRobux: 4500, priceUsd: "$49.99", bonusText: "", featured: false, forYou: false, enabled: true },
+        { id: "pkg-3625", robux: 3625, originalRobux: 3150, priceUsd: "$34.99", bonusText: "", featured: false, forYou: false, enabled: true },
+        { id: "pkg-2000", robux: 2000, originalRobux: 1700, priceUsd: "$19.99", bonusText: "", featured: false, forYou: false, enabled: true },
+        { id: "pkg-1500", robux: 1500, originalRobux: 1200, priceUsd: "$14.99", bonusText: "", featured: false, forYou: false, enabled: true },
+        { id: "pkg-1000", robux: 1000, originalRobux: 800, priceUsd: "$9.99", bonusText: "+ 200 more", featured: true, forYou: true, enabled: true },
+        { id: "pkg-500", robux: 500, originalRobux: 400, priceUsd: "$4.99", bonusText: "", featured: false, forYou: false, enabled: true }
+    ],
+    sectionTitles: {
+        avatarSection: "Limited-time avatar items",
+        packagesSection: "Robux packages"
+    },
+    updatedAt: Date.now()
+};
+
+// Public: Get current store catalog configuration
+app.get('/api/store-config', async (req, res) => {
+    try {
+        if (rtdb) {
+            const snap = await rtdb.ref('settings/storeConfig').once('value');
+            if (snap.exists() && snap.val()) {
+                return res.json({ success: true, config: snap.val() });
+            }
+        }
+        return res.json({ success: true, config: DEFAULT_STORE_CONFIG });
+    } catch (e) {
+        console.error('[Store Config GET Error]:', e.message);
+        return res.json({ success: true, config: DEFAULT_STORE_CONFIG });
+    }
+});
+
+// Admin: Save updated store catalog configuration
+app.post('/api/store-config', verifyAdmin, rateLimit('admin'), async (req, res) => {
+    try {
+        const config = req.body && req.body.config ? req.body.config : req.body;
+        if (!config || typeof config !== 'object') {
+            return res.status(400).json({ success: false, error: 'Invalid store config data.' });
+        }
+        config.updatedAt = Date.now();
+
+        if (rtdb) {
+            await rtdb.ref('settings/storeConfig').set(config);
+        }
+
+        return res.json({ success: true, config });
+    } catch (e) {
+        console.error('[Store Config POST Error]:', e.message);
+        return res.status(500).json({ success: false, error: e.message });
+    }
+});
 
 // Start Express API server
 app.listen(PORT, () => {
