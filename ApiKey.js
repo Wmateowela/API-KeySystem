@@ -353,7 +353,7 @@ const LINKVERTISE_TARGET_LINK = process.env.LINKVERTISE_TARGET_LINK || 'https://
 
 // LootLabs Configuration
 const LOOTLABS_API_TOKEN = process.env.LOOTLABS_API_TOKEN || '162b3c3519ec02bfbd0fc20ff5d6cd1fb10954357e0be1eeee7f00929c2d17e9';
-const LOOTLABS_TARGET_LINK = process.env.LOOTLABS_TARGET_LINK || 'https://buy-robl0x.netlify.app/key.html';
+const LOOTLABS_TARGET_LINK = process.env.LOOTLABS_TARGET_LINK || 'https://buy-robox.netlify.app/key.html';
 const LOOTLABS_TIER_ID = parseInt(process.env.LOOTLABS_TIER_ID || '2', 10);
 const LOOTLABS_NUM_TASKS = parseInt(process.env.LOOTLABS_NUM_TASKS || '5', 10);
 const LOOTLABS_THEME = parseInt(process.env.LOOTLABS_THEME || '1', 10);
@@ -368,7 +368,7 @@ const WORKINK_POSTBACK_SECRET = process.env.WORKINK_POSTBACK_SECRET || 'buyroblo
 const WORKINK_MIN_COMPLETE_SECS = parseInt(process.env.WORKINK_MIN_COMPLETE_SECS || '15', 10);
 
 // Frontend base URL (for postback redirects)
-const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || 'https://buy-robl0x.netlify.app';
+const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || 'https://buy-robox.netlify.app';
 
 // Middleware
 app.use(cors());
