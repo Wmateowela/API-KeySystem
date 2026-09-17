@@ -28,14 +28,35 @@ const STARTUP_CACHE_TTL = 15 * 60 * 1000; // 15 min guard: skip full reload if r
 
 const FIREBASE_DATABASE_URL = process.env.FIREBASE_DATABASE_URL || 'https://buy-r-bl0x-default-rtdb.asia-southeast1.firebasedatabase.app/';
 
-// Provider key-duration config (admin-managed). Values are in hours.
+// Provider key-duration & status config (admin-managed).
 const DEFAULT_PROVIDER_DURATIONS = {
     linkvertise: 6,
     lootlabs: 2,
     workink: 12
 };
+const DEFAULT_PROVIDER_SETTINGS = {
+    linkvertise: {
+        duration: 6,
+        locked: false,
+        status: 'working', // 'working' | 'under_review' | 'not_working'
+        tag: 'Instant'
+    },
+    lootlabs: {
+        duration: 2,
+        locked: false,
+        status: 'working',
+        tag: 'Fast'
+    },
+    workink: {
+        duration: 12,
+        locked: false,
+        status: 'working',
+        tag: 'Best Value'
+    }
+};
 const memorySettings = {
     providerDurations: { ...DEFAULT_PROVIDER_DURATIONS },
+    providerSettings: JSON.parse(JSON.stringify(DEFAULT_PROVIDER_SETTINGS)),
     storeConfig: null,
     storeConfigUpdatedAt: Date.now(),
     storeConfigStorageSource: 'rtdb'
@@ -45,13 +66,13 @@ const MIN_PROVIDER_HOURS = 1;
 const MAX_PROVIDER_HOURS = 24 * 365; // 1 year cap
 
 function getProviderDurationMs(provider) {
-    const hours = memorySettings.providerDurations[provider];
+    const hours = (memorySettings.providerSettings[provider] && memorySettings.providerSettings[provider].duration) || memorySettings.providerDurations[provider];
     const safeHours = (typeof hours === 'number' && hours > 0) ? hours : (DEFAULT_PROVIDER_DURATIONS[provider] || 12);
     return safeHours * 60 * 60 * 1000;
 }
 
 function getProviderDurationHours(provider) {
-    const hours = memorySettings.providerDurations[provider];
+    const hours = (memorySettings.providerSettings[provider] && memorySettings.providerSettings[provider].duration) || memorySettings.providerDurations[provider];
     return (typeof hours === 'number' && hours > 0) ? hours : (DEFAULT_PROVIDER_DURATIONS[provider] || 12);
 }
 
@@ -60,20 +81,43 @@ function ipToRtdbKey(ip) {
 }
 
 async function loadSettingsFromStorage() {
-    // 1. Load provider durations
+    // 1. Load provider durations & settings
     if (rtdb) {
         try {
-            const snap = await rtdb.ref('settings/providerDurations').once('value');
-            if (snap.exists()) {
-                const data = snap.val() || {};
+            const [durSnap, setSnap] = await Promise.all([
+                rtdb.ref('settings/providerDurations').once('value'),
+                rtdb.ref('settings/providerSettings').once('value')
+            ]);
+            if (durSnap.exists()) {
+                const data = durSnap.val() || {};
                 PROVIDER_KEYS.forEach(p => {
                     const h = parseInt(data[p], 10);
-                    if (!isNaN(h) && h > 0) memorySettings.providerDurations[p] = h;
+                    if (!isNaN(h) && h > 0) {
+                        memorySettings.providerDurations[p] = h;
+                        if (memorySettings.providerSettings[p]) memorySettings.providerSettings[p].duration = h;
+                    }
                 });
+            }
+            if (setSnap.exists()) {
+                const setVal = setSnap.val() || {};
+                PROVIDER_KEYS.forEach(p => {
+                    if (setVal[p] && typeof setVal[p] === 'object') {
+                        memorySettings.providerSettings[p] = {
+                            ...DEFAULT_PROVIDER_SETTINGS[p],
+                            ...setVal[p]
+                        };
+                        const h = parseInt(setVal[p].duration, 10);
+                        if (!isNaN(h) && h > 0) {
+                            memorySettings.providerDurations[p] = h;
+                        }
+                    }
+                });
+                console.log('✅ Loaded provider settings from RTDB:', memorySettings.providerSettings);
+            } else {
                 console.log('✅ Loaded provider durations from RTDB:', memorySettings.providerDurations);
             }
         } catch (e) {
-            console.warn('RTDB provider durations warning:', e.message);
+            console.warn('RTDB provider settings warning:', e.message);
         }
     }
 
@@ -662,7 +706,7 @@ app.get('/api/get-workink-link', (req, res) => {
     res.json({ url: WORKINK_TARGET_LINK });
 });
 
-// Public: provider key durations (hours) for the key page cards
+// Public: provider key durations (hours) & status for the key page cards
 app.get('/api/provider-config', (req, res) => {
     res.json({
         success: true,
@@ -670,11 +714,12 @@ app.get('/api/provider-config', (req, res) => {
             linkvertise: getProviderDurationHours('linkvertise'),
             lootlabs: getProviderDurationHours('lootlabs'),
             workink: getProviderDurationHours('workink')
-        }
+        },
+        providers: memorySettings.providerSettings
     });
 });
 
-// Admin: get provider durations
+// Admin: get provider durations & full config
 app.get('/api/admin/provider-config', verifyAdmin, rateLimit('admin'), (req, res) => {
     res.json({
         success: true,
@@ -682,35 +727,80 @@ app.get('/api/admin/provider-config', verifyAdmin, rateLimit('admin'), (req, res
             linkvertise: getProviderDurationHours('linkvertise'),
             lootlabs: getProviderDurationHours('lootlabs'),
             workink: getProviderDurationHours('workink')
-        }
+        },
+        providers: memorySettings.providerSettings
     });
 });
 
-// Admin: update provider durations (hours)
+// Admin: update provider durations & status (hours, locked, status, tag)
 app.post('/api/admin/provider-config', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
         const body = req.body || {};
-        const updated = {};
+        let changed = false;
+
+        // If 'providers' object was sent
+        if (body.providers && typeof body.providers === 'object') {
+            for (const p of PROVIDER_KEYS) {
+                const pData = body.providers[p];
+                if (!pData || typeof pData !== 'object') continue;
+                
+                if (pData.duration !== undefined) {
+                    const h = parseInt(pData.duration, 10);
+                    if (!isNaN(h) && h >= MIN_PROVIDER_HOURS && h <= MAX_PROVIDER_HOURS) {
+                        memorySettings.providerDurations[p] = h;
+                        memorySettings.providerSettings[p].duration = h;
+                        changed = true;
+                    }
+                }
+                if (pData.locked !== undefined) {
+                    memorySettings.providerSettings[p].locked = !!pData.locked;
+                    changed = true;
+                }
+                if (pData.status !== undefined) {
+                    const st = String(pData.status).toLowerCase().trim();
+                    if (['working', 'under_review', 'not_working'].includes(st)) {
+                        memorySettings.providerSettings[p].status = st;
+                        changed = true;
+                    }
+                }
+                if (pData.tag !== undefined) {
+                    memorySettings.providerSettings[p].tag = String(pData.tag).slice(0, 30);
+                    changed = true;
+                }
+            }
+        }
+
+        // Direct duration keys fallback (e.g. { linkvertise: 6, lootlabs: 2 })
         for (const p of PROVIDER_KEYS) {
             if (body[p] === undefined) continue;
             const h = parseInt(body[p], 10);
-            if (isNaN(h) || h < MIN_PROVIDER_HOURS || h > MAX_PROVIDER_HOURS) {
-                return res.status(400).json({ success: false, error: `Invalid ${p} duration. Use ${MIN_PROVIDER_HOURS}-${MAX_PROVIDER_HOURS} hours.` });
+            if (!isNaN(h) && h >= MIN_PROVIDER_HOURS && h <= MAX_PROVIDER_HOURS) {
+                memorySettings.providerDurations[p] = h;
+                memorySettings.providerSettings[p].duration = h;
+                changed = true;
             }
-            memorySettings.providerDurations[p] = h;
-            updated[p] = h;
         }
-        if (Object.keys(updated).length === 0) {
-            return res.status(400).json({ success: false, error: 'No valid durations provided.' });
+
+        if (!changed) {
+            return res.status(400).json({ success: false, error: 'No valid provider settings provided.' });
         }
+
         if (rtdb) {
             try {
-                await rtdb.ref('settings/providerDurations').set(memorySettings.providerDurations);
+                await Promise.all([
+                    rtdb.ref('settings/providerDurations').set(memorySettings.providerDurations),
+                    rtdb.ref('settings/providerSettings').set(memorySettings.providerSettings)
+                ]);
             } catch (e) {
-                console.warn('Could not persist provider durations to RTDB:', e.message);
+                console.warn('Could not persist provider settings to RTDB:', e.message);
             }
         }
-        res.json({ success: true, durations: { ...memorySettings.providerDurations } });
+
+        res.json({
+            success: true,
+            durations: { ...memorySettings.providerDurations },
+            providers: memorySettings.providerSettings
+        });
     } catch (e) {
         res.status(500).json({ success: false, error: e.message });
     }
@@ -1624,28 +1714,7 @@ app.post('/api/extend-key', rateLimit('claim'), async (req, res) => {
             return res.status(403).json({ success: false, error: "This key does not match your active session." });
         }
 
-        // 🔒 Cooldown Rule:
-        // A provider can only be reused when <= 1 hour remains on its duration timer.
-        // That is: cooldown duration is (providerHours - 1) hours.
-        const providerHours = getProviderDurationHours(cleanProvider);
-        const cooldownMs = Math.max(0, (providerHours - 1) * 3600 * 1000);
-        const lastUsed = (keyData.providerUsage && keyData.providerUsage[cleanProvider])
-            ? keyData.providerUsage[cleanProvider]
-            : (keyData.provider === cleanProvider ? (keyData.createdAt || 0) : 0);
-
-        if (lastUsed && (Date.now() - lastUsed) < cooldownMs) {
-            const remainingMs = cooldownMs - (Date.now() - lastUsed);
-            const remainingMins = Math.ceil(remainingMs / 60000);
-            const remHours = Math.floor(remainingMins / 60);
-            const remM = remainingMins % 60;
-            const timeStr = remHours > 0 ? `${remHours}h ${remM}m` : `${remM}m`;
-            return res.status(403).json({ 
-                success: false, 
-                error: `Cooldown active: ${cleanProvider} can only be used 1 hour before its duration ends. Available in ${timeStr}.` 
-            });
-        }
-
-        // Completion Verification
+        // Completion Verification (Cooldown check removed as requested - users can extend anytime)
         if (cleanProvider === 'linkvertise') {
             if (!hash) {
                 return res.status(400).json({ success: false, error: "Missing Linkvertise completion hash." });
