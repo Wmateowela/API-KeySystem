@@ -35,7 +35,10 @@ const DEFAULT_PROVIDER_DURATIONS = {
     workink: 12
 };
 const memorySettings = {
-    providerDurations: { ...DEFAULT_PROVIDER_DURATIONS }
+    providerDurations: { ...DEFAULT_PROVIDER_DURATIONS },
+    storeConfig: null,
+    storeConfigUpdatedAt: Date.now(),
+    storeConfigStorageSource: 'rtdb'
 };
 const PROVIDER_KEYS = ['linkvertise', 'lootlabs', 'workink'];
 const MIN_PROVIDER_HOURS = 1;
@@ -57,6 +60,7 @@ function ipToRtdbKey(ip) {
 }
 
 async function loadSettingsFromStorage() {
+    // 1. Load provider durations
     if (rtdb) {
         try {
             const snap = await rtdb.ref('settings/providerDurations').once('value');
@@ -67,11 +71,51 @@ async function loadSettingsFromStorage() {
                     if (!isNaN(h) && h > 0) memorySettings.providerDurations[p] = h;
                 });
                 console.log('✅ Loaded provider durations from RTDB:', memorySettings.providerDurations);
-                return;
             }
         } catch (e) {
             console.warn('RTDB provider durations warning:', e.message);
         }
+    }
+
+    // 2. Load active storage source (RTDB vs Firestore) and store catalog config
+    try {
+        let activeSource = 'rtdb';
+        if (rtdb) {
+            try {
+                const snapSource = await rtdb.ref('settings/activeStorageSource').once('value');
+                if (snapSource.exists() && snapSource.val() && snapSource.val().source) {
+                    activeSource = snapSource.val().source;
+                }
+            } catch (e) {}
+        }
+        if (db && activeSource === 'rtdb') {
+            try {
+                const fsDoc = await db.collection('settings').doc('activeStorageSource').get();
+                if (fsDoc.exists && fsDoc.data() && fsDoc.data().source) {
+                    activeSource = fsDoc.data().source;
+                }
+            } catch (e) {}
+        }
+        memorySettings.storeConfigStorageSource = activeSource;
+
+        // 3. Load catalog from active source
+        if (activeSource === 'firestore' && db) {
+            const fsConfig = await db.collection('settings').doc('storeConfig').get();
+            if (fsConfig.exists && fsConfig.data()) {
+                memorySettings.storeConfig = fsConfig.data();
+                memorySettings.storeConfigUpdatedAt = memorySettings.storeConfig.updatedAt || Date.now();
+                console.log('✅ Loaded Store Catalog Config from Firestore');
+            }
+        } else if (rtdb) {
+            const snapConfig = await rtdb.ref('settings/storeConfig').once('value');
+            if (snapConfig.exists() && snapConfig.val()) {
+                memorySettings.storeConfig = snapConfig.val();
+                memorySettings.storeConfigUpdatedAt = memorySettings.storeConfig.updatedAt || Date.now();
+                console.log('✅ Loaded Store Catalog Config from RTDB');
+            }
+        }
+    } catch (e) {
+        console.warn('Store config loading error:', e.message);
     }
 }
 
@@ -353,7 +397,7 @@ const LINKVERTISE_TARGET_LINK = process.env.LINKVERTISE_TARGET_LINK || 'https://
 
 // LootLabs Configuration
 const LOOTLABS_API_TOKEN = process.env.LOOTLABS_API_TOKEN || '162b3c3519ec02bfbd0fc20ff5d6cd1fb10954357e0be1eeee7f00929c2d17e9';
-const LOOTLABS_TARGET_LINK = process.env.LOOTLABS_TARGET_LINK || 'https://buy-robox.netlify.app/key.html';
+const LOOTLABS_TARGET_LINK = process.env.LOOTLABS_TARGET_LINK || 'https://admin-robolox.netlify.app/key.html';
 const LOOTLABS_TIER_ID = parseInt(process.env.LOOTLABS_TIER_ID || '2', 10);
 const LOOTLABS_NUM_TASKS = parseInt(process.env.LOOTLABS_NUM_TASKS || '5', 10);
 const LOOTLABS_THEME = parseInt(process.env.LOOTLABS_THEME || '1', 10);
@@ -368,7 +412,7 @@ const WORKINK_POSTBACK_SECRET = process.env.WORKINK_POSTBACK_SECRET || 'buyroblo
 const WORKINK_MIN_COMPLETE_SECS = parseInt(process.env.WORKINK_MIN_COMPLETE_SECS || '15', 10);
 
 // Frontend base URL (for postback redirects)
-const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || 'https://buy-robox.netlify.app';
+const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || 'https://admin-robolox.netlify.app';
 
 // Middleware
 app.use(cors());
@@ -553,6 +597,7 @@ const BAN_PROTECTED_PATHS = new Set([
     '/api/create-lootlabs-locker',
     '/api/claim-workink-key',
     '/api/create-workink-task',
+    '/api/extend-key',
     '/api/get-link'
 ]);
 app.use(async (req, res, next) => {
@@ -915,6 +960,7 @@ async function issueLootlabsKey(userId, postbackValue, req, pending = null) {
         expiresAt: expiresAt,
         revoked: false,
         provider: 'lootlabs',
+        providerUsage: { lootlabs: now },
         ip: ip,
         country: country,
         maxUsers: 1,
@@ -1194,6 +1240,7 @@ async function issueWorkinkKey(userId, postbackValue, req, pending = null) {
         expiresAt: expiresAt,
         revoked: false,
         provider: 'workink',
+        providerUsage: { workink: now },
         ip: ip,
         country: country,
         maxUsers: 1,
@@ -1393,6 +1440,7 @@ app.post('/api/claim-key', rateLimit('claim'), async (req, res) => {
             expiresAt: expiresAt,
             revoked: false,
             provider: 'linkvertise',
+            providerUsage: { linkvertise: now },
             ip: ip,
             country: country,
             maxUsers: 1,
@@ -1500,11 +1548,233 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
             }
         }
 
-        return res.json({ valid: true, expiresAt: keyData.expiresAt || 0 });
+        const providerUsage = keyData.providerUsage || (keyData.provider ? { [keyData.provider]: keyData.createdAt || Date.now() } : {});
+
+        return res.json({ 
+            valid: true, 
+            expiresAt: keyData.expiresAt || 0,
+            provider: keyData.provider || null,
+            providerUsage
+        });
 
     } catch (error) {
         console.error("Verify key error:", error);
         return res.status(500).json({ valid: false, error: "Server verify error: " + error.message });
+    }
+});
+
+// Endpoint to fetch key cooldowns and remaining time for frontend UI
+app.get('/api/key-cooldowns', async (req, res) => {
+    try {
+        const key = req.query.key;
+        if (!key) return res.status(400).json({ success: false, error: "Missing key parameter." });
+        const cleanKey = String(key).trim().toUpperCase();
+
+        let keyData = memoryKeys.get(cleanKey);
+        if (!keyData) keyData = await getKeyFromStorage(cleanKey);
+        if (!keyData) return res.status(404).json({ success: false, error: "Key not found." });
+
+        const providerUsage = keyData.providerUsage || (keyData.provider ? { [keyData.provider]: keyData.createdAt || Date.now() } : {});
+
+        return res.json({
+            success: true,
+            expiresAt: keyData.expiresAt || 0,
+            providerUsage,
+            durations: {
+                linkvertise: getProviderDurationHours('linkvertise'),
+                lootlabs: getProviderDurationHours('lootlabs'),
+                workink: getProviderDurationHours('workink')
+            }
+        });
+    } catch (e) {
+        return res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// Endpoint to extend key access duration (+6h Linkvertise, +2h LootLabs, +12h Workink)
+app.post('/api/extend-key', rateLimit('claim'), async (req, res) => {
+    const { key, userId, provider, hash, postbackValue } = req.body || {};
+
+    if (!key || !userId || !provider) {
+        return res.status(400).json({ success: false, error: "Missing key, userId, or provider." });
+    }
+
+    const cleanKey = String(key).trim().toUpperCase();
+    const cleanProvider = String(provider).trim().toLowerCase();
+
+    if (!PROVIDER_KEYS.includes(cleanProvider)) {
+        return res.status(400).json({ success: false, error: `Invalid provider: ${cleanProvider}` });
+    }
+
+    try {
+        let keyData = memoryKeys.get(cleanKey);
+        if (!keyData) {
+            keyData = await getKeyFromStorage(cleanKey);
+        }
+
+        if (!keyData) {
+            return res.status(404).json({ success: false, error: "Access key not found. Please re-enter a valid key." });
+        }
+
+        if (keyData.revoked) {
+            return res.status(403).json({ success: false, error: "This key has been revoked." });
+        }
+
+        if (!keyData.adminCreated && keyData.userId && keyData.userId !== userId) {
+            return res.status(403).json({ success: false, error: "This key does not match your active session." });
+        }
+
+        // 🔒 Cooldown Rule:
+        // A provider can only be reused when <= 1 hour remains on its duration timer.
+        // That is: cooldown duration is (providerHours - 1) hours.
+        const providerHours = getProviderDurationHours(cleanProvider);
+        const cooldownMs = Math.max(0, (providerHours - 1) * 3600 * 1000);
+        const lastUsed = (keyData.providerUsage && keyData.providerUsage[cleanProvider])
+            ? keyData.providerUsage[cleanProvider]
+            : (keyData.provider === cleanProvider ? (keyData.createdAt || 0) : 0);
+
+        if (lastUsed && (Date.now() - lastUsed) < cooldownMs) {
+            const remainingMs = cooldownMs - (Date.now() - lastUsed);
+            const remainingMins = Math.ceil(remainingMs / 60000);
+            const remHours = Math.floor(remainingMins / 60);
+            const remM = remainingMins % 60;
+            const timeStr = remHours > 0 ? `${remHours}h ${remM}m` : `${remM}m`;
+            return res.status(403).json({ 
+                success: false, 
+                error: `Cooldown active: ${cleanProvider} can only be used 1 hour before its duration ends. Available in ${timeStr}.` 
+            });
+        }
+
+        // Completion Verification
+        if (cleanProvider === 'linkvertise') {
+            if (!hash) {
+                return res.status(400).json({ success: false, error: "Missing Linkvertise completion hash." });
+            }
+            if (memoryUsedHashes.has(hash)) {
+                return res.status(403).json({ success: false, error: "This completion hash has already been used." });
+            }
+            if (rtdb) {
+                const snap = await rtdb.ref(`usedHashes/${hash}`).once('value');
+                if (snap.exists()) {
+                    return res.status(403).json({ success: false, error: "This completion hash has already been used." });
+                }
+            }
+
+            let isValidHash = false;
+            try {
+                const lvResponse = await fetch('https://publisher.linkvertise.com/api/v1/anti_bypassing', {
+                    method: 'POST',
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json',
+                        'User-Agent': 'BuyRoblox-KeySystem/1.0'
+                    },
+                    body: JSON.stringify({ token: LINKVERTISE_TOKEN, hash: hash })
+                });
+                const lvData = await lvResponse.json().catch(() => ({}));
+                if (lvResponse.ok && (lvData.success === true || lvData.status === true || lvData.status === 200 || lvData.valid === true || lvData.user_id)) {
+                    isValidHash = true;
+                }
+            } catch (e) {
+                console.warn("Linkvertise verification error in extend-key:", e.message);
+            }
+
+            if (!isValidHash) {
+                return res.status(403).json({ success: false, error: "Linkvertise completion hash verification failed." });
+            }
+
+            // Mark hash as used
+            const usedEntry = { userId, time: Date.now(), extendKey: cleanKey };
+            memoryUsedHashes.set(hash, usedEntry);
+            if (rtdb) rtdb.ref(`usedHashes/${hash}`).set(usedEntry).catch(() => {});
+
+        } else if (cleanProvider === 'lootlabs') {
+            if (!postbackValue) {
+                return res.status(400).json({ success: false, error: "Missing LootLabs postback confirmation." });
+            }
+            let pending = memoryLootlabsPending.get(postbackValue);
+            if (!pending && rtdb) {
+                try {
+                    const snap = await rtdb.ref(`lootlabsPending/${postbackValue}`).once('value');
+                    if (snap.exists()) pending = snap.val();
+                } catch (e) {}
+            }
+            if (!pending) {
+                return res.status(404).json({ success: false, error: "LootLabs postback not confirmed yet. Please complete all tasks." });
+            }
+            if (pending.extendRedeemed) {
+                return res.status(403).json({ success: false, error: "This LootLabs completion has already been redeemed." });
+            }
+            if (!pending.redeemed) {
+                return res.status(400).json({ success: false, error: "LootLabs tasks have not been completed yet. Please finish the locker in LootLabs." });
+            }
+            pending.extendRedeemed = true;
+            pending.redeemed = true;
+            memoryLootlabsPending.set(postbackValue, pending);
+            if (rtdb) rtdb.ref(`lootlabsPending/${postbackValue}`).update({ redeemed: true, extendRedeemed: true, redeemedAt: Date.now() }).catch(() => {});
+
+        } else if (cleanProvider === 'workink') {
+            if (!postbackValue) {
+                return res.status(400).json({ success: false, error: "Missing Work.ink postback confirmation." });
+            }
+            let pending = memoryWorkinkPending.get(postbackValue);
+            if (!pending && rtdb) {
+                try {
+                    const snap = await rtdb.ref(`workinkPending/${postbackValue}`).once('value');
+                    if (snap.exists()) pending = snap.val();
+                } catch (e) {}
+            }
+            if (!pending) {
+                return res.status(404).json({ success: false, error: "Work.ink postback not confirmed yet. Please complete all tasks." });
+            }
+            if (pending.extendRedeemed) {
+                return res.status(403).json({ success: false, error: "This Work.ink completion has already been redeemed." });
+            }
+            if (!pending.redeemed) {
+                return res.status(400).json({ success: false, error: "Work.ink tasks have not been completed yet. Please finish the locker in Work.ink." });
+            }
+            pending.extendRedeemed = true;
+            pending.redeemed = true;
+            memoryWorkinkPending.set(postbackValue, pending);
+            if (rtdb) rtdb.ref(`workinkPending/${postbackValue}`).update({ redeemed: true, extendRedeemed: true, redeemedAt: Date.now() }).catch(() => {});
+        }
+
+        // Apply Duration Extension
+        const addedMs = getProviderDurationMs(cleanProvider);
+        const currentExpires = (keyData.expiresAt && keyData.expiresAt > Date.now()) ? keyData.expiresAt : Date.now();
+        const newExpiresAt = currentExpires + addedMs;
+
+        if (!keyData.providerUsage) keyData.providerUsage = {};
+        keyData.providerUsage[cleanProvider] = Date.now();
+
+        const updates = {
+            expiresAt: newExpiresAt,
+            providerUsage: keyData.providerUsage,
+            lastExtendedAt: Date.now(),
+            lastExtendedProvider: cleanProvider
+        };
+
+        await updateKeyInStorage(cleanKey, updates);
+
+        if (db) {
+            try {
+                await db.collection('keys').doc(cleanKey).set(updates, { merge: true });
+            } catch (e) {}
+        }
+
+        console.log(`🎉 [Key Extended] ${cleanKey} extended +${providerHours}h via ${cleanProvider}. New expiresAt: ${newExpiresAt}`);
+
+        return res.json({
+            success: true,
+            key: cleanKey,
+            newExpiresAt,
+            addedHours: providerHours,
+            providerUsage: keyData.providerUsage
+        });
+
+    } catch (error) {
+        console.error("Extend key error:", error);
+        return res.status(500).json({ success: false, error: "Internal server error: " + error.message });
     }
 });
 
@@ -2317,36 +2587,89 @@ const DEFAULT_STORE_CONFIG = {
     updatedAt: Date.now()
 };
 
-// Public: Get current store catalog configuration
+// Public: Get current store catalog configuration with zero-bandwidth 304/notModified check
 app.get('/api/store-config', async (req, res) => {
     try {
-        if (rtdb) {
-            const snap = await rtdb.ref('settings/storeConfig').once('value');
-            if (snap.exists() && snap.val()) {
-                return res.json({ success: true, config: snap.val() });
-            }
+        const clientVersion = req.query.v ? parseInt(req.query.v, 10) : null;
+        const currentUpdated = memorySettings.storeConfigUpdatedAt || Date.now();
+        const activeSource = memorySettings.storeConfigStorageSource || 'rtdb';
+
+        // Zero-bandwidth check: if client already has latest version, return notModified
+        if (clientVersion && clientVersion === currentUpdated) {
+            return res.json({ 
+                success: true, 
+                notModified: true, 
+                storageSource: activeSource,
+                updatedAt: currentUpdated
+            });
         }
-        return res.json({ success: true, config: DEFAULT_STORE_CONFIG });
+
+        const config = memorySettings.storeConfig || DEFAULT_STORE_CONFIG;
+        return res.json({ 
+            success: true, 
+            config, 
+            updatedAt: currentUpdated,
+            storageSource: activeSource 
+        });
     } catch (e) {
         console.error('[Store Config GET Error]:', e.message);
-        return res.json({ success: true, config: DEFAULT_STORE_CONFIG });
+        return res.json({ 
+            success: true, 
+            config: DEFAULT_STORE_CONFIG, 
+            updatedAt: Date.now(), 
+            storageSource: 'rtdb' 
+        });
     }
 });
 
-// Admin: Save updated store catalog configuration
+// Admin: Save updated store catalog configuration and select storage source (RTDB or Firestore)
 app.post('/api/store-config', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
-        const config = req.body && req.body.config ? req.body.config : req.body;
+        const body = req.body || {};
+        const config = body.config ? body.config : body;
+        const storageSource = (body.storageSource === 'firestore' || body.storageSource === 'rtdb') 
+            ? body.storageSource 
+            : (memorySettings.storeConfigStorageSource || 'rtdb');
+
         if (!config || typeof config !== 'object') {
             return res.status(400).json({ success: false, error: 'Invalid store config data.' });
         }
         config.updatedAt = Date.now();
 
-        if (rtdb) {
-            await rtdb.ref('settings/storeConfig').set(config);
+        // Update in-memory cache for instant zero-lag serving
+        memorySettings.storeConfig = config;
+        memorySettings.storeConfigUpdatedAt = config.updatedAt;
+        memorySettings.storeConfigStorageSource = storageSource;
+
+        // Persist to selected database
+        if (storageSource === 'firestore') {
+            if (db) {
+                await db.collection('settings').doc('storeConfig').set(config);
+                await db.collection('settings').doc('activeStorageSource').set({ source: 'firestore', updatedAt: Date.now() });
+            }
+            if (rtdb) {
+                // Record active source in RTDB too for sync
+                rtdb.ref('settings/activeStorageSource').set({ source: 'firestore', updatedAt: Date.now() }).catch(() => {});
+            }
+            console.log('✅ Store Catalog Config saved to FIRESTORE');
+        } else {
+            // Realtime Database
+            if (rtdb) {
+                await rtdb.ref('settings/storeConfig').set(config);
+                await rtdb.ref('settings/activeStorageSource').set({ source: 'rtdb', updatedAt: Date.now() });
+            }
+            if (db) {
+                db.collection('settings').doc('activeStorageSource').set({ source: 'rtdb', updatedAt: Date.now() }).catch(() => {});
+            }
+            console.log('✅ Store Catalog Config saved to RTDB');
         }
 
-        return res.json({ success: true, config });
+        return res.json({ 
+            success: true, 
+            config, 
+            storageSource, 
+            updatedAt: config.updatedAt 
+        });
     } catch (e) {
         console.error('[Store Config POST Error]:', e.message);
         return res.status(500).json({ success: false, error: e.message });
