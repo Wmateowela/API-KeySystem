@@ -438,6 +438,7 @@ const PORT = process.env.PORT || 3000;
 // Default Tokens
 const LINKVERTISE_TOKEN = process.env.LINKVERTISE_TOKEN || '05bea4d469e02f8573931ff654597345edb6092d8c418ffc588c91de1678325a';
 const LINKVERTISE_TARGET_LINK = process.env.LINKVERTISE_TARGET_LINK || 'https://direct-link.net/1276098/1A4zh2pEaHCB';
+const LINKVERTISE_EXTEND_LINK = process.env.LINKVERTISE_EXTEND_LINK || 'https://link-target.net/1276098/0mXZLsuM8nZp';
 
 // LootLabs Configuration
 const LOOTLABS_API_TOKEN = process.env.LOOTLABS_API_TOKEN || '162b3c3519ec02bfbd0fc20ff5d6cd1fb10954357e0be1eeee7f00929c2d17e9';
@@ -694,6 +695,11 @@ app.get(['/', '/health', '/api/health'], (req, res) => {
 // Return target linkvertise url for frontend to navigate to
 app.get('/api/get-link', (req, res) => {
     res.json({ url: LINKVERTISE_TARGET_LINK });
+});
+
+// Return target linkvertise extend key url
+app.get('/api/get-extend-link', (req, res) => {
+    res.json({ url: LINKVERTISE_EXTEND_LINK });
 });
 
 // Return target lootlabs url for frontend to navigate to
@@ -1666,10 +1672,22 @@ app.get('/api/key-cooldowns', async (req, res) => {
 
         const providerUsage = keyData.providerUsage || (keyData.provider ? { [keyData.provider]: keyData.createdAt || Date.now() } : {});
 
+        // Calculate daily extension limits (max 3 per 24 hours)
+        const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+        const now = Date.now();
+        const extensionTimestamps = (Array.isArray(keyData.extensionTimestamps) ? keyData.extensionTimestamps : []).filter(t => (now - t) < ONE_DAY_MS);
+        const maxDaily = 3;
+        const dailyCount = extensionTimestamps.length;
+        const dailyRemaining = Math.max(0, maxDaily - dailyCount);
+
         return res.json({
             success: true,
             expiresAt: keyData.expiresAt || 0,
             providerUsage,
+            dailyCount,
+            dailyRemaining,
+            maxDaily,
+            dailyLimitReached: dailyCount >= maxDaily,
             durations: {
                 linkvertise: getProviderDurationHours('linkvertise'),
                 lootlabs: getProviderDurationHours('lootlabs'),
@@ -1714,7 +1732,24 @@ app.post('/api/extend-key', rateLimit('claim'), async (req, res) => {
             return res.status(403).json({ success: false, error: "This key does not match your active session." });
         }
 
-        // Completion Verification (Cooldown check removed as requested - users can extend anytime)
+        // 🔒 Daily Limit Enforcement: Maximum 3 extensions per day (24 hours)
+        const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+        const now = Date.now();
+        const extensionTimestamps = (Array.isArray(keyData.extensionTimestamps) ? keyData.extensionTimestamps : []).filter(t => (now - t) < ONE_DAY_MS);
+        const maxDaily = 3;
+
+        if (extensionTimestamps.length >= maxDaily) {
+            return res.status(403).json({
+                success: false,
+                error: "Daily limit reached: You can only extend your key 3 times per day. Please come back tomorrow.",
+                dailyLimitReached: true,
+                dailyCount: extensionTimestamps.length,
+                maxDaily,
+                dailyRemaining: 0
+            });
+        }
+
+        // Completion Verification
         if (cleanProvider === 'linkvertise') {
             if (!hash) {
                 return res.status(400).json({ success: false, error: "Missing Linkvertise completion hash." });
@@ -1809,6 +1844,7 @@ app.post('/api/extend-key', rateLimit('claim'), async (req, res) => {
         }
 
         // Apply Duration Extension
+        const providerHours = getProviderDurationHours(cleanProvider);
         const addedMs = getProviderDurationMs(cleanProvider);
         const currentExpires = (keyData.expiresAt && keyData.expiresAt > Date.now()) ? keyData.expiresAt : Date.now();
         const newExpiresAt = currentExpires + addedMs;
@@ -1816,12 +1852,19 @@ app.post('/api/extend-key', rateLimit('claim'), async (req, res) => {
         if (!keyData.providerUsage) keyData.providerUsage = {};
         keyData.providerUsage[cleanProvider] = Date.now();
 
+        // Add to daily extension history
+        extensionTimestamps.push(now);
+
         const updates = {
             expiresAt: newExpiresAt,
             providerUsage: keyData.providerUsage,
+            extensionTimestamps: extensionTimestamps,
             lastExtendedAt: Date.now(),
             lastExtendedProvider: cleanProvider
         };
+
+        keyData.extensionTimestamps = extensionTimestamps;
+        keyData.expiresAt = newExpiresAt;
 
         await updateKeyInStorage(cleanKey, updates);
 
@@ -1831,13 +1874,16 @@ app.post('/api/extend-key', rateLimit('claim'), async (req, res) => {
             } catch (e) {}
         }
 
-        console.log(`🎉 [Key Extended] ${cleanKey} extended +${providerHours}h via ${cleanProvider}. New expiresAt: ${newExpiresAt}`);
+        console.log(`🎉 [Key Extended] ${cleanKey} extended +${providerHours}h via ${cleanProvider}. Daily used: ${extensionTimestamps.length}/${maxDaily}. New expiresAt: ${newExpiresAt}`);
 
         return res.json({
             success: true,
             key: cleanKey,
             newExpiresAt,
             addedHours: providerHours,
+            dailyCount: extensionTimestamps.length,
+            dailyRemaining: Math.max(0, maxDaily - extensionTimestamps.length),
+            maxDaily: maxDaily,
             providerUsage: keyData.providerUsage
         });
 
