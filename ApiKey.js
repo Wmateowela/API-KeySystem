@@ -54,12 +54,18 @@ const DEFAULT_PROVIDER_SETTINGS = {
         tag: 'Best Value'
     }
 };
+const DEFAULT_STORE_DOMAINS = {
+    primaryStoreUrl: 'https://buyrobux-store.pages.dev',
+    keyGatewayUrl: 'https://pathan-key.pages.dev',
+    allowedDomains: ['https://buyrobux-store.pages.dev']
+};
 const memorySettings = {
     providerDurations: { ...DEFAULT_PROVIDER_DURATIONS },
     providerSettings: JSON.parse(JSON.stringify(DEFAULT_PROVIDER_SETTINGS)),
     storeConfig: null,
     storeConfigUpdatedAt: Date.now(),
-    storeConfigStorageSource: 'rtdb'
+    storeConfigStorageSource: 'rtdb',
+    storeDomains: { ...DEFAULT_STORE_DOMAINS }
 };
 const PROVIDER_KEYS = ['linkvertise', 'lootlabs', 'workink'];
 const MIN_PROVIDER_HOURS = 1;
@@ -158,6 +164,16 @@ async function loadSettingsFromStorage() {
                 console.log('✅ Loaded Store Catalog Config from RTDB');
             }
         }
+        // 4. Load store domains
+        if (rtdb) {
+            try {
+                const snapDomains = await rtdb.ref('settings/storeDomains').once('value');
+                if (snapDomains.exists() && snapDomains.val()) {
+                    memorySettings.storeDomains = snapDomains.val();
+                    console.log('✅ Loaded Store Domains from RTDB');
+                }
+            } catch (e) {}
+        }
     } catch (e) {
         console.warn('Store config loading error:', e.message);
     }
@@ -253,9 +269,10 @@ async function loadKeysFromStorage(force = false) {
     const now = Date.now();
     if (!force && keysLastLoaded && (now - keysLastLoaded) < STARTUP_CACHE_TTL && memoryKeys.size > 0) return;
 
-    let loaded = 0;
+    let loadedRtdb = 0;
+    let loadedFirestore = 0;
 
-    // 1. Load from Realtime Database first (0 Firestore reads!)
+    // 1. Load from Realtime Database
     if (rtdb) {
         try {
             const snap = await rtdb.ref('keys').once('value');
@@ -265,20 +282,35 @@ async function loadKeysFromStorage(force = false) {
                     const data = val[k];
                     if (data && (data.key || k)) {
                         const keyName = (data.key || k).toUpperCase();
-                        memoryKeys.set(keyName, data);
-                        loaded++;
+                        memoryKeys.set(keyName, { key: keyName, ...data });
+                        loadedRtdb++;
                     }
                 });
-                keysLastLoaded = Date.now();
-                console.log(`✅ Loaded ${loaded} keys from Realtime Database (RTDB) into memory.`);
-                return;
             }
         } catch (e) {
             console.warn("Could not load keys from RTDB:", e.message);
         }
     }
 
+    // 2. Load from Firestore collection 'keys'
+    if (db) {
+        try {
+            const snap = await db.collection('keys').get();
+            snap.forEach(docSnap => {
+                const data = docSnap.data();
+                const keyName = (data && data.key ? data.key : docSnap.id).toUpperCase();
+                if (!memoryKeys.has(keyName)) {
+                    memoryKeys.set(keyName, { key: keyName, ...data });
+                    loadedFirestore++;
+                }
+            });
+        } catch (e) {
+            console.warn("Could not load keys from Firestore:", e.message);
+        }
+    }
 
+    keysLastLoaded = Date.now();
+    console.log(`✅ Loaded keys into memory: ${loadedRtdb} from RTDB, ${loadedFirestore} from Firestore. Total in memory: ${memoryKeys.size}`);
 }
 
 function setupRTDBListeners() {
@@ -386,33 +418,66 @@ async function loadUsedHashesFromFirestore(force = false) {
 
 try {
     let credential = null;
+    
+    // 1. Check FIREBASE_SERVICE_ACCOUNT environment variable (Recommended for Render / Cloud Hosting)
     if (process.env.FIREBASE_SERVICE_ACCOUNT) {
         try {
             const parsed = typeof process.env.FIREBASE_SERVICE_ACCOUNT === 'string' 
                 ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT) 
                 : process.env.FIREBASE_SERVICE_ACCOUNT;
+            if (parsed.private_key) {
+                parsed.private_key = parsed.private_key.replace(/\\n/g, '\n');
+            }
             credential = cert(parsed);
+            console.log("✅ Using FIREBASE_SERVICE_ACCOUNT from env.");
         } catch (e) {
             console.warn("Could not parse FIREBASE_SERVICE_ACCOUNT env:", e.message);
         }
     }
+
+    // 2. Check individual FIREBASE_PRIVATE_KEY and FIREBASE_CLIENT_EMAIL env variables
+    if (!credential && process.env.FIREBASE_PRIVATE_KEY && process.env.FIREBASE_CLIENT_EMAIL) {
+        try {
+            credential = cert({
+                projectId: process.env.FIREBASE_PROJECT_ID || 'buy-r-bl0x',
+                clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+                privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n')
+            });
+            console.log("✅ Using FIREBASE_PRIVATE_KEY & FIREBASE_CLIENT_EMAIL env variables.");
+        } catch (e) {
+            console.warn("Could not create credential from individual env variables:", e.message);
+        }
+    }
     
+    // 3. Check local serviceAccountKey.json file (Local development)
     if (!credential) {
         const configuredKeyPath = process.env.FIREBASE_SERVICE_ACCOUNT_KEY_PATH;
         const keyPath = configuredKeyPath
             ? (path.isAbsolute(configuredKeyPath) ? configuredKeyPath : path.resolve(__dirname, configuredKeyPath))
             : path.join(__dirname, 'serviceAccountKey.json');
         if (fs.existsSync(keyPath)) {
-            const serviceAccount = require(keyPath);
-            credential = cert(serviceAccount);
+            try {
+                const serviceAccount = JSON.parse(fs.readFileSync(keyPath, 'utf8'));
+                if (Object.keys(serviceAccount).length > 0) {
+                    if (serviceAccount.private_key) {
+                        serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+                    }
+                    credential = cert(serviceAccount);
+                    console.log("✅ Using local serviceAccountKey.json file.");
+                }
+            } catch(e) {
+                console.warn("Ignored invalid serviceAccountKey.json:", e.message);
+            }
         }
     }
 
     if (credential) {
-        initializeApp({ 
-            credential,
-            databaseURL: FIREBASE_DATABASE_URL
-        });
+        if (getApps().length === 0) {
+            initializeApp({ 
+                credential,
+                databaseURL: FIREBASE_DATABASE_URL
+            });
+        }
         db = getFirestore();
         rtdb = getDatabase();
         rtdbAvailable = true;
@@ -426,10 +491,12 @@ try {
         loadAnnouncementsFromFirestore(true);
         loadUsedHashesFromFirestore();
     } else {
+        console.warn("❌ CREDENTIAL IS NULL. Please set FIREBASE_SERVICE_ACCOUNT env var or add serviceAccountKey.json.");
         console.log("⚡ Running with internal key management engine.");
     }
 } catch (error) {
     console.warn("ℹ️ Running in resilient mode with internal key management:", error.message);
+    console.warn("Detailed error stack:", error.stack);
 }
 
 const app = express();
@@ -442,7 +509,7 @@ const LINKVERTISE_EXTEND_LINK = process.env.LINKVERTISE_EXTEND_LINK || 'https://
 
 // LootLabs Configuration
 const LOOTLABS_API_TOKEN = process.env.LOOTLABS_API_TOKEN || '162b3c3519ec02bfbd0fc20ff5d6cd1fb10954357e0be1eeee7f00929c2d17e9';
-const LOOTLABS_TARGET_LINK = process.env.LOOTLABS_TARGET_LINK || 'https://admin-robolox.netlify.app/key.html';
+const LOOTLABS_TARGET_LINK = process.env.LOOTLABS_TARGET_LINK || 'https://robox-6nc.pages.dev/key.html';
 const LOOTLABS_TIER_ID = parseInt(process.env.LOOTLABS_TIER_ID || '2', 10);
 const LOOTLABS_NUM_TASKS = parseInt(process.env.LOOTLABS_NUM_TASKS || '5', 10);
 const LOOTLABS_THEME = parseInt(process.env.LOOTLABS_THEME || '1', 10);
@@ -457,7 +524,7 @@ const WORKINK_POSTBACK_SECRET = process.env.WORKINK_POSTBACK_SECRET || 'buyroblo
 const WORKINK_MIN_COMPLETE_SECS = parseInt(process.env.WORKINK_MIN_COMPLETE_SECS || '15', 10);
 
 // Frontend base URL (for postback redirects)
-const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || 'https://admin-robolox.netlify.app';
+const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || 'https://robox-6nc.pages.dev';
 
 // Middleware
 app.use(cors());
@@ -850,9 +917,15 @@ app.post('/api/create-lootlabs-locker', async (req, res) => {
     }
 
     // Destination URL LootLabs will redirect user to after completion
-    // We pass the postbackValue in the URL fragment so it survives redirects
+    // Supports direct local redirects or forwarding via local_return parameter
     const requestedUrl = (req.body && typeof req.body.destinationUrl === 'string' && req.body.destinationUrl.trim()) ? req.body.destinationUrl.trim() : null;
-    const destinationUrl = requestedUrl ? `${requestedUrl}#lootlabs_done=${postbackValue}` : `${FRONTEND_BASE_URL}/key.html#lootlabs_done=${postbackValue}`;
+    const localReturnUrl = (req.body && typeof req.body.localReturnUrl === 'string' && req.body.localReturnUrl.trim()) ? req.body.localReturnUrl.trim() : null;
+
+    let targetBase = requestedUrl || `${FRONTEND_BASE_URL}/key.html`;
+    if (localReturnUrl && !targetBase.includes('localhost') && !targetBase.includes('127.0.0.1')) {
+        targetBase += (targetBase.includes('?') ? '&' : '?') + `local_return=${encodeURIComponent(localReturnUrl)}`;
+    }
+    const destinationUrl = `${targetBase}#lootlabs_done=${postbackValue}`;
 
     try {
         const llResponse = await fetch('https://creators.lootlabs.gg/api/public/content_locker', {
@@ -956,7 +1029,7 @@ async function redeemLootlabsPostback(postbackValue, req) {
 
 // LootLabs Postback - LootLabs server sends GET request here when user completes the locker.
 // Configure this URL in your LootLabs panel postback settings:
-//   https://api-keysystem.onrender.com/api/lootlabs-postback?postbackValue={UNIQUE_ID}&clickId={CLICK_ID}&secret=buyroblox_lootlabs_secret_2026
+//   https://api-keysystem-bbbf.onrender.com/api/lootlabs-postback?postbackValue={UNIQUE_ID}&clickId={CLICK_ID}&secret=buyroblox_lootlabs_secret_2026
 const recentLootlabsPostbacks = []; // last 20 postback attempts (for debugging)
 app.get('/api/lootlabs-postback', async (req, res) => {
     // Log EVERY postback attempt for debugging
@@ -987,13 +1060,10 @@ app.get('/api/lootlabs-postback', async (req, res) => {
         return res.status(400).send("Missing postbackValue");
     }
 
-    // Strict mode: require secret. Set STRICT_LOOTLABS_POSTBACK=false in env to disable.
-    const strictMode = process.env.STRICT_LOOTLABS_POSTBACK !== 'false';
-    if (strictMode && LOOTLABS_POSTBACK_SECRET) {
-        if (!secret || secret !== LOOTLABS_POSTBACK_SECRET) {
-            console.warn(`[LootLabs Postback] Invalid/missing secret. Got secret: ${secret ? 'present' : 'MISSING'}.`);
-            return res.status(403).send("Invalid secret");
-        }
+    // Strict mode: if secret is passed, verify it matches.
+    if (LOOTLABS_POSTBACK_SECRET && secret && secret !== LOOTLABS_POSTBACK_SECRET) {
+        console.warn(`[LootLabs Postback] Invalid secret provided.`);
+        return res.status(403).send("Invalid secret");
     }
 
     try {
@@ -1164,7 +1234,13 @@ app.post('/api/create-workink-task', async (req, res) => {
     }
 
     const requestedUrl = (req.body && typeof req.body.destinationUrl === 'string' && req.body.destinationUrl.trim()) ? req.body.destinationUrl.trim() : null;
-    const destinationUrl = requestedUrl ? `${requestedUrl}#workink_done=${postbackValue}` : `${FRONTEND_BASE_URL}/key.html#workink_done=${postbackValue}`;
+    const localReturnUrl = (req.body && typeof req.body.localReturnUrl === 'string' && req.body.localReturnUrl.trim()) ? req.body.localReturnUrl.trim() : null;
+
+    let targetBase = requestedUrl || `${FRONTEND_BASE_URL}/key.html`;
+    if (localReturnUrl && !targetBase.includes('localhost') && !targetBase.includes('127.0.0.1')) {
+        targetBase += (targetBase.includes('?') ? '&' : '?') + `local_return=${encodeURIComponent(localReturnUrl)}`;
+    }
+    const destinationUrl = `${targetBase}#workink_done=${postbackValue}`;
 
     try {
         const wiResponse = await fetch('https://api.work.ink/v1/links', {
@@ -1282,12 +1358,9 @@ app.all('/api/workink-postback', async (req, res) => {
         return res.status(400).send("Missing postbackValue");
     }
 
-    const strictMode = process.env.STRICT_WORKINK_POSTBACK === 'true';
-    if (strictMode && WORKINK_POSTBACK_SECRET) {
-        if (!secret || secret !== WORKINK_POSTBACK_SECRET) {
-            console.warn(`[Work.ink Postback] Invalid/missing secret.`);
-            return res.status(403).send("Invalid secret");
-        }
+    if (WORKINK_POSTBACK_SECRET && secret && secret !== WORKINK_POSTBACK_SECRET) {
+        console.warn(`[Work.ink Postback] Invalid secret provided.`);
+        return res.status(403).send("Invalid secret");
     }
 
     try {
@@ -1644,18 +1717,45 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
             }
         }
 
+        // Session & Concurrency Tracking (Single active device / session per key)
+        const sessionId = req.body.sessionId ? String(req.body.sessionId).trim() : null;
+        const updates = { lastSeen: Date.now() };
+        if (sessionId) {
+            updates.activeSessionId = sessionId;
+        }
+        await updateKeyInStorage(cleanKey, updates);
+
         const providerUsage = keyData.providerUsage || (keyData.provider ? { [keyData.provider]: keyData.createdAt || Date.now() } : {});
 
         return res.json({ 
             valid: true, 
             expiresAt: keyData.expiresAt || 0,
             provider: keyData.provider || null,
-            providerUsage
+            providerUsage,
+            activeSessionId: sessionId || keyData.activeSessionId || null
         });
 
     } catch (error) {
         console.error("Verify key error:", error);
         return res.status(500).json({ valid: false, error: "Server verify error: " + error.message });
+    }
+});
+
+// Endpoint to logout / disconnect an active key session
+app.post('/api/logout-key', async (req, res) => {
+    try {
+        const { key } = req.body || {};
+        if (key) {
+            const cleanKey = String(key).trim().toUpperCase();
+            let keyData = memoryKeys.get(cleanKey);
+            if (!keyData) keyData = await getKeyFromStorage(cleanKey);
+            if (keyData) {
+                await updateKeyInStorage(cleanKey, { activeSessionId: null, lastLoggedOut: Date.now() });
+            }
+        }
+        return res.json({ success: true });
+    } catch (e) {
+        return res.json({ success: false, error: e.message });
     }
 });
 
@@ -1899,7 +1999,7 @@ app.post('/api/extend-key', rateLimit('claim'), async (req, res) => {
 // Whitelist of allowed admin emails - loaded from env for security.
 // Set ADMIN_EMAILS env var in Render/local .env as comma-separated list.
 // Falls back to a safe default list if not set.
-const ADMIN_EMAILS_ENV = process.env.ADMIN_EMAILS || 'js7384333@gmail.com,js8495444@gmail.com,atifjanibrand@gmail.com';
+const ADMIN_EMAILS_ENV = process.env.ADMIN_EMAILS || 'js7384333@gmail.com,js8495444@gmail.com,atifjanibrand@gmail.com,nmcpathan@gmail.com';
 const ALLOWED_ADMIN_EMAILS = ADMIN_EMAILS_ENV
     .split(',')
     .map(e => e.toLowerCase().trim())
@@ -1962,6 +2062,9 @@ app.post('/api/admin/login', rateLimit('admin'), (req, res) => {
 
 app.get('/api/admin/stats', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
+        if (memoryKeys.size === 0) {
+            await loadKeysFromStorage(true);
+        }
         // Fast in-memory stats calculation (0 Firestore reads)
         const allKeys = Array.from(memoryKeys.values());
 
@@ -2012,6 +2115,9 @@ app.get('/api/admin/stats', verifyAdmin, rateLimit('admin'), async (req, res) =>
 
 app.get('/api/admin/keys', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
+        if (memoryKeys.size === 0) {
+            await loadKeysFromStorage(true);
+        }
         const search = (req.query.search || '').toLowerCase();
         const sort = (req.query.sort || 'newest').toLowerCase();
         // Fast in-memory key listing (0 Firestore reads)
@@ -2787,6 +2893,120 @@ app.post('/api/store-config', verifyAdmin, rateLimit('admin'), async (req, res) 
         });
     } catch (e) {
         console.error('[Store Config POST Error]:', e.message);
+        return res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// Store Domains: Get active store domains and gateway config
+app.get('/api/store-domains', async (req, res) => {
+    try {
+        const domains = memorySettings.storeDomains || DEFAULT_STORE_DOMAINS;
+        return res.json({ success: true, domains });
+    } catch (e) {
+        return res.json({ success: true, domains: DEFAULT_STORE_DOMAINS });
+    }
+});
+
+// Admin: Save and broadcast updated store domains
+app.post('/api/admin/store-domains', verifyAdmin, rateLimit('admin'), async (req, res) => {
+    try {
+        const body = req.body || {};
+        const primaryStoreUrl = String(body.primaryStoreUrl || '').trim();
+        const keyGatewayUrl = String(body.keyGatewayUrl || '').trim();
+        const allowedDomains = Array.isArray(body.allowedDomains) 
+            ? body.allowedDomains.map(d => String(d).trim()).filter(Boolean)
+            : (primaryStoreUrl ? [primaryStoreUrl] : []);
+
+        const payload = {
+            primaryStoreUrl: primaryStoreUrl || DEFAULT_STORE_DOMAINS.primaryStoreUrl,
+            keyGatewayUrl: keyGatewayUrl || DEFAULT_STORE_DOMAINS.keyGatewayUrl,
+            allowedDomains: allowedDomains.length > 0 ? allowedDomains : [primaryStoreUrl || DEFAULT_STORE_DOMAINS.primaryStoreUrl],
+            updatedAt: Date.now()
+        };
+
+        memorySettings.storeDomains = payload;
+
+        if (rtdb) {
+            await rtdb.ref('settings/storeDomains').set(payload).catch(err => {
+                console.warn('RTDB storeDomains save warning:', err.message);
+            });
+        }
+        if (db) {
+            await db.collection('settings').doc('storeDomains').set(payload).catch(() => {});
+        }
+        console.log('✅ Store Domains saved successfully via Admin API:', payload);
+
+        return res.json({ success: true, domains: payload });
+    } catch (e) {
+        console.error('[Store Domains POST Error]:', e.message);
+        return res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// ====================
+// Server Cloud Configuration Endpoint
+// ====================
+const DEFAULT_SERVER_CONFIG = {
+    selectedStoreId: 'render-b',
+    selectedApiKeyId: 'render-c',
+    activeStoreUrl: 'https://roblox-backend-1jck.onrender.com',
+    activeApiKeyUrl: 'https://api-keysystem-bbbf.onrender.com',
+    customStoreUrl: '',
+    customApiKeyUrl: '',
+    updatedAt: Date.now()
+};
+
+let memoryServerConfig = { ...DEFAULT_SERVER_CONFIG };
+let serverConfigRtdbCache = { cfg: null, fetchedAt: 0 };
+const SERVER_CONFIG_RTDB_TTL_MS = 15000;
+
+async function getLiveServerConfig() {
+    if (rtdb && (Date.now() - serverConfigRtdbCache.fetchedAt) > SERVER_CONFIG_RTDB_TTL_MS) {
+        try {
+            const snap = await rtdb.ref('settings/serverConfig').once('value');
+            if (snap.exists()) {
+                serverConfigRtdbCache = {
+                    cfg: { ...DEFAULT_SERVER_CONFIG, ...snap.val() },
+                    fetchedAt: Date.now()
+                };
+                memoryServerConfig = serverConfigRtdbCache.cfg;
+            }
+        } catch (e) {
+            console.warn('Live server config RTDB read failed, using cached memory config:', e.message);
+        }
+    }
+    return serverConfigRtdbCache.cfg || memoryServerConfig;
+}
+
+app.get('/api/server-config', async (req, res) => {
+    res.json({ success: true, config: await getLiveServerConfig() });
+});
+
+app.get('/api/admin/server-config', verifyAdmin, rateLimit('admin'), async (req, res) => {
+    res.json({ success: true, config: await getLiveServerConfig() });
+});
+
+app.post('/api/admin/server-config', verifyAdmin, rateLimit('admin'), async (req, res) => {
+    try {
+        const body = req.body || {};
+        const config = body.config || body;
+        if (!config || typeof config !== 'object') {
+            return res.status(400).json({ success: false, error: 'Invalid server configuration.' });
+        }
+        config.updatedAt = Date.now();
+        memoryServerConfig = { ...DEFAULT_SERVER_CONFIG, ...config };
+        serverConfigRtdbCache = { cfg: memoryServerConfig, fetchedAt: Date.now() };
+
+        if (rtdb) {
+            await rtdb.ref('settings/serverConfig').set(memoryServerConfig);
+        }
+        if (db) {
+            await db.collection('settings').doc('serverConfig').set(memoryServerConfig).catch(() => {});
+        }
+        console.log('✅ Server Cloud Configuration updated and saved');
+        return res.json({ success: true, config: memoryServerConfig });
+    } catch(e) {
+        console.error('[Server Config Error]:', e.message);
         return res.status(500).json({ success: false, error: e.message });
     }
 });
