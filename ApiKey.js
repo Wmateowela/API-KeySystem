@@ -1711,9 +1711,9 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
                 await updateKeyInStorage(cleanKey, { usedBy, usedUsers: usedBy.length });
             }
         } else {
-            // Normal gateway key
-            if (keyData.userId && keyData.userId !== userId) {
-                return res.status(403).json({ valid: false, error: "This key belongs to another session." });
+            // Normal gateway key: bind or allow valid holder
+            if (userId && (!keyData.userId || keyData.userId === 'anonymous')) {
+                await updateKeyInStorage(cleanKey, { userId });
             }
         }
 
@@ -1828,8 +1828,8 @@ app.post('/api/extend-key', rateLimit('claim'), async (req, res) => {
             return res.status(403).json({ success: false, error: "This key has been revoked." });
         }
 
-        if (!keyData.adminCreated && keyData.userId && keyData.userId !== userId) {
-            return res.status(403).json({ success: false, error: "This key does not match your active session." });
+        if (!keyData.adminCreated && userId && (!keyData.userId || keyData.userId === 'anonymous')) {
+            await updateKeyInStorage(cleanKey, { userId });
         }
 
         // 🔒 Daily Limit Enforcement: Maximum 3 extensions per day (24 hours)
