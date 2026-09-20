@@ -56,7 +56,7 @@ const DEFAULT_PROVIDER_SETTINGS = {
 };
 const DEFAULT_STORE_DOMAINS = {
     primaryStoreUrl: 'https://buyrobux-store.pages.dev',
-    keyGatewayUrl: 'https://pathan-key.pages.dev',
+    keyGatewayUrl: 'https://pathan-keys.pages.dev',
     allowedDomains: ['https://buyrobux-store.pages.dev']
 };
 const memorySettings = {
