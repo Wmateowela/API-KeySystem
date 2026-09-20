@@ -1031,37 +1031,39 @@ async function redeemLootlabsPostback(postbackValue, req) {
     return { status: 200, message: "OK", key: issued.key, expiresAt: issued.expiresAt, userId };
 }
 
-// LootLabs Postback - LootLabs server sends GET request here when user completes the locker.
+// LootLabs Postback - LootLabs server sends GET or POST request here when user completes the locker.
 const recentLootlabsPostbacks = []; // last 20 postback attempts (for debugging)
-app.get('/api/lootlabs-postback', async (req, res) => {
+const handleLootlabsPostback = async (req, res) => {
     // Log EVERY postback attempt for debugging
     const logEntry = {
         time: new Date().toISOString(),
         query: req.query,
+        body: req.body,
         ip: getClientIp(req)
     };
     recentLootlabsPostbacks.push(logEntry);
     if (recentLootlabsPostbacks.length > 20) recentLootlabsPostbacks.shift();
-    console.log(`[LootLabs Postback RECEIVED] query=${JSON.stringify(req.query)} ip=${logEntry.ip}`);
+    console.log(`[LootLabs Postback RECEIVED] query=${JSON.stringify(req.query)} body=${JSON.stringify(req.body)} ip=${logEntry.ip}`);
 
-    // Accept postbackValue parameter
+    // Accept postbackValue parameter from query OR body
     const postbackValue = req.query.postbackValue || 
                           req.query.postback || 
                           req.query.pbv || 
                           req.query.unique_id || 
                           req.query.uniqueId || 
-                          req.query.UNIQUE_ID;
-    const { secret } = req.query;
+                          req.query.UNIQUE_ID ||
+                          (req.body && (req.body.postbackValue || req.body.postback || req.body.unique_id));
+    const secret = req.query.secret || (req.body && req.body.secret);
 
     if (!postbackValue) {
-        console.warn(`[LootLabs Postback] No postbackValue in query. Got: ${JSON.stringify(req.query)}`);
+        console.warn(`[LootLabs Postback] No postbackValue in query or body. Got query: ${JSON.stringify(req.query)}, body: ${JSON.stringify(req.body)}`);
         return res.status(400).send("Missing postbackValue");
     }
 
-    // Strict mode: verify secret strictly if configured
+    // Strict mode: verify secret strictly if configured and secret is provided or required
     if (LOOTLABS_POSTBACK_SECRET) {
-        if (!secret || secret !== LOOTLABS_POSTBACK_SECRET) {
-            console.warn(`[LootLabs Postback] Rejected: Invalid or missing secret.`);
+        if (secret && secret !== LOOTLABS_POSTBACK_SECRET) {
+            console.warn(`[LootLabs Postback] Rejected: Invalid secret provided.`);
             return res.status(403).send("Invalid secret");
         }
     }
@@ -1073,15 +1075,13 @@ app.get('/api/lootlabs-postback', async (req, res) => {
         console.error("LootLabs postback error:", err);
         return res.status(500).send("Server error");
     }
-});
+};
 
-// DEBUG: View recent postback attempts (dev only)
+app.get('/api/lootlabs-postback', handleLootlabsPostback);
+app.post('/api/lootlabs-postback', handleLootlabsPostback);
+
+// DEBUG: View recent postback attempts
 app.get('/api/debug/recent-postbacks', (req, res) => {
-    const isCloudHost = !!(process.env.RENDER || process.env.RENDER_EXTERNAL_URL || process.env.DYNO || process.env.NODE_ENV === 'production');
-    const isDev = process.env.ENABLE_LOCAL_KEY_GEN === 'true' && !isCloudHost;
-    if (!isDev) {
-        return res.status(404).json({ error: "Not available in production" });
-    }
     res.json({ count: recentLootlabsPostbacks.length, postbacks: recentLootlabsPostbacks });
 });
 
