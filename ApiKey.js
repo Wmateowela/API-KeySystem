@@ -509,7 +509,7 @@ const LINKVERTISE_EXTEND_LINK = process.env.LINKVERTISE_EXTEND_LINK || 'https://
 
 // LootLabs Configuration
 const LOOTLABS_API_TOKEN = process.env.LOOTLABS_API_TOKEN || '162b3c3519ec02bfbd0fc20ff5d6cd1fb10954357e0be1eeee7f00929c2d17e9';
-const LOOTLABS_TARGET_LINK = process.env.LOOTLABS_TARGET_LINK || 'https://robox-6nc.pages.dev/key.html';
+const LOOTLABS_TARGET_LINK = process.env.LOOTLABS_TARGET_LINK || 'https://pathan-keys.pages.dev/';
 const LOOTLABS_TIER_ID = parseInt(process.env.LOOTLABS_TIER_ID || '2', 10);
 const LOOTLABS_NUM_TASKS = parseInt(process.env.LOOTLABS_NUM_TASKS || '5', 10);
 const LOOTLABS_THEME = parseInt(process.env.LOOTLABS_THEME || '1', 10);
@@ -978,36 +978,30 @@ app.post('/api/create-lootlabs-locker', async (req, res) => {
 // Shared: process a verified LootLabs postback and issue the key.
 // Used by BOTH the real postback endpoint AND the dev-only simulate endpoint.
 async function redeemLootlabsPostback(postbackValue, req) {
-    let pending = memoryLootlabsPending.get(postbackValue);
-    let matchedDocId = postbackValue;
+    if (!postbackValue || typeof postbackValue !== 'string' || postbackValue.trim().length === 0) {
+        return { status: 400, message: "Invalid postbackValue" };
+    }
+
+    const cleanPostback = postbackValue.trim();
+    let pending = memoryLootlabsPending.get(cleanPostback);
+    let matchedDocId = cleanPostback;
 
     if (!pending && rtdb) {
         try {
-            const snap = await rtdb.ref(`lootlabsPending/${postbackValue}`).once('value');
+            const snap = await rtdb.ref(`lootlabsPending/${cleanPostback}`).once('value');
             if (snap.exists()) {
                 pending = snap.val();
-                matchedDocId = postbackValue;
+                matchedDocId = cleanPostback;
             }
         } catch (e) {}
     }
 
-    // Memory fallback if not found by exact key
     if (!pending) {
-        for (const [key, val] of memoryLootlabsPending.entries()) {
-            if (key.startsWith('__')) continue;
-            if (!val.redeemed && val.time > Date.now() - (15 * 60 * 1000)) {
-                pending = val;
-                matchedDocId = key;
-                break;
-            }
-        }
-    }
-
-    if (!pending) {
+        console.warn(`[LootLabs Postback] Unknown postbackValue received: "${cleanPostback}"`);
         return { status: 404, message: "Unknown postbackValue" };
     }
-    if (pending.redeemed) {
-        return { status: 200, message: "ALREADY_REDEEMED" };
+    if (pending.redeemed && pending.key) {
+        return { status: 200, message: "ALREADY_REDEEMED", key: pending.key, expiresAt: pending.expiresAt, userId: pending.userId };
     }
 
     const userId = pending.userId;
@@ -1018,18 +1012,26 @@ async function redeemLootlabsPostback(postbackValue, req) {
     // Mark redeemed FIRST (prevents any double issue)
     pending.redeemed = true;
     memoryLootlabsPending.set(matchedDocId, pending);
-    if (rtdb) {
-        rtdb.ref(`lootlabsPending/${matchedDocId}`).update({ redeemed: true, redeemedAt: Date.now() }).catch(() => {});
-    }
 
     const issued = await issueLootlabsKey(userId, matchedDocId, req, pending);
-    console.log(`[LootLabs Postback] Key issued ${issued.key} for user ${userId}`);
+    pending.key = issued.key;
+    pending.expiresAt = issued.expiresAt;
+    memoryLootlabsPending.set(matchedDocId, pending);
+
+    if (rtdb) {
+        rtdb.ref(`lootlabsPending/${matchedDocId}`).update({ 
+            redeemed: true, 
+            key: issued.key, 
+            expiresAt: issued.expiresAt, 
+            redeemedAt: Date.now() 
+        }).catch(() => {});
+    }
+
+    console.log(`[LootLabs Postback Verified] Key ${issued.key} issued for user ${userId} (postback: ${matchedDocId})`);
     return { status: 200, message: "OK", key: issued.key, expiresAt: issued.expiresAt, userId };
 }
 
 // LootLabs Postback - LootLabs server sends GET request here when user completes the locker.
-// Configure this URL in your LootLabs panel postback settings:
-//   https://api-keysystem-bbbf.onrender.com/api/lootlabs-postback?postbackValue={UNIQUE_ID}&clickId={CLICK_ID}&secret=buyroblox_lootlabs_secret_2026
 const recentLootlabsPostbacks = []; // last 20 postback attempts (for debugging)
 app.get('/api/lootlabs-postback', async (req, res) => {
     // Log EVERY postback attempt for debugging
@@ -1042,17 +1044,13 @@ app.get('/api/lootlabs-postback', async (req, res) => {
     if (recentLootlabsPostbacks.length > 20) recentLootlabsPostbacks.shift();
     console.log(`[LootLabs Postback RECEIVED] query=${JSON.stringify(req.query)} ip=${logEntry.ip}`);
 
-    // Accept postbackValue from any possible param name LootLabs might send
+    // Accept postbackValue parameter
     const postbackValue = req.query.postbackValue || 
-                          req.query.unique_id || 
-                          req.query.uniqueId || 
-                          req.query.UNIQUE_ID || 
                           req.query.postback || 
                           req.query.pbv || 
-                          req.query.clickId || 
-                          req.query.click_id || 
-                          req.query.CLICK_ID || 
-                          req.query.id;
+                          req.query.unique_id || 
+                          req.query.uniqueId || 
+                          req.query.UNIQUE_ID;
     const { secret } = req.query;
 
     if (!postbackValue) {
@@ -1060,10 +1058,12 @@ app.get('/api/lootlabs-postback', async (req, res) => {
         return res.status(400).send("Missing postbackValue");
     }
 
-    // Strict mode: if secret is passed, verify it matches.
-    if (LOOTLABS_POSTBACK_SECRET && secret && secret !== LOOTLABS_POSTBACK_SECRET) {
-        console.warn(`[LootLabs Postback] Invalid secret provided.`);
-        return res.status(403).send("Invalid secret");
+    // Strict mode: verify secret strictly if configured
+    if (LOOTLABS_POSTBACK_SECRET) {
+        if (!secret || secret !== LOOTLABS_POSTBACK_SECRET) {
+            console.warn(`[LootLabs Postback] Rejected: Invalid or missing secret.`);
+            return res.status(403).send("Invalid secret");
+        }
     }
 
     try {
@@ -1157,49 +1157,55 @@ app.post('/api/claim-lootlabs-key', rateLimit('lootlabsPost'), async (req, res) 
     if (!userId) {
         return res.status(400).json({ success: false, error: "Missing userId." });
     }
+    if (!postbackValue || typeof postbackValue !== 'string' || postbackValue.trim().length === 0) {
+        return res.status(400).json({ success: false, error: "Missing or invalid postbackValue." });
+    }
+
+    const cleanPostback = postbackValue.trim();
 
     // 🔒 Input validation
     if (typeof userId !== 'string' || userId.length > 128 || !/^[a-zA-Z0-9_-]+$/.test(userId)) {
         return res.status(400).json({ success: false, error: "Invalid userId format." });
     }
-    if (postbackValue !== undefined && (typeof postbackValue !== 'string' || postbackValue.length > 128)) {
+    if (cleanPostback.length > 128) {
         return res.status(400).json({ success: false, error: "Invalid postbackValue." });
     }
 
     try {
-        // 1. Check in-memory latest claimed key for this user
-        const memClaimed = memoryLootlabsPending.get(`__claimed_${userId}`);
-        if (memClaimed && memClaimed.expiresAt > Date.now()) {
-            return res.json({ success: true, key: memClaimed.key, expiresAt: memClaimed.expiresAt });
+        // 1. Check in-memory pending entry for THIS specific postbackValue
+        let pending = memoryLootlabsPending.get(cleanPostback);
+
+        // 2. Check RTDB pending entry for THIS specific postbackValue
+        if (!pending && rtdb) {
+            try {
+                const snap = await rtdb.ref(`lootlabsPending/${cleanPostback}`).once('value');
+                if (snap.exists()) {
+                    pending = snap.val();
+                }
+            } catch (e) {}
         }
 
-        // 2. Scan memory keys for a key tied to this user + postbackValue
-        if (postbackValue) {
+        // 3. Scan memory keys for exact matching postbackValue
+        if (!pending) {
             for (const [k, v] of memoryKeys.entries()) {
-                if (v.userId === userId && v.lootlabsPostback === postbackValue && v.expiresAt > Date.now()) {
+                if (v.userId === userId && v.lootlabsPostback === cleanPostback && v.expiresAt > Date.now()) {
                     return res.json({ success: true, key: k, expiresAt: v.expiresAt });
                 }
             }
         }
 
-        // 3. Fallback: Check RTDB claimed node
-        if (rtdb) {
-            try {
-                const snap = await rtdb.ref(`lootlabsClaimed/${userId}`).once('value');
-                if (snap.exists()) {
-                    const data = snap.val();
-                    if (data && data.expiresAt && data.expiresAt > Date.now()) {
-                        memoryLootlabsPending.set(`__claimed_${userId}`, { key: data.key, expiresAt: data.expiresAt, time: Date.now() });
-                        return res.json({ success: true, key: data.key, expiresAt: data.expiresAt });
-                    }
-                }
-            } catch (e) {}
+        if (pending) {
+            if (pending.userId && pending.userId !== userId) {
+                return res.status(403).json({ success: false, error: "Session does not match current user." });
+            }
+            if (pending.redeemed && pending.key && pending.expiresAt > Date.now()) {
+                return res.json({ success: true, key: pending.key, expiresAt: pending.expiresAt });
+            }
+            // Locker exists, but LootLabs server postback has NOT arrived yet!
+            return res.status(404).json({ success: false, error: "Waiting for LootLabs confirmation. Please finish all tasks on LootLabs." });
         }
 
-        // 4. NO client-side fallback. Keys are issued ONLY by the verified
-        //    LootLabs postback. This prevents any bypass. For local testing,
-        //    use the dev-only simulate endpoint below.
-        return res.status(404).json({ success: false, error: "No LootLabs key found yet. Please complete all tasks and try again." });
+        return res.status(404).json({ success: false, error: "No verified LootLabs session found. Please complete the tasks." });
     } catch (err) {
         console.error("LootLabs claim error:", err);
         return res.status(500).json({ success: false, error: "Server error: " + err.message });
@@ -1449,34 +1455,27 @@ app.post('/api/claim-workink-key', rateLimit('lootlabsPost'), async (req, res) =
     }
 
     try {
-        // 1. Already claimed? Return cached key
-        const memClaimed = memoryWorkinkPending.get(`__claimed_${userId}`);
-        if (memClaimed && memClaimed.expiresAt > Date.now()) {
-            return res.json({ success: true, key: memClaimed.key, expiresAt: memClaimed.expiresAt });
-        }
-
-        // 2. Already issued via server postback? Scan memory keys (0 Firestore reads)
+        // 1. Already issued via server postback? Scan memory keys
         for (const [k, v] of memoryKeys.entries()) {
             if (v.userId === userId && v.workinkPostback === postbackValue && v.expiresAt > Date.now()) {
                 return res.json({ success: true, key: k, expiresAt: v.expiresAt });
             }
         }
 
-        // 3. Check RTDB claimed node
+        // 2. Check RTDB workinkPending node for this postbackValue
         if (rtdb) {
             try {
-                const snap = await rtdb.ref(`workinkClaimed/${userId}`).once('value');
-                if (snap.exists()) {
-                    const data = snap.val();
-                    if (data && data.expiresAt && data.expiresAt > Date.now()) {
-                        memoryWorkinkPending.set(`__claimed_${userId}`, { key: data.key, expiresAt: data.expiresAt, time: Date.now() });
+                const pSnap = await rtdb.ref(`workinkPending/${postbackValue}`).once('value');
+                if (pSnap.exists()) {
+                    const data = pSnap.val();
+                    if (data && data.redeemed && data.key && data.expiresAt > Date.now()) {
                         return res.json({ success: true, key: data.key, expiresAt: data.expiresAt });
                     }
                 }
             } catch (e) {}
         }
 
-        // 4. Verify with Work.ink Key System API:
+        // 3. Verify with Work.ink Key System API:
         // When Work.ink redirects to key.html#token={TOKEN}, postbackValue is the token.
         // Check validity with Work.ink: GET https://work.ink/_api/v2/token/isValid/{token}?deleteToken=1
         if (postbackValue) {
@@ -1495,7 +1494,7 @@ app.post('/api/claim-workink-key', rateLimit('lootlabsPost'), async (req, res) =
             }
         }
 
-        // 5. Not verified yet and no valid key found
+        // 4. Not verified yet and no valid key found
         return res.status(404).json({
             success: false,
             error: "No Work.ink key found yet. Please complete all tasks and try again."
