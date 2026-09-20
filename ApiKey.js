@@ -56,7 +56,7 @@ const DEFAULT_PROVIDER_SETTINGS = {
 };
 const DEFAULT_STORE_DOMAINS = {
     primaryStoreUrl: 'https://buyrobux-store.pages.dev',
-    keyGatewayUrl: 'https://pathan-keys.pages.dev',
+    keyGatewayUrl: 'https://nmc-key.netlify.app',
     allowedDomains: ['https://buyrobux-store.pages.dev']
 };
 const memorySettings = {
@@ -524,7 +524,7 @@ const WORKINK_POSTBACK_SECRET = process.env.WORKINK_POSTBACK_SECRET || 'buyroblo
 const WORKINK_MIN_COMPLETE_SECS = parseInt(process.env.WORKINK_MIN_COMPLETE_SECS || '15', 10);
 
 // Frontend base URL (for postback redirects)
-const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || 'https://pathan-keys.pages.dev';
+const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || 'https://nmc-key.netlify.app';
 
 // Middleware
 app.use(cors());
