@@ -960,9 +960,10 @@ app.post('/api/create-lootlabs-locker', async (req, res) => {
 
         if (llResponse.ok && locker && (locker.loot_url || locker.short)) {
             const lootUrl = locker.loot_url || `https://lootdest.org/s?${locker.short}`;
+            const lootUrlWithPuid = lootUrl + (lootUrl.includes('?') ? '&' : '?') + `puid=${postbackValue}`;
             return res.json({
                 success: true,
-                lockerUrl: lootUrl,
+                lockerUrl: lootUrlWithPuid,
                 postbackValue
             });
         }
@@ -1076,12 +1077,13 @@ const handleLootlabsPostback = async (req, res) => {
 
     // Accept postbackValue parameter from query OR body
     const postbackValue = req.query.postbackValue || 
+                          req.query.click_id ||
                           req.query.postback || 
                           req.query.pbv || 
                           req.query.unique_id || 
                           req.query.uniqueId || 
                           req.query.UNIQUE_ID ||
-                          (req.body && (req.body.postbackValue || req.body.postback || req.body.unique_id));
+                          (req.body && (req.body.postbackValue || req.body.click_id || req.body.postback || req.body.unique_id));
     const secret = req.query.secret || (req.body && req.body.secret);
 
     if (!postbackValue) {
