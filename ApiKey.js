@@ -524,7 +524,7 @@ const WORKINK_POSTBACK_SECRET = process.env.WORKINK_POSTBACK_SECRET || 'buyroblo
 const WORKINK_MIN_COMPLETE_SECS = parseInt(process.env.WORKINK_MIN_COMPLETE_SECS || '15', 10);
 
 // Frontend base URL (for postback redirects)
-const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || 'https://robox-6nc.pages.dev';
+const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || 'https://pathan-keys.pages.dev';
 
 // Middleware
 app.use(cors());
@@ -994,6 +994,34 @@ async function redeemLootlabsPostback(postbackValue, req) {
                 matchedDocId = cleanPostback;
             }
         } catch (e) {}
+    }
+
+    // If not found by exact key (e.g. LootLabs passed macro name literally like {postbackValue} or {UNIQUE_ID})
+    if (!pending && (cleanPostback.includes('{') || cleanPostback.includes('}') || cleanPostback.length < 16)) {
+        for (const [key, val] of memoryLootlabsPending.entries()) {
+            if (key.startsWith('__')) continue;
+            if (!val.redeemed && val.time > Date.now() - (15 * 60 * 1000)) {
+                pending = val;
+                matchedDocId = key;
+                break;
+            }
+        }
+        if (!pending && rtdb) {
+            try {
+                const snap = await rtdb.ref('lootlabsPending').limitToLast(20).once('value');
+                if (snap.exists()) {
+                    const list = snap.val();
+                    const entries = Object.entries(list).reverse();
+                    for (const [key, val] of entries) {
+                        if (val && !val.redeemed && val.time > Date.now() - (15 * 60 * 1000)) {
+                            pending = val;
+                            matchedDocId = key;
+                            break;
+                        }
+                    }
+                }
+            } catch (e) {}
+        }
     }
 
     if (!pending) {
