@@ -996,8 +996,9 @@ async function redeemLootlabsPostback(postbackValue, req) {
         } catch (e) {}
     }
 
-    // If not found by exact key (e.g. LootLabs passed macro name literally like {postbackValue} or {UNIQUE_ID})
-    if (!pending && (cleanPostback.includes('{') || cleanPostback.includes('}') || cleanPostback.length < 16)) {
+    // LootLabs sends its own unique_id (numeric) NOT our custom postbackValue.
+    // So we must find the most recent unredeemed pending entry for this user.
+    if (!pending) {
         for (const [key, val] of memoryLootlabsPending.entries()) {
             if (key.startsWith('__')) continue;
             if (!val.redeemed && val.time > Date.now() - (15 * 60 * 1000)) {
@@ -1200,26 +1201,40 @@ app.post('/api/claim-lootlabs-key', rateLimit('lootlabsPost'), async (req, res) 
     }
 
     try {
-        // 1. Check in-memory pending entry for THIS specific postbackValue
-        let pending = memoryLootlabsPending.get(cleanPostback);
+        // 1. Check in-memory claimed cache for this user
+        const memClaimed = memoryLootlabsPending.get(`__claimed_${userId}`);
+        if (memClaimed && memClaimed.expiresAt > Date.now()) {
+            return res.json({ success: true, key: memClaimed.key, expiresAt: memClaimed.expiresAt });
+        }
 
-        // 2. Check RTDB pending entry for THIS specific postbackValue
+        // 2. Check pending entry by postbackValue (memory + RTDB)
+        let pending = memoryLootlabsPending.get(cleanPostback);
         if (!pending && rtdb) {
             try {
                 const snap = await rtdb.ref(`lootlabsPending/${cleanPostback}`).once('value');
-                if (snap.exists()) {
-                    pending = snap.val();
-                }
+                if (snap.exists()) pending = snap.val();
             } catch (e) {}
         }
 
-        // 3. Scan memory keys for exact matching postbackValue
-        if (!pending) {
-            for (const [k, v] of memoryKeys.entries()) {
-                if (v.userId === userId && v.lootlabsPostback === cleanPostback && v.expiresAt > Date.now()) {
-                    return res.json({ success: true, key: k, expiresAt: v.expiresAt });
-                }
+        // 3. Scan memory keys for matching postbackValue
+        for (const [k, v] of memoryKeys.entries()) {
+            if (v.userId === userId && v.lootlabsPostback === cleanPostback && v.expiresAt > Date.now()) {
+                return res.json({ success: true, key: k, expiresAt: v.expiresAt });
             }
+        }
+
+        // 4. Check RTDB lootlabsClaimed for this user (postback may have stored key here)
+        if (rtdb) {
+            try {
+                const snap = await rtdb.ref(`lootlabsClaimed/${userId}`).once('value');
+                if (snap.exists()) {
+                    const data = snap.val();
+                    if (data && data.key && data.expiresAt > Date.now()) {
+                        memoryLootlabsPending.set(`__claimed_${userId}`, { key: data.key, expiresAt: data.expiresAt, time: Date.now() });
+                        return res.json({ success: true, key: data.key, expiresAt: data.expiresAt });
+                    }
+                }
+            } catch (e) {}
         }
 
         if (pending) {
@@ -1229,7 +1244,6 @@ app.post('/api/claim-lootlabs-key', rateLimit('lootlabsPost'), async (req, res) 
             if (pending.redeemed && pending.key && pending.expiresAt > Date.now()) {
                 return res.json({ success: true, key: pending.key, expiresAt: pending.expiresAt });
             }
-            // Locker exists, but LootLabs server postback has NOT arrived yet!
             return res.status(404).json({ success: false, error: "Waiting for LootLabs confirmation. Please finish all tasks on LootLabs." });
         }
 
