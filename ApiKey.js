@@ -8,6 +8,10 @@ const { getAuth } = require('firebase-admin/auth');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { countDevices } = require('./presence');
+const { saveDailySubmission, latestSubmissions, removableOldSubmissionIds } = require('./support-store');
+const { isLinkedToGoogleAccount, findActiveGoogleKeys, findUsableGoogleKeys, accountKeySlot } = require('./google-key-lookup');
+const { mayDisconnectKeySession, mayDisconnectGuestSession } = require('./logout-authorization');
 
 // Local in-memory caches for lightning-fast lookups & 0-read operations
 const memoryKeys = new Map();
@@ -18,6 +22,8 @@ const memoryBans = new Map();           // ip -> { ip, reason, banUntil, bannedA
 const memoryAnnouncements = new Map();  // id -> announcementDoc
 const memoryInvalidKeys = new Map();     // key -> timestamp (negative cache to prevent 404 DB spam)
 const onlineUsers = new Map();          // userId -> lastSeen (ms)
+const presenceSessions = new Map();     // session/node id -> canonical live visitor record
+const authHandoffs = new Map();         // one-time token -> verified Google/key session
 
 let announcementsLastLoaded = 0;
 const ANNOUNCEMENTS_CACHE_TTL = 10 * 60 * 1000; // 10 mins
@@ -164,14 +170,19 @@ async function loadSettingsFromStorage() {
                 console.log('✅ Loaded Store Catalog Config from RTDB');
             }
         }
-        // 4. Load store domains
+        // 4. Load store domains & attach live listener
         if (rtdb) {
             try {
                 const snapDomains = await rtdb.ref('settings/storeDomains').once('value');
                 if (snapDomains.exists() && snapDomains.val()) {
                     memorySettings.storeDomains = snapDomains.val();
-                    console.log('✅ Loaded Store Domains from RTDB');
+                    console.log('✅ Loaded Store Domains from RTDB:', memorySettings.storeDomains.primaryStoreUrl);
                 }
+                rtdb.ref('settings/storeDomains').on('value', (snap) => {
+                    if (snap.exists() && snap.val()) {
+                        memorySettings.storeDomains = snap.val();
+                    }
+                });
             } catch (e) {}
         }
     } catch (e) {
@@ -206,9 +217,20 @@ async function saveKeyToStorage(key, keyData) {
 
 }
 
-async function updateKeyInStorage(key, updates) {
+async function updateKeyInStorage(key, updates, options = {}) {
     const cleanKey = (key || '').toUpperCase();
     if (!cleanKey) return;
+
+    // Account-access changes must not report success when persistent key
+    // storage was unavailable. Ordinary heartbeat/verification updates retain
+    // their existing best-effort behavior.
+    if (options.strict) {
+        if (!rtdb) throw new Error('Persistent key storage is unavailable.');
+        await rtdb.ref(`keys/${cleanKey}`).update(updates);
+        const saved = await rtdb.ref(`keys/${cleanKey}`).once('value');
+        memoryKeys.set(cleanKey, { key: cleanKey, ...(saved.val() || {}) });
+        return;
+    }
 
     // 1. RAM Cache
     const existing = memoryKeys.get(cleanKey) || {};
@@ -271,11 +293,17 @@ async function loadKeysFromStorage(force = false) {
 
     let loadedRtdb = 0;
     let loadedFirestore = 0;
+    let rtdbReadSucceeded = false;
+
+    // A forced refresh must be an exact snapshot. Keeping deleted entries in this
+    // map was the reason the Admin "Total Keys" card slowly became inaccurate.
+    if (force) memoryKeys.clear();
 
     // 1. Load from Realtime Database
     if (rtdb) {
         try {
             const snap = await rtdb.ref('keys').once('value');
+            rtdbReadSucceeded = true;
             const val = snap.val();
             if (val && typeof val === 'object') {
                 Object.keys(val).forEach(k => {
@@ -292,8 +320,9 @@ async function loadKeysFromStorage(force = false) {
         }
     }
 
-    // 2. Load from Firestore collection 'keys'
-    if (db) {
+    // 2. Firestore is legacy/fallback storage. Do not union it with RTDB: old
+    // Firestore documents would otherwise resurrect deleted keys in the totals.
+    if (db && !rtdbReadSucceeded) {
         try {
             const snap = await db.collection('keys').get();
             snap.forEach(docSnap => {
@@ -333,7 +362,56 @@ function setupRTDBListeners() {
             const keyName = (data && data.key) ? data.key.toUpperCase() : (snap.key || '').toUpperCase();
             if (keyName) memoryKeys.delete(keyName);
         });
-        console.log("✅ Realtime Database (RTDB) live sync listener active.");
+
+        // Real-time synchronization of online presence from RTDB
+        rtdb.ref('presence').on('value', (snap) => {
+            const val = snap.val();
+            // Refresh only Firebase records. API heartbeat sessions live in the
+            // same map and must not be erased whenever RTDB changes.
+            for (const nodeId of presenceSessions.keys()) {
+                if (nodeId.startsWith('rtdb:')) presenceSessions.delete(nodeId);
+            }
+            if (val && typeof val === 'object') {
+                const now = Date.now();
+                const cutoff = now - ONLINE_WINDOW_MS;
+                Object.entries(val).forEach(([vid, p]) => {
+                    if (p && (p.lastSeen || 0) > cutoff) {
+                        const ts = p.lastSeen || now;
+                        presenceSessions.set(`rtdb:${vid}`, { ...p, visitorId: vid, lastSeen: ts });
+                        onlineUsers.set(vid, ts);
+                        if (p.uid) {
+                            onlineUsers.set(p.uid, ts);
+                            onlineUsers.set(`guid:${p.uid}`, ts);
+                        }
+                        if (p.key) {
+                            const cleanK = String(p.key).trim().toUpperCase();
+                            onlineUsers.set(`key:${cleanK}`, ts);
+
+                            const keyObj = memoryKeys.get(cleanK);
+                            if (keyObj && p.email && !keyObj.googleEmail) {
+                                keyObj.googleEmail = p.email;
+                                if (p.displayName) keyObj.displayName = p.displayName;
+                                keyObj.authProvider = 'google';
+                            }
+                        }
+                        if (p.email) {
+                            onlineUsers.set(`email:${String(p.email).toLowerCase()}`, ts);
+                        }
+                    } else if (p && (p.lastSeen || 0) <= cutoff) {
+                        onlineUsers.delete(vid);
+                        if (p.uid) {
+                            onlineUsers.delete(p.uid);
+                            onlineUsers.delete(`guid:${p.uid}`);
+                        }
+                        if (p.key) {
+                            onlineUsers.delete(`key:${String(p.key).trim().toUpperCase()}`);
+                        }
+                    }
+                });
+            }
+        });
+
+        console.log("✅ Realtime Database (RTDB) live sync & presence listeners active.");
     } catch (e) {
         console.warn("RTDB listener setup warning:", e.message);
     }
@@ -390,6 +468,93 @@ async function loadAnnouncementsFromFirestore(force = false) {
         }
     }
     return Array.from(memoryAnnouncements.values());
+}
+
+const DEFAULT_FEATURES_NOTICE = {
+    active: true,
+    title: "What's New in Update",
+    badge: "v2.5 UPDATE",
+    subtitle: "Explore our latest features, realistic store upgrades, and simulation tools!",
+    items: [
+        {
+            id: "feat-1",
+            title: "Verified Creator Badges",
+            desc: "Search now displays authentic <strong>Roblox Verified Badges</strong> dynamically beside verified player usernames.",
+            icon: "fas fa-badge-check",
+            badge: "NEW",
+            highlight: false,
+            color: "blue"
+        },
+        {
+            id: "feat-2",
+            title: "Ultra-Realistic Storefront & UI",
+            desc: "Redesigned <strong>'For You'</strong> cards, high-res bonus graphics, and calibrated Robux icons, font weights, and colors.",
+            icon: "fas fa-palette",
+            badge: "IMPROVED",
+            highlight: false,
+            color: "purple"
+        },
+        {
+            id: "feat-3",
+            title: "Authentic Quick Pay Purchase",
+            desc: "Experience realistic <strong>Quick Pay checkout</strong> modal with true-to-life progress spinners and real-time breakdowns.",
+            icon: "fas fa-credit-card",
+            badge: "NEW",
+            highlight: false,
+            color: "emerald"
+        },
+        {
+            id: "feat-4",
+            title: "⚡ Automated Human Auto-Gift Mode",
+            desc: "Built for streamers! Full <strong>human typing simulation</strong>, custom WPM speeds, natural delays, and realistic 0-ending amounts in <strong>Edit Profile → Auto Gift tab</strong>.",
+            icon: "fas fa-robot",
+            badge: "⭐ STREAMERS FAVORITE",
+            highlight: true,
+            color: "amber"
+        },
+        {
+            id: "feat-5",
+            title: "Google Cloud Login & Sync",
+            desc: "Integrated <strong>Google Sign-In</strong> allowing instant cross-device profile, balance, and simulation preferences synchronization.",
+            icon: "fab fa-google",
+            badge: "CLOUD",
+            highlight: false,
+            color: "rose"
+        }
+    ],
+    version: 1,
+    updatedAt: new Date().toISOString()
+};
+
+let cachedFeaturesNotice = null;
+let featuresNoticeLastLoaded = 0;
+
+async function loadFeaturesNoticeFromFirestore(force = false) {
+    const now = Date.now();
+    if (!force && (now - featuresNoticeLastLoaded) < ANNOUNCEMENTS_CACHE_TTL && cachedFeaturesNotice) {
+        return cachedFeaturesNotice;
+    }
+
+    if (rtdb) {
+        try {
+            const snap = await rtdb.ref('featuresNotice').once('value');
+            if (snap.exists()) {
+                const data = snap.val() || {};
+                cachedFeaturesNotice = { ...DEFAULT_FEATURES_NOTICE, ...data };
+                if (Array.isArray(data.items)) {
+                    cachedFeaturesNotice.items = data.items;
+                }
+                featuresNoticeLastLoaded = now;
+                return cachedFeaturesNotice;
+            }
+        } catch (e) {
+            console.warn("RTDB load features notice warning:", e.message);
+        }
+    }
+    if (!cachedFeaturesNotice) {
+        cachedFeaturesNotice = { ...DEFAULT_FEATURES_NOTICE };
+    }
+    return cachedFeaturesNotice;
 }
 
 async function loadUsedHashesFromFirestore(force = false) {
@@ -501,6 +666,7 @@ try {
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const API_BUILD_VERSION = '2026.09.29-assigned-key-sync-v16';
 
 // Default Tokens
 const LINKVERTISE_TOKEN = process.env.LINKVERTISE_TOKEN || '05bea4d469e02f8573931ff654597345edb6092d8c418ffc588c91de1678325a';
@@ -546,6 +712,7 @@ const rateLimitMap = new Map();
 const RATE_LIMITS = {
     claim:        { windowMs: 60 * 1000,     max: 5  }, // 5 claims per minute per IP
     verify:       { windowMs: 60 * 1000,     max: 30 }, // 30 verifies per minute per IP
+    logoutState:  { windowMs: 60 * 1000,     max: 90 }, // separate budget for background cross-domain logout checks
     admin:        { windowMs: 60 * 1000,     max: 60 }, // 60 admin calls per minute
     lootlabsPost: { windowMs: 60 * 1000,     max: 60 }  // 60 postback/poll requests/min for fast polling
 };
@@ -676,28 +843,140 @@ async function clearBan(ip) {
 }
 
 // ---------------- ONLINE TRACKING ----------------
-const ONLINE_WINDOW_MS = 70 * 1000; // considered online if seen within 70s
-function markOnline(userId, ip) {
-    if (!userId) return;
-    onlineUsers.set(userId, Date.now());
+const ONLINE_WINDOW_MS = 60 * 1000; // heartbeat is every 25s; expire ghost sessions quickly
+function markOnline(userId, ip, key, googleInfo) {
+    const now = Date.now();
+    if (userId && typeof userId === 'string') {
+        const cleanUid = userId.trim();
+        if (cleanUid) onlineUsers.set(cleanUid, now);
+    }
+    if (googleInfo && googleInfo.email) {
+        onlineUsers.set(`email:${String(googleInfo.email).trim().toLowerCase()}`, now);
+    }
+    if (googleInfo && googleInfo.uid) {
+        onlineUsers.set(`guid:${String(googleInfo.uid).trim()}`, now);
+    }
+    if (key && typeof key === 'string') {
+        const cleanKey = key.trim().toUpperCase();
+        if (cleanKey) {
+            onlineUsers.set(`key:${cleanKey}`, now);
+            if (googleInfo) {
+                const keyObj = memoryKeys.get(cleanKey);
+                if (keyObj && (!keyObj.googleEmail || !keyObj.displayName)) {
+                    const updates = {};
+                    if (googleInfo.email && !keyObj.googleEmail) updates.googleEmail = googleInfo.email;
+                    if (googleInfo.displayName && !keyObj.displayName) updates.displayName = googleInfo.displayName;
+                    if (googleInfo.uid && (!keyObj.googleUid || keyObj.googleUid === 'anonymous')) updates.googleUid = googleInfo.uid;
+                    if (!keyObj.authProvider || keyObj.authProvider === 'anonymous') updates.authProvider = 'google';
+                    if (Object.keys(updates).length > 0) {
+                        updateKeyInStorage(cleanKey, updates);
+                    }
+                }
+            }
+        }
+    }
     if (ip) {
-        const key = `ip:${normalizeIp(ip)}`;
-        onlineUsers.set(key, Date.now());
+        const cleanIp = normalizeIp(ip);
+        if (cleanIp && cleanIp !== 'unknown') {
+            onlineUsers.set(`ip:${cleanIp}`, now);
+        }
     }
 }
+function isKeyOnline(key) {
+    if (!key) return false;
+    const t = onlineUsers.get(`key:${String(key).trim().toUpperCase()}`);
+    return !!t && (Date.now() - t) < ONLINE_WINDOW_MS;
+}
 function isUserOnline(userId) {
-    if (!userId) return false;
-    const t = onlineUsers.get(userId);
+    if (!userId || userId === '-') return false;
+    const raw = String(userId).trim();
+    let t = onlineUsers.get(raw);
+    if (!t && raw.includes('.')) {
+        t = onlineUsers.get(`ip:${normalizeIp(raw)}`);
+    }
+    if (!t && raw.includes('@')) {
+        t = onlineUsers.get(`email:${raw.toLowerCase()}`);
+    }
+    if (!t) {
+        t = onlineUsers.get(`guid:${raw}`);
+    }
     return !!t && (Date.now() - t) < ONLINE_WINDOW_MS;
 }
 function getOnlineUserIds() {
     const now = Date.now();
-    const ids = [];
-    for (const [k, t] of onlineUsers.entries()) {
-        if (k.startsWith('ip:')) continue;
-        if (now - t < ONLINE_WINDOW_MS) ids.push(k);
+    const ids = new Set();
+    const aliases = new Map();
+    for (const keyObj of memoryKeys.values()) {
+        const canonical = keyObj.googleUid || (keyObj.googleEmail ? `email:${String(keyObj.googleEmail).toLowerCase()}` : keyObj.userId) || `key:${keyObj.key}`;
+        if (keyObj.key) aliases.set(`key:${String(keyObj.key).toUpperCase()}`, canonical);
+        if (keyObj.googleUid) { aliases.set(String(keyObj.googleUid), canonical); aliases.set(`guid:${keyObj.googleUid}`, canonical); }
+        if (keyObj.googleEmail) aliases.set(`email:${String(keyObj.googleEmail).toLowerCase()}`, canonical);
+        if (keyObj.userId) aliases.set(String(keyObj.userId), canonical);
     }
-    return ids;
+    for (const [k, t] of onlineUsers.entries()) {
+        if (now - t < ONLINE_WINDOW_MS) {
+            if (k.startsWith('key:')) {
+                const keyName = k.slice(4);
+                const keyObj = memoryKeys.get(keyName);
+                if (keyObj) {
+                    const isLifetime = !keyObj.expiresAt || keyObj.expiresAt === 0;
+                    const expired = !isLifetime && keyObj.expiresAt <= now;
+                    if (!expired && !keyObj.revoked) {
+                        ids.add(aliases.get(k) || `key:${keyName}`);
+                    }
+                }
+            } else if (!k.startsWith('ip:')) {
+                ids.add(aliases.get(k) || k);
+            }
+        }
+    }
+    return Array.from(ids);
+}
+
+function getKeyOnlineBreakdown(key, sharedRecords = {}) {
+    const cleanKey = String(key || '').trim().toUpperCase();
+    const cutoff = Date.now() - ONLINE_WINDOW_MS;
+    const people = new Map();
+    for (const [sessionNode, p] of Object.entries({ ...sharedRecords, ...Object.fromEntries(presenceSessions) })) {
+        if (!p || p.online === false || (p.lastSeen || 0) <= cutoff || (p.lastSeen || 0) > Date.now() + 60000 || String(p.key || '').trim().toUpperCase() !== cleanKey) continue;
+        const isGoogle = p.authProvider === 'google' || !!p.email;
+        // Count physical browser/device sessions, not unique email addresses.
+        // One Google account may legitimately be active on several allowed devices.
+        const identity = `device:${String(p.visitorId || sessionNode)}`;
+        if (!people.has(identity) || Number(p.lastSeen) > people.get(identity).lastSeen) {
+            people.set(identity, {
+                type: isGoogle ? 'google' : 'guest',
+                email: isGoogle ? String(p.email || '') : '',
+                displayName: isGoogle ? String(p.displayName || '') : '',
+                lastSeen: p.lastSeen || 0
+            });
+        }
+    }
+    const onlinePeople = Array.from(people.values());
+    return {
+        onlineUsers: onlinePeople.length,
+        onlineGoogle: onlinePeople.filter(p => p.type === 'google').length,
+        onlineGuests: onlinePeople.filter(p => p.type === 'guest').length,
+        onlinePeople
+    };
+}
+
+function getKeyAccountUsers(keyData) {
+    const members = Array.isArray(keyData && keyData.accountUsers) ? [...keyData.accountUsers] : [];
+    if (keyData && keyData.googleUid && !members.some(m => m && m.uid === keyData.googleUid)) {
+        members.push({
+            uid: keyData.googleUid,
+            email: keyData.googleEmail || '',
+            displayName: keyData.displayName || '',
+            linkedAt: keyData.linkedAt || keyData.createdAt || 0
+        });
+    }
+    return members.filter(m => m && m.uid);
+}
+
+function hasAccountMember(keyData, uid, email = '') {
+    const cleanEmail = String(email || '').toLowerCase();
+    return getKeyAccountUsers(keyData).some(m => m.uid === uid || (cleanEmail && String(m.email || '').toLowerCase() === cleanEmail));
 }
 
 // ---------------- BAN ENFORCEMENT MIDDLEWARE ----------------
@@ -738,14 +1017,356 @@ app.get('/api/check-ban', async (req, res) => {
     res.json({ banned: false });
 });
 
-// Heartbeat: frontend pings this to appear "online" (real tracking)
+// Heartbeat: frontend pings this to appear "online" (real tracking for all visitors)
 app.post('/api/heartbeat', rateLimit('verify'), (req, res) => {
-    const { userId } = req.body || {};
-    if (!userId || typeof userId !== 'string' || userId.length > 128 || !/^[a-zA-Z0-9_-]+$/.test(userId)) {
-        return res.status(400).json({ success: false, error: 'Invalid userId' });
+    let { userId, key, email, displayName, googleUid, authProvider, sessionId, visitorId, offline } = req.body || {};
+    const ip = getClientIp(req);
+    if (!userId || typeof userId !== 'string' || !/^[a-zA-Z0-9_.:-]+$/.test(userId)) {
+        userId = `anon_${normalizeIp(ip).replace(/[^a-zA-Z0-9_]/g, '_')}`;
     }
-    markOnline(userId, getClientIp(req));
-    res.json({ success: true });
+    const sessionKey = String(sessionId || visitorId || userId || `ip:${normalizeIp(ip)}`).slice(0, 180);
+    if (offline === true) {
+        presenceSessions.delete(`api:${sessionKey}`);
+        if (rtdb) rtdb.ref('serverPresence/' + crypto.createHash('sha256').update(sessionKey).digest('hex')).remove().catch(() => {});
+        return res.json({ success: true, offline: true });
+    }
+    const googleInfo = (email || displayName || googleUid) ? {
+        email: email || '',
+        displayName: displayName || '',
+        uid: googleUid || userId
+    } : null;
+    markOnline(userId, ip, key, googleInfo);
+    presenceSessions.set(`api:${sessionKey}`, {
+        uid: googleUid || userId,
+        key: key ? String(key).trim().toUpperCase() : '',
+        email: email || '',
+        displayName: displayName || '',
+        authProvider: authProvider || (email ? 'google' : 'anonymous'),
+        lastSeen: Date.now(),
+        // Use the stable visitor id so the API heartbeat and Firebase presence
+        // entry for the same browser collapse into one person.
+        visitorId: String(visitorId || userId || sessionKey)
+    });
+    if (rtdb) {
+        const record = presenceSessions.get(`api:${sessionKey}`);
+        rtdb.ref('serverPresence/' + crypto.createHash('sha256').update(sessionKey).digest('hex')).set(record).catch(e => console.warn('[Presence] Shared heartbeat unavailable:', e.message));
+    }
+    res.json({ success: true, onlineCount: getOnlineUserIds().length });
+});
+
+async function verifyUserToken(req, required = true) {
+    const token = extractBearer(req) || (req.body && req.body.idToken);
+    const a = getAdminAuth();
+    if (!token || !a) {
+        if (required) throw new Error('A valid Firebase sign-in is required.');
+        return null;
+    }
+    try {
+        return await a.verifyIdToken(token);
+    } catch (e) {
+        if (required) throw new Error('Firebase sign-in expired or is invalid.');
+        return null;
+    }
+}
+
+function handoffStorageKey(token) {
+    return crypto.createHash('sha256').update(String(token)).digest('hex');
+}
+
+// Create a short-lived, single-use bridge so Firebase login can safely cross
+// from the Key domain to a separately hosted Store domain.
+app.post('/api/auth/handoff', rateLimit('verify'), async (req, res) => {
+    try {
+        const decoded = await verifyUserToken(req, true);
+        const key = String((req.body && req.body.key) || '').trim().toUpperCase();
+        const sessionId = String((req.body && req.body.sessionId) || '').trim();
+        if (!key) return res.status(400).json({ success: false, error: 'Missing key.' });
+        const keyData = await getKeyFromStorage(key);
+        if (!keyData || keyData.revoked || (keyData.expiresAt > 0 && keyData.expiresAt <= Date.now())) {
+            return res.status(403).json({ success: false, error: 'Key is invalid or expired.' });
+        }
+        if ((keyData.excludedEmails || []).some(value => String(value).toLowerCase() === String(decoded.email || '').toLowerCase())) return res.status(403).json({ success: false, error: 'This account has been moved to a different key.' });
+        if (keyData.boundEmail && (!decoded.email_verified || String(decoded.email || '').toLowerCase() !== keyData.boundEmail)) return res.status(403).json({ error: 'Sign in with the email assigned to this key.' });
+        const maxUsers = Math.max(1, parseInt(keyData.maxUsers, 10) || 1);
+        const multiUserKey = maxUsers > 1;
+        if (keyData.googleUid && !multiUserKey && keyData.googleUid !== decoded.uid) {
+            return res.status(403).json({ success: false, error: 'This key belongs to another Google account.' });
+        }
+        if (multiUserKey && decoded.email && !hasAccountMember(keyData, decoded.uid, decoded.email)) {
+            if (!accountKeySlot(keyData, decoded.uid, getClientIp(req), '', decoded.email).allowed) return res.status(403).json({ success: false, error: `This key has reached its ${maxUsers}-person limit.` });
+        }
+        if (!multiUserKey && !keyData.googleUid && !keyData.adminCreated && keyData.userId && keyData.userId !== decoded.uid) {
+            return res.status(403).json({ success: false, error: 'This guest key belongs to another device.' });
+        }
+        const firebaseProfile = await getAdminAuth()?.getUser(decoded.uid).catch(() => null);
+        const googleProfile = firebaseProfile?.providerData?.find(profile => profile.providerId === 'google.com');
+        const rawToken = crypto.randomBytes(32).toString('base64url');
+        const storageKey = handoffStorageKey(rawToken);
+        const record = {
+            uid: decoded.uid,
+            email: (decoded.email || '').toLowerCase(),
+            name: decoded.name || googleProfile?.displayName || firebaseProfile?.displayName || decoded.email || 'Google User',
+            picture: decoded.picture || googleProfile?.photoURL || firebaseProfile?.photoURL || getKeyAccountUsers(keyData).find(member => member.uid === decoded.uid)?.photoURL || (keyData.googleUid === decoded.uid ? keyData.photoURL : '') || '',
+            key,
+            expiresAt: keyData.expiresAt || 0,
+            sessionId,
+            createdAt: Date.now(),
+            expiresAtToken: Date.now() + 90 * 1000
+        };
+        authHandoffs.set(storageKey, record);
+        if (rtdb) await rtdb.ref(`authHandoffs/${storageKey}`).set(record);
+        return res.json({ success: true, handoffToken: rawToken, expiresIn: 90 });
+    } catch (e) {
+        return res.status(401).json({ success: false, error: e.message });
+    }
+});
+
+app.post('/api/auth/handoff/exchange', rateLimit('verify'), async (req, res) => {
+    try {
+        const rawToken = String((req.body && req.body.handoffToken) || '').trim();
+        if (!rawToken) return res.status(400).json({ success: false, error: 'Missing handoff token.' });
+        const storageKey = handoffStorageKey(rawToken);
+        let record = authHandoffs.get(storageKey) || null;
+        if (!record && rtdb) {
+            const snap = await rtdb.ref(`authHandoffs/${storageKey}`).once('value');
+            if (snap.exists()) record = snap.val();
+        }
+        authHandoffs.delete(storageKey);
+        if (rtdb) await rtdb.ref(`authHandoffs/${storageKey}`).remove().catch(() => {});
+        if (!record || record.expiresAtToken < Date.now()) {
+            return res.status(410).json({ success: false, error: 'Login handoff expired. Please return to the key page.' });
+        }
+        const keyData = await getKeyFromStorage(record.key);
+        if (!keyData || keyData.revoked || (keyData.expiresAt > 0 && keyData.expiresAt <= Date.now())) {
+            return res.status(403).json({ success: false, error: 'Key is invalid or expired.' });
+        }
+        if ((keyData.excludedEmails || []).some(value => String(value).toLowerCase() === String(record.email || '').toLowerCase())) return res.status(403).json({ success: false, error: 'This account has been moved to a different key.' });
+        const a = getAdminAuth();
+        if (!a) return res.status(503).json({ success: false, error: 'Firebase Auth is unavailable.' });
+        const customToken = await a.createCustomToken(record.uid, { email: record.email || '' });
+        return res.json({ success: true, customToken, key: record.key, expiresAt: keyData.expiresAt || 0, sessionId: record.sessionId || '', photoURL: record.picture || '', displayName: record.name || '', email: record.email || '' });
+    } catch (e) {
+        return res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// Sync and bind Google account to access key / retrieve active key for cross-device login
+app.post('/api/sync-google-key', rateLimit('verify'), async (req, res) => {
+    try {
+        const decoded = await verifyUserToken(req, true);
+        const { displayName, photoURL, key, sessionId, previousIdToken } = req.body || {};
+        const uid = decoded.uid;
+        const email = decoded.email || '';
+
+        const cleanUid = String(uid).trim();
+        const cleanEmail = (email && typeof email === 'string') ? email.trim().toLowerCase() : '';
+        const cleanName = (displayName && typeof displayName === 'string') ? displayName.trim() : (cleanEmail ? cleanEmail.split('@')[0] : 'Google User');
+        const cleanPhoto = (photoURL && typeof photoURL === 'string') ? photoURL.trim() : '';
+        const cleanKey = (key && typeof key === 'string') ? key.trim().toUpperCase() : '';
+        const cleanSessionId = (sessionId && typeof sessionId === 'string') ? sessionId.trim() : null;
+        const now = Date.now();
+        const ip = getClientIp(req);
+        let previousIdentity = null;
+        if (previousIdToken && getAdminAuth()) {
+            try { previousIdentity = await getAdminAuth().verifyIdToken(previousIdToken); } catch (e) {}
+        }
+        const previousGuestUid = previousIdentity?.firebase?.sign_in_provider === 'anonymous' ? previousIdentity.uid : '';
+
+        // Check if user is banned
+        const ban = await isIpBanned(ip);
+        if (ban) {
+            return res.status(403).json({
+                success: false,
+                banned: true,
+                reason: ban.reason || 'Violation of terms',
+                banUntil: ban.banUntil || 0,
+                error: 'Your access has been banned.'
+            });
+        }
+
+        const linkedActiveKeys = () => findActiveGoogleKeys(memoryKeys.values(), cleanUid, cleanEmail, decoded.email_verified, Date.now());
+        const usableLinkedKeys = () => findUsableGoogleKeys(memoryKeys.values(), cleanUid, cleanEmail, decoded.email_verified, ip, previousGuestUid, Date.now());
+        let existingActiveKeys = linkedActiveKeys();
+        const assignedKeyName = decoded.email_verified && cleanEmail ? await membership.assignedKeyForEmail(cleanEmail) : '';
+        const assignedKey = assignedKeyName ? await getKeyFromStorage(assignedKeyName) : null;
+        const assignedExpiry = assignedKey ? Math.min(assignedKey.expiresAt || Infinity, assignedKey.subscriptionExpiresAt || Infinity) : 0;
+        const usableAssignedKey = assignedKey && !assignedKey.revoked && assignedExpiry > now &&
+            isLinkedToGoogleAccount(assignedKey, cleanUid, cleanEmail, decoded.email_verified) &&
+            accountKeySlot(assignedKey, cleanUid, ip, previousGuestUid, cleanEmail).allowed;
+        // An explicit Admin assignment replaces the account's former key,
+        // even when the old key has a longer remaining duration.
+        let targetKey = assignedKeyName ? (usableAssignedKey ? assignedKey : null) : usableLinkedKeys()[0] || null;
+
+        // If client submitted a key (e.g. from guest mode / newly claimed)
+        if (cleanKey && (!assignedKeyName || cleanKey === assignedKeyName)) {
+            let keyObj = memoryKeys.get(cleanKey);
+            if (!keyObj) {
+                keyObj = await getKeyFromStorage(cleanKey);
+            }
+
+            // A saved key can have been superseded by an Admin assignment on
+            // another device. Ignore that stale submitted key and continue
+            // selecting the account's newly linked key below.
+            if (keyObj && !keyObj.revoked && !(keyObj.excludedEmails || []).some(value => String(value).toLowerCase() === cleanEmail)) {
+                if (keyObj.boundEmail && (!decoded.email_verified || keyObj.boundEmail !== cleanEmail)) return res.status(403).json({ error: 'Sign in with the email assigned to this key.' });
+                const isLifetime = !keyObj.expiresAt || keyObj.expiresAt === 0;
+                const isExpired = !isLifetime && keyObj.expiresAt <= now;
+
+                if (!isExpired) {
+                    const submittedMaxUsers = Math.max(1, parseInt(keyObj.maxUsers, 10) || 1);
+                    const submittedIsMulti = submittedMaxUsers > 1;
+                    // Check if this key was already bound to a DIFFERENT Google account
+                    const boundToOther = !submittedIsMulti && ((keyObj.googleUid && keyObj.googleUid !== cleanUid) ||
+                                         (keyObj.googleEmail && cleanEmail && keyObj.googleEmail.toLowerCase() !== cleanEmail));
+
+                    const submittedSlot = accountKeySlot(keyObj, cleanUid, ip, previousGuestUid, cleanEmail);
+                    if (!submittedSlot.allowed) keyObj = null;
+                    let normalizedUsedBy = keyObj ? (submittedSlot.usedBy || (Array.isArray(keyObj.usedBy) ? [...keyObj.usedBy] : [])) : [];
+                    if (keyObj && !keyObj.adminCreated && previousGuestUid && normalizedUsedBy.includes(previousGuestUid)) {
+                        normalizedUsedBy = [...new Set(normalizedUsedBy.map(id => id === previousGuestUid ? cleanUid : id))];
+                    }
+                    if (keyObj && !normalizedUsedBy.includes(cleanUid)) normalizedUsedBy.push(cleanUid);
+                    if (keyObj && !keyObj.ipCheck && normalizedUsedBy.length > submittedMaxUsers) keyObj = null;
+                    if (keyObj && submittedIsMulti && !keyObj.ipCheck && !hasAccountMember(keyObj, cleanUid, cleanEmail)) {
+                        const occupied = new Set([...normalizedUsedBy, ...getKeyAccountUsers(keyObj).map(m => m.uid)]);
+                        if (occupied.size > submittedMaxUsers) keyObj = null;
+                    }
+
+                    if (!boundToOther && keyObj) {
+                        // Converting a guest key to Google requires proof of the
+                        // anonymous Firebase identity that originally created it.
+                        if (!keyObj.googleUid && !keyObj.adminCreated && keyObj.userId && keyObj.userId !== cleanUid) {
+                            if (!previousGuestUid || previousGuestUid !== keyObj.userId) {
+                                keyObj = null;
+                            }
+                        }
+                    }
+
+                    if (!boundToOther && keyObj) {
+                        // If user already has another active key, pick the one with longer duration
+                        let shouldBindNewKey = true;
+                        if (targetKey && targetKey.key !== cleanKey) {
+                            const currentBestExp = (!targetKey.expiresAt || targetKey.expiresAt === 0) ? Infinity : targetKey.expiresAt;
+                            const newKeyExp = isLifetime ? Infinity : keyObj.expiresAt;
+                            if (currentBestExp >= newKeyExp) {
+                                shouldBindNewKey = false;
+                            }
+                        }
+
+                        if (shouldBindNewKey) {
+                            const updates = submittedIsMulti ? {
+                                accountUsers: [...getKeyAccountUsers(keyObj), ...(hasAccountMember(keyObj, cleanUid, cleanEmail) ? [] : [{ uid: cleanUid, email: cleanEmail, displayName: cleanName, photoURL: cleanPhoto, linkedAt: now }])],
+                                usedBy: normalizedUsedBy,
+                                usedUsers: normalizedUsedBy.length,
+                                ...(submittedSlot.usedIps ? { usedIps: submittedSlot.usedIps } : {}),
+                                authProvider: 'google', lastSeen: now
+                            } : {
+                                userId: cleanUid, googleUid: cleanUid, googleEmail: cleanEmail,
+                                displayName: cleanName, photoURL: cleanPhoto,
+                                usedBy: normalizedUsedBy, usedUsers: normalizedUsedBy.length,
+                                authProvider: 'google', linkedAt: now, lastSeen: now
+                            };
+                            if (cleanSessionId) updates.activeSessionId = cleanSessionId;
+
+                            await updateKeyInStorage(cleanKey, updates);
+                            targetKey = { ...keyObj, ...updates };
+                        }
+                    }
+                }
+            }
+        }
+
+        // If active key exists / was bound
+        if (targetKey) {
+            // One Google account owns one effective timer. Revoke every shorter
+            // linked key so generating another key cannot stack or duplicate time.
+            for (const oldKey of usableLinkedKeys()) {
+                if (oldKey.key && oldKey.key !== targetKey.key && (parseInt(oldKey.maxUsers, 10) || 1) <= 1) {
+                    await updateKeyInStorage(oldKey.key, {
+                        revoked: true,
+                        revokedAt: now,
+                        supersededBy: targetKey.key,
+                        supersededReason: 'longer_google_key_selected'
+                    });
+                }
+            }
+            const sessionUpdates = { lastSeen: now };
+            const selectedSlot = accountKeySlot(targetKey, cleanUid, ip, previousGuestUid, cleanEmail);
+            if (selectedSlot.usedBy) {
+                sessionUpdates.usedBy = selectedSlot.usedBy;
+                sessionUpdates.usedUsers = selectedSlot.usedBy.length;
+            }
+            if (selectedSlot.usedIps) sessionUpdates.usedIps = selectedSlot.usedIps;
+            if (cleanSessionId) sessionUpdates.activeSessionId = cleanSessionId;
+            if (!targetKey.googleEmail && cleanEmail) sessionUpdates.googleEmail = cleanEmail;
+            if (!targetKey.displayName && cleanName) sessionUpdates.displayName = cleanName;
+            if (!targetKey.googleUid && (parseInt(targetKey.maxUsers, 10) || 1) <= 1) sessionUpdates.googleUid = cleanUid;
+            sessionUpdates.authProvider = 'google';
+
+            await updateKeyInStorage(targetKey.key, sessionUpdates);
+
+            if (rtdb) {
+                try {
+                    await rtdb.ref(`users/${cleanUid}`).update({
+                        uid: cleanUid,
+                        email: cleanEmail,
+                        displayName: cleanName,
+                        photoURL: cleanPhoto,
+                        activeKey: targetKey.key,
+                        expiresAt: targetKey.expiresAt || 0,
+                        lastSeen: now
+                    });
+                } catch (e) {}
+            }
+
+            markOnline(cleanUid, ip, targetKey.key, { email: cleanEmail, displayName: cleanName, uid: cleanUid });
+
+            return res.json({
+                success: true,
+                hasActiveKey: true,
+                key: targetKey.key,
+                expiresAt: targetKey.expiresAt || 0,
+                provider: targetKey.provider || null,
+                displayName: cleanName,
+                email: cleanEmail
+            });
+        }
+
+        if (rtdb) {
+            try {
+                await rtdb.ref(`users/${cleanUid}`).update({
+                    uid: cleanUid,
+                    email: cleanEmail,
+                    displayName: cleanName,
+                    photoURL: cleanPhoto,
+                    lastSeen: now
+                });
+            } catch (e) {}
+        }
+
+        markOnline(cleanUid, ip, null, { email: cleanEmail, displayName: cleanName, uid: cleanUid });
+
+        let expiredFound = false;
+        for (const k of memoryKeys.values()) {
+            if (isLinkedToGoogleAccount(k, cleanUid, cleanEmail, decoded.email_verified) && k.expiresAt > 0 && k.expiresAt <= now) {
+                expiredFound = true;
+                break;
+            }
+        }
+
+        return res.json({
+            success: true,
+            hasActiveKey: false,
+            reason: existingActiveKeys.length ? 'sharing_limit' : (expiredFound ? 'expired' : 'no_key'),
+            message: existingActiveKeys.length ? "The linked key has no available user slot. Get a fresh key to attach to this account." : (expiredFound ? "Your access key for this account has expired." : "No active key associated with this Google account."),
+            displayName: cleanName,
+            email: cleanEmail
+        });
+
+    } catch (err) {
+        console.error("Sync Google Key error:", err);
+        return res.status(500).json({ success: false, error: err.message });
+    }
 });
 
 // Health Check Endpoint (Render & Frontend Health Probe)
@@ -753,6 +1374,8 @@ app.get(['/', '/health', '/api/health'], (req, res) => {
     res.json({
         status: "ok",
         service: "buy-roblox-apikey-backend",
+        apiBuildVersion: API_BUILD_VERSION,
+        capabilities: { authHandoff: true, accountKeySync: true },
         timestamp: new Date().toISOString(),
         firebaseReady: !!db,
         activeKeys: memoryKeys.size
@@ -1693,6 +2316,10 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
 
     try {
         const cleanKey = key.trim().toUpperCase();
+        const verifiedUser = await verifyUserToken(req, false);
+        if ((req.body.authProvider === 'google' || req.body.googleEmail || req.body.googleUid) && !verifiedUser) {
+            return res.status(401).json({ valid: false, error: 'Google session could not be verified.' });
+        }
 
         // 1. Negative cache: if known invalid, reject immediately (0 Firestore reads)
         const invalidSince = memoryInvalidKeys.get(cleanKey);
@@ -1718,6 +2345,12 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
         if (keyData.revoked) {
             return res.status(403).json({ valid: false, error: "This key has been revoked." });
         }
+        if (verifiedUser?.email && (keyData.excludedEmails || []).some(value => String(value).toLowerCase() === String(verifiedUser.email).toLowerCase())) {
+            return res.status(403).json({ valid: false, error: 'This account has been moved to a different key.' });
+        }
+        if (keyData.boundEmail && (!verifiedUser?.email_verified || String(verifiedUser.email || '').toLowerCase() !== keyData.boundEmail)) {
+            return res.status(403).json({ valid: false, error: 'Sign in with the email assigned to this key.' });
+        }
 
         // Check expiry (expiresAt === 0 or null means lifetime key)
         const hasExpiry = keyData.expiresAt && keyData.expiresAt > 0;
@@ -1725,16 +2358,33 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
             return res.status(403).json({ valid: false, error: "Key is expired. Please get a new 12-hour key." });
         }
 
+        // Account keys follow the verified Google account on any device. Guest
+        // keys remain locked to the anonymous Firebase/device UID that created it.
+        const keyMaxUsers = Math.max(1, parseInt(keyData.maxUsers, 10) || 1);
+        const isMultiUserKey = keyMaxUsers > 1;
+        if (keyData.googleUid && !isMultiUserKey) {
+            if (!verifiedUser || verifiedUser.uid !== keyData.googleUid) {
+                return res.status(403).json({ valid: false, error: 'Sign in with the Google account linked to this key.' });
+            }
+        } else if (!isMultiUserKey && !keyData.adminCreated && keyData.userId && keyData.userId !== 'anonymous' && (!verifiedUser || verifiedUser.uid !== keyData.userId)) {
+            return res.status(403).json({ valid: false, error: 'This guest key is locked to the device that created it.' });
+        }
+
         // Multi-user / Share Limits Check (for Admin generated keys or shared keys)
         if (keyData.adminCreated) {
             let usedBy = Array.isArray(keyData.usedBy) ? [...keyData.usedBy] : [];
             const maxUsers = parseInt(keyData.maxUsers, 10) || 1;
             const reqIp = normalizeIp(getClientIp(req));
+            const reservedEmail = verifiedUser?.email_verified && verifiedUser.email ? `email:${String(verifiedUser.email).trim().toLowerCase()}` : '';
 
             if (keyData.ipCheck) {
                 // Sharing counted per unique IP -> people on the same home/wifi can share freely.
                 let usedIps = Array.isArray(keyData.usedIps) ? [...keyData.usedIps] : [];
-                if (usedIps.includes(reqIp)) {
+                if (reservedEmail && usedIps.includes(reservedEmail)) {
+                    usedIps = [...new Set(usedIps.map(value => value === reservedEmail ? reqIp : value))];
+                    if (!usedBy.includes(userId)) usedBy.push(userId);
+                    await updateKeyInStorage(cleanKey, { usedIps, usedBy, usedUsers: usedBy.length });
+                } else if (usedIps.includes(reqIp)) {
                     // same network -> allowed
                 } else if (usedIps.length >= maxUsers) {
                     return res.status(403).json({ valid: false, error: `This key has reached its sharing limit (Max ${maxUsers} networks).` });
@@ -1743,6 +2393,9 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
                     if (!usedBy.includes(userId)) usedBy.push(userId);
                     await updateKeyInStorage(cleanKey, { usedIps, usedBy, usedUsers: usedBy.length });
                 }
+            } else if (reservedEmail && usedBy.includes(reservedEmail)) {
+                usedBy = [...new Set(usedBy.map(value => value === reservedEmail ? userId : value))];
+                await updateKeyInStorage(cleanKey, { usedBy, usedUsers: usedBy.length });
             } else if (usedBy.includes(userId)) {
                 // User already recognized
             } else {
@@ -1766,6 +2419,23 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
         if (sessionId) {
             updates.activeSessionId = sessionId;
         }
+        if (verifiedUser && verifiedUser.email) {
+            if (isMultiUserKey) {
+                const members = getKeyAccountUsers(keyData);
+                if (!hasAccountMember(keyData, verifiedUser.uid, verifiedUser.email)) {
+                    members.push({ uid: verifiedUser.uid, email: String(verifiedUser.email).toLowerCase(), displayName: verifiedUser.name || '', linkedAt: Date.now() });
+                }
+                updates.accountUsers = members;
+                updates.authProvider = members.length ? 'google' : (keyData.authProvider || 'anonymous');
+            } else {
+                if (verifiedUser.email && !keyData.googleEmail) updates.googleEmail = String(verifiedUser.email).trim().toLowerCase();
+                if (verifiedUser.name && !keyData.displayName) updates.displayName = String(verifiedUser.name).trim();
+                if (!keyData.googleUid || keyData.googleUid === 'anonymous') updates.googleUid = verifiedUser.uid;
+                updates.userId = verifiedUser.uid;
+                updates.authProvider = 'google';
+            }
+        }
+
         await updateKeyInStorage(cleanKey, updates);
 
         const providerUsage = keyData.providerUsage || (keyData.provider ? { [keyData.provider]: keyData.createdAt || Date.now() } : {});
@@ -1773,6 +2443,7 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
         return res.json({ 
             valid: true, 
             expiresAt: keyData.expiresAt || 0,
+            maxUsers: keyMaxUsers,
             provider: keyData.provider || null,
             providerUsage,
             activeSessionId: sessionId || keyData.activeSessionId || null
@@ -1784,21 +2455,57 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
     }
 });
 
-// Endpoint to logout / disconnect an active key session
+// A read-only fallback for clients that cannot subscribe to their RTDB logout
+// marker (for example when browser RTDB rules reject the listener).
+app.get('/api/auth/logout-state', rateLimit('logoutState'), async (req, res) => {
+    try {
+        const verifiedUser = await verifyUserToken(req, true);
+        if (!rtdb) return res.status(503).json({ success: false, error: 'Account logout sync is unavailable.' });
+        const snap = await rtdb.ref(`users/${verifiedUser.uid}/logoutAt`).once('value');
+        return res.json({ success: true, logoutAt: Number(snap.val() || 0) });
+    } catch (e) {
+        const authError = /Firebase sign-in|valid Firebase sign-in/.test(e.message || '');
+        return res.status(authError ? 401 : 503).json({ success: false, error: e.message });
+    }
+});
+
+// Endpoint to logout / disconnect an active key session. The Firebase ID token
+// identifies an account. A guest Store with no Firebase login can disconnect
+// only its own unbound key, proved by the exact opaque session id.
 app.post('/api/logout-key', async (req, res) => {
     try {
-        const { key } = req.body || {};
-        if (key) {
-            const cleanKey = String(key).trim().toUpperCase();
-            let keyData = memoryKeys.get(cleanKey);
-            if (!keyData) keyData = await getKeyFromStorage(cleanKey);
-            if (keyData) {
-                await updateKeyInStorage(cleanKey, { activeSessionId: null, lastLoggedOut: Date.now() });
-            }
+        const { key, sessionId } = req.body || {};
+        const verifiedUser = await verifyUserToken(req, false);
+        const isAccount = !!verifiedUser && verifiedUser.firebase?.sign_in_provider !== 'anonymous';
+        if (isAccount && !rtdb) {
+            return res.status(503).json({ success: false, error: 'Account logout could not be synced. Please try again.' });
         }
-        return res.json({ success: true });
+        const logoutAt = Date.now();
+        let cleanKey = '';
+        let keyData = null;
+        if (key) {
+            cleanKey = String(key).trim().toUpperCase();
+            keyData = memoryKeys.get(cleanKey);
+            if (!keyData) keyData = await getKeyFromStorage(cleanKey);
+        }
+        const mayDisconnect = mayDisconnectKeySession(keyData, verifiedUser) ||
+            (!isAccount && mayDisconnectGuestSession(keyData, sessionId));
+        if (!isAccount && !mayDisconnect) {
+            return res.status(401).json({ success: false, error: 'A valid account or matching guest session is required to log out.' });
+        }
+        if (isAccount) {
+            // Persist the signal before claiming success. This invalidates the
+            // account on Key, Store and block.html without relying on same-origin
+            // localStorage or an untrusted client-supplied uid.
+            await rtdb.ref(`users/${verifiedUser.uid}`).update({ logoutAt, activeKey: null });
+        }
+        if (mayDisconnect) {
+            await updateKeyInStorage(cleanKey, { activeSessionId: null, lastLoggedOut: logoutAt });
+        }
+        return res.json({ success: true, logoutAt });
     } catch (e) {
-        return res.json({ success: false, error: e.message });
+        const authError = /Firebase sign-in|valid Firebase sign-in/.test(e.message || '');
+        return res.status(authError ? 401 : 503).json({ success: false, error: e.message });
     }
 });
 
@@ -2105,13 +2812,14 @@ app.post('/api/admin/login', rateLimit('admin'), (req, res) => {
 
 app.get('/api/admin/stats', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
-        if (memoryKeys.size === 0) {
+        const now = Date.now();
+        // Reload from database if cache is empty or stale (> 30s) or explicitly requested
+        if (memoryKeys.size === 0 || req.query.refresh === '1' || (now - keysLastLoaded) > 30000) {
             await loadKeysFromStorage(true);
         }
-        // Fast in-memory stats calculation (0 Firestore reads)
+        // Fast in-memory stats calculation
         const allKeys = Array.from(memoryKeys.values());
 
-        const now = Date.now();
         const totalKeys = allKeys.length;
         const activeKeys = allKeys.filter(k => !k.revoked && (!k.expiresAt || k.expiresAt === 0 || k.expiresAt > now)).length;
         const expiredKeys = allKeys.filter(k => !k.revoked && k.expiresAt > 0 && k.expiresAt <= now).length;
@@ -2131,9 +2839,22 @@ app.get('/api/admin/stats', verifyAdmin, rateLimit('admin'), async (req, res) =>
         const workinkCount = allKeys.filter(k => k.provider === 'workink' || k.workinkPostback).length;
         const adminCount = allKeys.filter(k => k.provider === 'admin' || k.adminCreated).length;
 
-        // Online (real): users seen within the last window
-        const onlineUserIds = getOnlineUserIds();
-        const onlineCount = onlineUserIds.length;
+        // Accurate online count from active visitors & sessions & RTDB presence
+        let sharedPresence = {};
+        if (rtdb) {
+            try {
+                const [browserSnap, serverSnap] = await Promise.all([rtdb.ref('presence').once('value'), rtdb.ref('serverPresence').once('value')]);
+                sharedPresence = { ...(browserSnap.val() || {}), ...(serverSnap.val() || {}) };
+            } catch (e) {}
+        }
+        const cutoff = now - ONLINE_WINDOW_MS;
+        const apiDevices = new Set();
+        for (const [nodeId, p] of presenceSessions.entries()) {
+            if (!nodeId.startsWith('api:') || !p || (p.lastSeen || 0) <= cutoff) continue;
+            apiDevices.add(String(p.visitorId || nodeId));
+        }
+        const apiPresenceCount = apiDevices.size;
+        const onlineCount = countDevices({ ...sharedPresence, ...Object.fromEntries(presenceSessions) }, now);
 
         // Banned: keys whose IP is currently banned (plus revoked)
         let bannedCount = 0;
@@ -2149,7 +2870,7 @@ app.get('/api/admin/stats', verifyAdmin, rateLimit('admin'), async (req, res) =>
         res.json({
             totalKeys, activeKeys, expiredKeys, uniqueUsers,
             linkvertiseCount, lootlabsCount, workinkCount, adminCount,
-            onlineCount, bannedCount, tierCounts
+            onlineCount, localOnlineCount: apiPresenceCount, sharedPresence: true, bannedCount, tierCounts
         });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -2173,18 +2894,35 @@ app.get('/api/admin/keys', verifyAdmin, rateLimit('admin'), async (req, res) => 
                 (k.note && k.note.toLowerCase().includes(search)) ||
                 (k.country && k.country.toLowerCase().includes(search)) ||
                 (k.tier && k.tier.toLowerCase().includes(search)) ||
+                (k.boundEmail && k.boundEmail.includes(search)) ||
+                getKeyAccountUsers(k).some(m => String(m.email || '').toLowerCase().includes(search)) ||
                 (k.ip && k.ip.toLowerCase().includes(search))
             );
         }
 
         const now = Date.now();
+        let sharedKeyPresence = {};
+        if (rtdb) {
+            try {
+                const [browserSnap, serverSnap] = await Promise.all([rtdb.ref('presence').once('value'), rtdb.ref('serverPresence').once('value')]);
+                sharedKeyPresence = { ...(browserSnap.val() || {}), ...(serverSnap.val() || {}) };
+            } catch (e) { console.warn('[Presence] Key status read unavailable:', e.message); }
+        }
         const enrichOne = (k) => {
             const provider = k.provider || (k.linkvertiseHash ? 'linkvertise' : (k.lootlabsPostback || k.lootlabsLocal ? 'lootlabs' : (k.workinkPostback ? 'workink' : (k.adminCreated ? 'admin' : 'unknown'))));
             const isLifetime = !k.expiresAt || k.expiresAt === 0;
             const expired = !isLifetime && k.expiresAt <= now;
-            const online = isUserOnline(k.userId) || (Array.isArray(k.usedBy) && k.usedBy.some(u => isUserOnline(u)));
             const ipBan = k.ip ? memoryBans.get(normalizeIp(k.ip)) : null;
             const ipBanned = !!(ipBan && ipBan.active && (!ipBan.banUntil || ipBan.banUntil > now));
+            const isOnlineKey = isKeyOnline(k.key) || 
+                isUserOnline(k.userId) || 
+                isUserOnline(k.googleUid) || 
+                isUserOnline(k.googleEmail) || 
+                isUserOnline(k.email) || 
+                isUserOnline(k.ip) || 
+                (Array.isArray(k.usedBy) && k.usedBy.some(u => isUserOnline(u)));
+            const online = !expired && !k.revoked && !ipBanned && isOnlineKey;
+            const onlineBreakdown = getKeyOnlineBreakdown(k.key, sharedKeyPresence);
             return {
                 key: k.key,
                 provider: provider,
@@ -2194,7 +2932,8 @@ app.get('/api/admin/keys', verifyAdmin, rateLimit('admin'), async (req, res) => 
                 expiresAt: k.expiresAt || 0,
                 revoked: k.revoked || false,
                 expired: expired,
-                online: online,
+                online: online || onlineBreakdown.onlineUsers > 0,
+                ...onlineBreakdown,
                 banned: (k.revoked || false) || ipBanned,
                 banUntil: ipBan ? (ipBan.banUntil || 0) : 0,
                 createdAt: k.createdAt || 0,
@@ -2204,7 +2943,14 @@ app.get('/api/admin/keys', verifyAdmin, rateLimit('admin'), async (req, res) => 
                 usedIps: k.usedIps || [],
                 ipCheck: !!k.ipCheck,
                 tier: k.tier || 'none',
-                note: k.note || ''
+                boundEmail: k.boundEmail || '',
+                subscriptionExpiresAt: k.subscriptionExpiresAt || 0,
+                note: k.note || '',
+                googleUser: k.authProvider === 'google' || !!k.googleEmail || !!k.userEmail,
+                email: k.googleEmail || k.userEmail || k.email || '',
+                displayName: k.displayName || k.name || '',
+                authProvider: k.authProvider || (k.googleEmail ? 'google' : 'anonymous'),
+                accountUsers: Array.isArray(k.accountUsers) ? k.accountUsers : []
             };
         };
 
@@ -2246,7 +2992,7 @@ app.get('/api/admin/keys', verifyAdmin, rateLimit('admin'), async (req, res) => 
                 enriched.sort(newest);
         }
 
-        res.json({ keys: enriched });
+        res.json({ keys: enriched, total: enriched.length });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -2277,7 +3023,14 @@ app.post('/api/admin/create-key', verifyAdmin, rateLimit('admin'), async (req, r
 
         const ip = getClientIp(req);
         const country = await getCountry(ip);
-        const cleanTier = ['basic', 'plus', 'vip'].includes(String(tier || '').toLowerCase()) ? String(tier).toLowerCase() : 'none';
+        const membershipConfig = await membership.config();
+        const cleanTier = String(tier || 'none').toLowerCase();
+        if (cleanTier !== 'none' && !membershipConfig.roles.some(r => r.id === cleanTier)) return res.status(400).json({ error: 'Choose an existing role.' });
+        const premium = cleanTier !== 'none' && cleanTier !== 'basic';
+        const boundEmail = premium && req.body.emailOptional !== true ? String(req.body.boundEmail || '').trim().toLowerCase() : '';
+        if (premium && req.body.emailOptional !== true && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(boundEmail)) return res.status(400).json({ error: 'Enter the assigned email or enable email optional.' });
+        const subscriptionDuration = Number(req.body.subscriptionDuration ?? durationNum);
+        if (premium && (!Number.isFinite(subscriptionDuration) || subscriptionDuration < 0)) return res.status(400).json({ error: 'Invalid subscription duration.' });
 
         const newKey = {
             key: keyString,
@@ -2293,6 +3046,8 @@ app.post('/api/admin/create-key', verifyAdmin, rateLimit('admin'), async (req, r
             usedIps: [],
             ipCheck: !!ipCheck,   // when true -> sharing counted per unique IP (same home/wifi allowed)
             tier: cleanTier,
+            boundEmail,
+            subscriptionExpiresAt: premium && subscriptionDuration > 0 ? now + subscriptionDuration : 0,
             note: note || '',
             ip: ip,
             country: country
@@ -2594,6 +3349,89 @@ app.get('/api/announcements/active', async (req, res) => {
 });
 
 // ============================================================
+// FEATURES & WHAT'S NEW NOTICE (KEY PAGE & ADMIN)
+// ============================================================
+
+// Public: Get current features update notice
+app.get('/api/features-notice', async (req, res) => {
+    try {
+        const notice = await loadFeaturesNoticeFromFirestore(false);
+        res.json(notice || DEFAULT_FEATURES_NOTICE);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Admin: Get features notice details
+app.get('/api/admin/features-notice', verifyAdmin, async (req, res) => {
+    try {
+        const notice = await loadFeaturesNoticeFromFirestore(false);
+        res.json({ success: true, notice: notice || DEFAULT_FEATURES_NOTICE });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Admin: Save / Publish features notice configuration
+app.post('/api/admin/features-notice', verifyAdmin, async (req, res) => {
+    try {
+        const { title, badge, subtitle, items, active } = req.body || {};
+        const current = await loadFeaturesNoticeFromFirestore(false);
+        const updated = {
+            ...current,
+            title: title !== undefined ? String(title).trim() : current.title,
+            badge: badge !== undefined ? String(badge).trim() : current.badge,
+            subtitle: subtitle !== undefined ? String(subtitle).trim() : current.subtitle,
+            items: Array.isArray(items) ? items : current.items,
+            active: active !== undefined ? !!active : current.active,
+            version: (parseInt(current.version, 10) || 0) + 1,
+            updatedAt: new Date().toISOString()
+        };
+        cachedFeaturesNotice = updated;
+        featuresNoticeLastLoaded = Date.now();
+
+        if (rtdb) {
+            try {
+                await rtdb.ref('featuresNotice').set(updated);
+            } catch (e) {
+                console.warn("RTDB save features notice warning:", e.message);
+            }
+        }
+        res.json({ success: true, notice: updated });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Admin: Start / Stop (Toggle Active) features notice
+app.post('/api/admin/features-notice/toggle', verifyAdmin, async (req, res) => {
+    try {
+        const current = await loadFeaturesNoticeFromFirestore(false);
+        const newActive = !current.active;
+        current.active = newActive;
+        current.updatedAt = new Date().toISOString();
+        if (newActive) {
+            current.version = (parseInt(current.version, 10) || 0) + 1;
+        }
+        cachedFeaturesNotice = current;
+        featuresNoticeLastLoaded = Date.now();
+
+        if (rtdb) {
+            try {
+                const rtdbUpdate = { active: newActive, updatedAt: current.updatedAt };
+                if (newActive) rtdbUpdate.version = current.version;
+                await rtdb.ref('featuresNotice').update(rtdbUpdate);
+            } catch (e) {
+                console.warn("RTDB toggle features notice warning:", e.message);
+            }
+        }
+        res.json({ success: true, active: newActive, notice: current });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ============================================================
 // SUPPORT: BUG REPORTS & FEATURE SUGGESTIONS
 // ============================================================
 function todayKey() {
@@ -2603,16 +3441,21 @@ function todayKey() {
 // Public: submit a bug report or feature suggestion (stored 100% in Firestore only)
 app.post('/api/support/submit', rateLimit('claim'), async (req, res) => {
     try {
-        const { userId, type, message, email } = req.body || {};
+        let { userId, type, message, email } = req.body || {};
+        const kind = (type === 'suggestion') ? 'suggestion' : 'bug';
+        const verifiedUser = await verifyUserToken(req, false);
+        const googleUser = verifiedUser && verifiedUser.email_verified && verifiedUser.email && verifiedUser.firebase?.sign_in_provider !== 'anonymous';
+        if (kind === 'suggestion' && !googleUser) return res.status(401).json({ success: false, error: 'Sign in with Google to send a suggestion.' });
+        userId = verifiedUser?.uid || ('guest_' + crypto.createHash('sha256').update(normalizeIp(getClientIp(req))).digest('hex'));
+        if (googleUser) email = verifiedUser.email;
         if (!userId || typeof userId !== 'string' || userId.length > 128 || !/^[a-zA-Z0-9_-]+$/.test(userId)) {
             return res.status(400).json({ success: false, error: 'Invalid userId.' });
         }
-        const kind = (type === 'suggestion') ? 'suggestion' : 'bug';
         const text = String(message || '').trim();
         if (text.length < 5 || text.length > 2000) {
             return res.status(400).json({ success: false, error: 'Message must be between 5 and 2000 characters.' });
         }
-        const emailClean = email ? String(email).trim().slice(0, 160) : '';
+        const emailClean = email ? String(email).trim().toLowerCase().slice(0, 160) : '';
         const day = todayKey();
         const norm = text.toLowerCase().replace(/\s+/g, ' ');
 
@@ -2625,6 +3468,8 @@ app.post('/api/support/submit', rateLimit('claim'), async (req, res) => {
             message: text,
             normalizedMessage: norm,
             email: emailClean,
+            googleUid: googleUser ? verifiedUser.uid : null,
+            authProvider: googleUser ? 'google' : 'anonymous',
             status: 'pending',
             unique: true,
             keyIssued: false,
@@ -2635,10 +3480,24 @@ app.post('/api/support/submit', rateLimit('claim'), async (req, res) => {
         };
 
         // 100% Firestore store for support reports/suggestions
-        if (db) {
-            await db.collection('supportRequests').doc(supportId).set(doc);
-        } else {
-            console.warn('[Support] Firestore not initialized, support request not persisted.');
+        if (!db) return res.status(503).json({ error: 'Support storage is unavailable. Please try again.' });
+        const quotaIdentity = googleUser ? String(verifiedUser.email).toLowerCase() : normalizeIp(getClientIp(req));
+        const accepted = await saveDailySubmission(db, quotaIdentity, doc);
+        if (!accepted) return res.status(429).json({ error: 'You can send one bug report or suggestion every 24 hours.' });
+        const legacyEmail = googleUser ? String(verifiedUser.email || '').trim() : '';
+        const ownSnaps = await Promise.all([
+            db.collection('supportRequests').where('userId', '==', userId).get(),
+            ...(googleUser ? [db.collection('supportRequests').where('email', '==', emailClean).get()] : []),
+            ...(googleUser && legacyEmail !== emailClean ? [db.collection('supportRequests').where('email', '==', legacyEmail).get()] : [])
+        ]);
+        const ownRecordsById = new Map();
+        ownSnaps.forEach((snap, index) => snap.forEach(item => { if (index === 0 || item.data().authProvider === 'google') ownRecordsById.set(item.id, { id: item.id, data: item.data() }); }));
+        const ownRecords = [...ownRecordsById.values()];
+        const oldIds = removableOldSubmissionIds(ownRecords, 5);
+        if (oldIds.length) {
+            const cleanup = db.batch();
+            oldIds.forEach(id => cleanup.delete(db.collection('supportRequests').doc(id)));
+            await cleanup.commit();
         }
 
         let note = '';
@@ -2662,17 +3521,21 @@ app.post('/api/support/submit', rateLimit('claim'), async (req, res) => {
 // Public: view my own submissions (direct from Firestore)
 app.get('/api/support/mine', async (req, res) => {
     try {
-        const userId = req.query.userId;
-        if (!userId || !/^[a-zA-Z0-9_-]+$/.test(userId)) return res.status(400).json({ success: false, error: 'Invalid userId' });
+        const verifiedUser = await verifyUserToken(req, false);
+        const userId = verifiedUser?.uid || ('guest_' + crypto.createHash('sha256').update(normalizeIp(getClientIp(req))).digest('hex'));
         
         if (!db) return res.json({ requests: [] });
-        const snap = await db.collection('supportRequests').where('userId', '==', userId).get();
-        const requests = [];
-        snap.forEach(docSnap => {
-            requests.push(docSnap.data());
-        });
-        requests.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-        res.json({ requests: requests.slice(0, 50) });
+        const googleEmail = verifiedUser?.email_verified && verifiedUser.email && verifiedUser.firebase?.sign_in_provider !== 'anonymous' ? verifiedUser.email.trim().toLowerCase() : '';
+        const legacyEmail = googleEmail ? verifiedUser.email.trim() : '';
+        const snaps = await Promise.all([
+            db.collection('supportRequests').where('userId', '==', userId).get(),
+            ...(googleEmail ? [db.collection('supportRequests').where('email', '==', googleEmail).get()] : []),
+            ...(legacyEmail !== googleEmail ? [db.collection('supportRequests').where('email', '==', legacyEmail).get()] : [])
+        ]);
+        const own = new Map();
+        snaps.forEach((snap, index) => snap.forEach(docSnap => { if (index === 0 || docSnap.data().authProvider === 'google') own.set(docSnap.id, docSnap.data()); }));
+        const requests = [...own.values()];
+        res.json({ requests: latestSubmissions(requests) });
     } catch (e) {
         res.status(500).json({ success: false, error: e.message });
     }
@@ -2687,7 +3550,7 @@ app.get('/api/admin/support', verifyAdmin, rateLimit('admin'), async (req, res) 
         snap.forEach(docSnap => {
             requests.push(docSnap.data());
         });
-        requests.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        requests.sort((a, b) => (Number(b.pinned) - Number(a.pinned)) || ((b.createdAt || 0) - (a.createdAt || 0)));
         res.json({ requests });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -2706,6 +3569,10 @@ app.post('/api/admin/support/:id/action', verifyAdmin, rateLimit('admin'), async
         if (!docSnap.exists) return res.status(404).json({ error: 'Request not found' });
         const data = docSnap.data();
 
+        if (data.status === 'approved' && action === 'approve') {
+            return res.json({ success: true, status: 'approved', key: data.rewardKey || data.issuedKey || null, expiresAt: data.issuedExpiresAt || 0, alreadyProcessed: true });
+        }
+
         if (action === 'reject') {
             const updates = { status: 'rejected', resolvedAt: Date.now() };
             await docRef.update(updates);
@@ -2713,13 +3580,33 @@ app.post('/api/admin/support/:id/action', verifyAdmin, rateLimit('admin'), async
         }
 
         if (action === 'approve') {
-            // Issue a free 24h key for this user
-            const keyString = [1,2,3].map(() => crypto.randomBytes(2).toString('hex').toUpperCase()).join('-');
             const now = Date.now();
-            const expiresAt = now + (24 * 60 * 60 * 1000);
+            const rewardMs = 24 * 60 * 60 * 1000;
+            let existing = null;
+            if (data.type === 'suggestion' && data.googleUid) {
+                for (const candidate of memoryKeys.values()) {
+                    const linked = candidate.googleUid === data.googleUid || (data.email && candidate.googleEmail && candidate.googleEmail.toLowerCase() === data.email.toLowerCase());
+                    const active = !candidate.revoked && (!candidate.expiresAt || candidate.expiresAt === 0 || candidate.expiresAt > now);
+                    if (linked && active && (!existing || (candidate.expiresAt || Infinity) > (existing.expiresAt || Infinity))) existing = candidate;
+                }
+            }
+            if (existing) {
+                const expiresAt = existing.expiresAt === 0 ? 0 : Math.max(now, existing.expiresAt) + rewardMs;
+                await updateKeyInStorage(existing.key, { expiresAt, lastRewardAt: now, lastRewardSupportId: supportId });
+                const updates = { status: 'approved', keyIssued: false, rewardType: 'extended', rewardKey: existing.key, issuedKey: existing.key, issuedExpiresAt: expiresAt, resolvedAt: now };
+                await docRef.update(updates);
+                return res.json({ success: true, status: 'approved', extended: true, key: existing.key, expiresAt });
+            }
+
+            // No active account key exists: create one already bound to the account.
+            const keyString = [1,2,3].map(() => crypto.randomBytes(2).toString('hex').toUpperCase()).join('-');
+            const expiresAt = now + rewardMs;
             const newKey = {
                 key: keyString,
-                userId: data.userId,
+                userId: data.googleUid || data.userId,
+                googleUid: data.googleUid || null,
+                googleEmail: data.email || '',
+                authProvider: data.googleUid ? 'google' : 'anonymous',
                 createdAt: now,
                 expiresAt,
                 revoked: false,
@@ -2745,6 +3632,43 @@ app.post('/api/admin/support/:id/action', verifyAdmin, rateLimit('admin'), async
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
+});
+
+app.post('/api/admin/support/:id/pin', verifyAdmin, rateLimit('admin'), async (req, res) => {
+    try {
+        if (!db) return res.status(503).json({ error: 'Firestore database not connected.' });
+        const refDoc = db.collection('supportRequests').doc(req.params.id);
+        const snap = await refDoc.get();
+        if (!snap.exists) return res.status(404).json({ error: 'Request not found' });
+        const pinned = req.body && typeof req.body.pinned === 'boolean' ? req.body.pinned : !snap.data().pinned;
+        await refDoc.update({ pinned, pinnedAt: pinned ? Date.now() : null });
+        res.json({ success: true, pinned });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/admin/support/:id', verifyAdmin, rateLimit('admin'), async (req, res) => {
+    try {
+        if (!db) return res.status(503).json({ error: 'Firestore database not connected.' });
+        await db.collection('supportRequests').doc(req.params.id).delete();
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/admin/support', verifyAdmin, rateLimit('admin'), async (req, res) => {
+    try {
+        if (!db) return res.status(503).json({ error: 'Firestore database not connected.' });
+        const snap = await db.collection('supportRequests').get();
+        let batch = db.batch();
+        let count = 0;
+        for (const docSnap of snap.docs) {
+            if (docSnap.data() && docSnap.data().pinned) continue;
+            batch.delete(docSnap.ref);
+            count++;
+            if (count % 400 === 0) { await batch.commit(); batch = db.batch(); }
+        }
+        if (count % 400 !== 0) await batch.commit();
+        res.json({ success: true, deleted: count });
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // Background Auto-Purge job: runs every 6 hours to clean expired keys > 2 days (48h) (RTDB + Firestore)
@@ -3054,7 +3978,41 @@ app.post('/api/admin/server-config', verifyAdmin, rateLimit('admin'), async (req
     }
 });
 
+const { installMembership } = require('./membership');
+const membership = installMembership({
+    app, db, verifyAdmin, verifyUserToken, getKeyFromStorage, updateKeyInStorage,
+    mutateKeyInStorage: async (name, change) => {
+        if (!rtdb) throw new Error('Persistent key storage is unavailable.');
+        const cleanKey = String(name || '').trim().toUpperCase();
+        const ref = rtdb.ref(`keys/${cleanKey}`);
+        let validationError = null;
+        const result = await ref.transaction(current => {
+            if (!current) {
+                validationError = Object.assign(new Error('Key not found.'), { status: 404 });
+                return;
+            }
+            try {
+                validationError = null;
+                return { ...current, ...change({ key: cleanKey, ...current }) };
+            } catch (e) {
+                validationError = e;
+                return;
+            }
+        }, undefined, false);
+        if (!result.committed) throw validationError || Object.assign(new Error('Key changed while assigning access. Please retry.'), { status: 409 });
+        const saved = { key: cleanKey, ...(result.snapshot.val() || {}) };
+        memoryKeys.set(cleanKey, saved);
+        return saved;
+    },
+    listKeysFromStorage: async () => {
+        if (!rtdb) throw new Error('Persistent key storage is unavailable.');
+        const snap = await rtdb.ref('keys').once('value');
+        const records = snap.val() || {};
+        return Object.entries(records).filter(([, data]) => data && typeof data === 'object').map(([key, data]) => ({ key: String(data.key || key).toUpperCase(), ...data }));
+    }
+});
+
 // Start Express API server
-app.listen(PORT, () => {
-    console.log(`🚀 ApiKey system running successfully on port ${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 ApiKey system running successfully on port ${PORT} (0.0.0.0)`);
 });
