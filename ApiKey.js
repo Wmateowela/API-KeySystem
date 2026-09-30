@@ -842,6 +842,46 @@ async function clearBan(ip) {
     }
 }
 
+// All keys that were created from a given IP (bans are stored per IP, so one
+// ban can silently affect several keys).
+function keysOnIp(ip) {
+    const clean = normalizeIp(ip);
+    if (!clean) return [];
+    return Array.from(memoryKeys.values()).filter(k => k.ip && normalizeIp(k.ip) === clean);
+}
+
+// Human readable ban reason + whether this looks like an automatic (system)
+// suspension instead of an explicit admin action.
+function describeKeyBan(k) {
+    if (k.banReason) return { reason: k.banReason, auto: false };
+    if (k.supersededReason) return { reason: 'Auto: replaced by a longer key for this Google account', auto: true };
+    return { reason: 'Auto ban (no ban record found)', auto: true };
+}
+
+// Active ban record for an IP as the Admin tooling sees it (no localhost
+// exemption, unlike isIpBanned which only guards player traffic).
+function activeIpBan(rawIp) {
+    const ip = normalizeIp(rawIp);
+    if (!ip) return null;
+    const ban = memoryBans.get(ip);
+    if (!ban || !ban.active) return null;
+    if (ban.banUntil && ban.banUntil > 0 && ban.banUntil <= Date.now()) return null;
+    return ban;
+}
+
+// Restore a suspended key: clears revoked + ban bookkeeping.
+async function restoreKey(key) {
+    await updateKeyInStorage(key, {
+        revoked: false,
+        revokedAt: null,
+        supersededBy: null,
+        supersededReason: null,
+        banReason: null,
+        bannedBy: null,
+        bannedAt: null
+    });
+}
+
 // ---------------- ONLINE TRACKING ----------------
 const ONLINE_WINDOW_MS = 60 * 1000; // heartbeat is every 25s; expire ghost sessions quickly
 function markOnline(userId, ip, key, googleInfo) {
@@ -2936,6 +2976,8 @@ app.get('/api/admin/keys', verifyAdmin, rateLimit('admin'), async (req, res) => 
                 ...onlineBreakdown,
                 banned: (k.revoked || false) || ipBanned,
                 banUntil: ipBan ? (ipBan.banUntil || 0) : 0,
+                banReason: (k.revoked || ipBanned) ? describeKeyBan(k).reason : '',
+                autoBan: (k.revoked || ipBanned) ? describeKeyBan(k).auto : false,
                 createdAt: k.createdAt || 0,
                 maxUsers: k.maxUsers || 1,
                 usedUsers: Array.isArray(k.usedBy) ? k.usedBy.length : (k.usedUsers || 0),
@@ -3066,7 +3108,7 @@ app.post('/api/admin/revoke-key/:key', verifyAdmin, rateLimit('admin'), async (r
         let data = await getKeyFromStorage(key);
         if (!data) return res.status(404).json({ error: 'Key not found' });
 
-        await updateKeyInStorage(key, { revoked: true, revokedAt: Date.now() });
+        await updateKeyInStorage(key, { revoked: true, revokedAt: Date.now(), banReason: 'Key revoked by admin', bannedBy: req.adminEmail || 'admin', bannedAt: Date.now() });
         res.json({ success: true });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -3080,7 +3122,16 @@ app.delete('/api/admin/delete-key/:key', verifyAdmin, rateLimit('admin'), async 
         if (!data) return res.status(404).json({ error: 'Key not found' });
 
         await deleteKeyFromStorage(key);
-        res.json({ success: true, key, source: 'rtdb+firestore+memory' });
+
+        // Manual delete also lifts the ban that belongs to this user's IP,
+        // otherwise the account (and everyone sharing that IP) stays blocked.
+        let unbannedIp = null;
+        const delIp = data.ip && data.ip !== '-' ? normalizeIp(data.ip) : '';
+        if (delIp && await isIpBanned(delIp)) {
+            await clearBan(delIp);
+            unbannedIp = delIp;
+        }
+        res.json({ success: true, key, unbannedIp, source: 'rtdb+firestore+memory' });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -3094,14 +3145,21 @@ app.post('/api/admin/ban-key/:key', verifyAdmin, rateLimit('admin'), async (req,
         let data = await getKeyFromStorage(key);
         if (!data) return res.status(404).json({ error: 'Key not found' });
 
+        const banReason = reason || 'Key banned by admin';
         // Revoke the key across RAM + RTDB + Firestore
-        await updateKeyInStorage(key, { revoked: true, revokedAt: Date.now() });
+        await updateKeyInStorage(key, {
+            revoked: true,
+            revokedAt: Date.now(),
+            banReason,
+            bannedBy: req.adminEmail || 'admin',
+            bannedAt: Date.now()
+        });
 
         // Ban the IP if available
         const banIp = data.ip && data.ip !== '-' ? data.ip : null;
         let ban = null;
         if (banIp) {
-            ban = await saveBan(banIp, parseInt(durationMs, 10) || 0, reason || 'Key banned by admin', req.adminEmail);
+            ban = await saveBan(banIp, parseInt(durationMs, 10) || 0, banReason, req.adminEmail);
         }
         res.json({ success: true, bannedIp: banIp, ban });
     } catch (e) {
@@ -3126,7 +3184,41 @@ app.post('/api/admin/unban-ip', verifyAdmin, rateLimit('admin'), async (req, res
         const { ip } = req.body || {};
         if (!ip) return res.status(400).json({ error: 'IP is required' });
         await clearBan(ip);
-        res.json({ success: true });
+
+        // The IP ban is only half of the block: keys banned together with it are
+        // also marked revoked, so restore those too (auto-superseded keys stay).
+        if (memoryKeys.size === 0) await loadKeysFromStorage(true);
+        let restored = 0;
+        for (const k of keysOnIp(ip)) {
+            if (k.revoked && !k.supersededReason) {
+                await restoreKey(k.key);
+                restored++;
+            }
+        }
+        res.json({ success: true, restored });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// UNBAN a single user/key: restore the key and lift the IP ban blocking it.
+app.post('/api/admin/unban-key/:key', verifyAdmin, rateLimit('admin'), async (req, res) => {
+    try {
+        const key = req.params.key.toUpperCase();
+        const data = await getKeyFromStorage(key);
+        if (!data) return res.status(404).json({ error: 'Key not found' });
+
+        await restoreKey(key);
+
+        // Banning is done per IP, so an IP ban would keep this user locked out
+        // even after the key itself is restored.
+        let unbannedIp = null;
+        const keyIp = data.ip && data.ip !== '-' ? normalizeIp(data.ip) : '';
+        if (keyIp && (activeIpBan(keyIp) || await isIpBanned(keyIp))) {
+            await clearBan(keyIp);
+            unbannedIp = keyIp;
+        }
+        res.json({ success: true, key, unbannedIp, restored: true });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -3135,12 +3227,46 @@ app.post('/api/admin/unban-ip', verifyAdmin, rateLimit('admin'), async (req, res
 app.get('/api/admin/bans', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
         const now = Date.now();
-        // Fast in-memory ban listing (0 Firestore reads)
-        let bans = Array.from(memoryBans.values());
-        bans = bans.filter(b => b.active && (!b.banUntil || b.banUntil > now));
-        bans.sort((a, b) => (b.bannedAt || 0) - (a.bannedAt || 0));
+        if (memoryKeys.size === 0) await loadKeysFromStorage(true);
 
-        res.json({ bans });
+        // Fast in-memory ban listing (0 Firestore reads)
+        const ipBans = Array.from(memoryBans.values())
+            .filter(b => b.active && (!b.banUntil || b.banUntil > now))
+            .map(b => {
+                const affected = keysOnIp(b.ip);
+                return {
+                    ...b,
+                    type: 'ip',
+                    keyCount: affected.length,
+                    keys: affected.slice(0, 12).map(k => k.key)
+                };
+            })
+            .sort((a, b) => (b.bannedAt || 0) - (a.bannedAt || 0));
+
+        // Suspended keys (auto-banned or revoked) have no ban record at all, so
+        // they never appeared in this tab and could not be undone from here.
+        const keyBans = [];
+        for (const k of memoryKeys.values()) {
+            if (!k.revoked) continue;
+            const kIp = k.ip && k.ip !== '-' ? normalizeIp(k.ip) : '';
+            const ipBan = kIp ? memoryBans.get(kIp) : null;
+            const ipBanned = !!(ipBan && ipBan.active && (!ipBan.banUntil || ipBan.banUntil > now));
+            const described = describeKeyBan(k);
+            keyBans.push({
+                type: 'key',
+                key: k.key,
+                ip: k.ip || '-',
+                reason: described.reason,
+                auto: described.auto,
+                bannedAt: k.bannedAt || k.revokedAt || k.createdAt || 0,
+                banUntil: ipBanned ? (ipBan.banUntil || 0) : 0,
+                ipBanned,
+                expired: !!(k.expiresAt && k.expiresAt > 0 && k.expiresAt <= now)
+            });
+        }
+        keyBans.sort((a, b) => (b.bannedAt || 0) - (a.bannedAt || 0));
+
+        res.json({ bans: [...ipBans, ...keyBans], ipBans, keyBans });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
