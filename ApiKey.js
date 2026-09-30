@@ -711,6 +711,7 @@ app.use((req, res, next) => {
 const rateLimitMap = new Map();
 const RATE_LIMITS = {
     claim:        { windowMs: 60 * 1000,     max: 5  }, // 5 claims per minute per IP
+    extend:       { windowMs: 60 * 1000,     max: 15 }, // allows short postback confirmation polling without weakening claim limits
     verify:       { windowMs: 60 * 1000,     max: 30 }, // 30 verifies per minute per IP
     logoutState:  { windowMs: 60 * 1000,     max: 90 }, // separate budget for background cross-domain logout checks
     admin:        { windowMs: 60 * 1000,     max: 60 }, // 60 admin calls per minute
@@ -2590,7 +2591,7 @@ app.get('/api/key-cooldowns', async (req, res) => {
 });
 
 // Endpoint to extend key access duration (+6h Linkvertise, +2h LootLabs, +12h Workink)
-app.post('/api/extend-key', rateLimit('claim'), async (req, res) => {
+app.post('/api/extend-key', rateLimit('extend'), async (req, res) => {
     const { key, userId, provider, hash, postbackValue } = req.body || {};
 
     if (!key || !userId || !provider) {
@@ -2694,13 +2695,25 @@ app.post('/api/extend-key', rateLimit('claim'), async (req, res) => {
                 } catch (e) {}
             }
             if (!pending) {
-                return res.status(404).json({ success: false, error: "LootLabs postback not confirmed yet. Please complete all tasks." });
+                return res.status(202).json({
+                    success: false,
+                    pending: true,
+                    retryable: true,
+                    retryAfter: 2,
+                    error: "LootLabs completion is still being confirmed."
+                });
             }
             if (pending.extendRedeemed) {
                 return res.status(403).json({ success: false, error: "This LootLabs completion has already been redeemed." });
             }
             if (!pending.redeemed) {
-                return res.status(400).json({ success: false, error: "LootLabs tasks have not been completed yet. Please finish the locker in LootLabs." });
+                return res.status(202).json({
+                    success: false,
+                    pending: true,
+                    retryable: true,
+                    retryAfter: 2,
+                    error: "LootLabs completion is still being confirmed."
+                });
             }
             pending.extendRedeemed = true;
             pending.redeemed = true;
@@ -2719,13 +2732,25 @@ app.post('/api/extend-key', rateLimit('claim'), async (req, res) => {
                 } catch (e) {}
             }
             if (!pending) {
-                return res.status(404).json({ success: false, error: "Work.ink postback not confirmed yet. Please complete all tasks." });
+                return res.status(202).json({
+                    success: false,
+                    pending: true,
+                    retryable: true,
+                    retryAfter: 2,
+                    error: "Work.ink completion is still being confirmed."
+                });
             }
             if (pending.extendRedeemed) {
                 return res.status(403).json({ success: false, error: "This Work.ink completion has already been redeemed." });
             }
             if (!pending.redeemed) {
-                return res.status(400).json({ success: false, error: "Work.ink tasks have not been completed yet. Please finish the locker in Work.ink." });
+                return res.status(202).json({
+                    success: false,
+                    pending: true,
+                    retryable: true,
+                    retryAfter: 2,
+                    error: "Work.ink completion is still being confirmed."
+                });
             }
             pending.extendRedeemed = true;
             pending.redeemed = true;
