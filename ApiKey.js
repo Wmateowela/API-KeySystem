@@ -20,6 +20,7 @@ const memoryLootlabsPending = new Map(); // postbackValue -> { userId, time, red
 const memoryWorkinkPending = new Map();  // postbackValue -> { userId, time, redeemed, ip, country }
 const memoryBans = new Map();           // ip -> { ip, reason, banUntil, bannedAt, active }
 const memoryAnnouncements = new Map();  // id -> announcementDoc
+const memorySupportRequests = new Map(); // id -> supportDoc
 const memoryInvalidKeys = new Map();     // key -> timestamp (negative cache to prevent 404 DB spam)
 const onlineUsers = new Map();          // userId -> lastSeen (ms)
 const presenceSessions = new Map();     // session/node id -> canonical live visitor record
@@ -30,6 +31,7 @@ const ANNOUNCEMENTS_CACHE_TTL = 10 * 60 * 1000; // 10 mins
 let keysLastLoaded = 0;
 let bansLastLoaded = 0;
 let usedHashesLastLoaded = 0;
+let supportRequestsLastLoaded = 0;
 const STARTUP_CACHE_TTL = 15 * 60 * 1000; // 15 min guard: skip full reload if recently loaded
 
 const FIREBASE_DATABASE_URL = process.env.FIREBASE_DATABASE_URL || 'https://buy-r-bl0x-default-rtdb.asia-southeast1.firebasedatabase.app/';
@@ -342,6 +344,56 @@ async function loadKeysFromStorage(force = false) {
     console.log(`✅ Loaded keys into memory: ${loadedRtdb} from RTDB, ${loadedFirestore} from Firestore. Total in memory: ${memoryKeys.size}`);
 }
 
+async function loadSupportFromStorage(force = false) {
+    const now = Date.now();
+    if (!force && supportRequestsLastLoaded && (now - supportRequestsLastLoaded) < STARTUP_CACHE_TTL && memorySupportRequests.size > 0) return;
+
+    let loadedRtdb = 0;
+    let loadedFirestore = 0;
+    let rtdbReadSucceeded = false;
+
+    if (force) memorySupportRequests.clear();
+
+    if (rtdb) {
+        try {
+            const snap = await rtdb.ref('supportRequests').once('value');
+            rtdbReadSucceeded = true;
+            const val = snap.val();
+            if (val && typeof val === 'object') {
+                Object.keys(val).forEach(id => {
+                    const data = val[id];
+                    if (data && (data.id || id)) {
+                        const supId = data.id || id;
+                        memorySupportRequests.set(supId, { id: supId, ...data });
+                        loadedRtdb++;
+                    }
+                });
+            }
+        } catch (e) {
+            console.warn("Could not load support requests from RTDB:", e.message);
+        }
+    }
+
+    if (db && !rtdbReadSucceeded && memorySupportRequests.size === 0) {
+        try {
+            const snap = await db.collection('supportRequests').limit(100).get();
+            snap.forEach(docSnap => {
+                const data = docSnap.data();
+                if (data && (data.id || docSnap.id)) {
+                    const supId = data.id || docSnap.id;
+                    memorySupportRequests.set(supId, { id: supId, ...data });
+                    loadedFirestore++;
+                }
+            });
+        } catch (e) {
+            console.warn("Could not load support requests from Firestore:", e.message);
+        }
+    }
+
+    supportRequestsLastLoaded = Date.now();
+    console.log(`✅ Loaded support requests into memory: ${loadedRtdb} from RTDB, ${loadedFirestore} from Firestore. Total in memory: ${memorySupportRequests.size}`);
+}
+
 function setupRTDBListeners() {
     if (!rtdb) return;
     try {
@@ -361,6 +413,27 @@ function setupRTDBListeners() {
             const data = snap.val();
             const keyName = (data && data.key) ? data.key.toUpperCase() : (snap.key || '').toUpperCase();
             if (keyName) memoryKeys.delete(keyName);
+        });
+
+        // Live sync for support requests (Zero Firestore read operations)
+        rtdb.ref('supportRequests').on('child_added', (snap) => {
+            const data = snap.val();
+            if (data && (data.id || snap.key)) {
+                const supId = data.id || snap.key;
+                memorySupportRequests.set(supId, { id: supId, ...data });
+            }
+        });
+        rtdb.ref('supportRequests').on('child_changed', (snap) => {
+            const data = snap.val();
+            if (data && (data.id || snap.key)) {
+                const supId = data.id || snap.key;
+                memorySupportRequests.set(supId, { id: supId, ...data });
+            }
+        });
+        rtdb.ref('supportRequests').on('child_removed', (snap) => {
+            if (snap.key) {
+                memorySupportRequests.delete(snap.key);
+            }
         });
 
         // Real-time synchronization of online presence from RTDB
@@ -655,6 +728,7 @@ try {
         loadBansFromFirestore();
         loadAnnouncementsFromFirestore(true);
         loadUsedHashesFromFirestore();
+        loadSupportFromStorage();
     } else {
         console.warn("❌ CREDENTIAL IS NULL. Please set FIREBASE_SERVICE_ACCOUNT env var or add serviceAccountKey.json.");
         console.log("⚡ Running with internal key management engine.");
@@ -2878,9 +2952,9 @@ app.post('/api/admin/login', rateLimit('admin'), (req, res) => {
 app.get('/api/admin/stats', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
         const now = Date.now();
-        // Reload from database if cache is empty or stale (> 30s) or explicitly requested
-        if (memoryKeys.size === 0 || req.query.refresh === '1' || (now - keysLastLoaded) > 30000) {
-            await loadKeysFromStorage(true);
+        // Reload from storage if cache is empty or explicitly requested by admin
+        if (memoryKeys.size === 0 || req.query.refresh === '1') {
+            await loadKeysFromStorage(req.query.refresh === '1');
         }
         // Fast in-memory stats calculation
         const allKeys = Array.from(memoryKeys.values());
@@ -3630,25 +3704,38 @@ app.post('/api/support/submit', rateLimit('claim'), async (req, res) => {
             dayKey: day
         };
 
-        // 100% Firestore store for support reports/suggestions
+        // 100% Zero-Read Firestore store for support reports/suggestions
         if (!db) return res.status(503).json({ error: 'Support storage is unavailable. Please try again.' });
         const quotaIdentity = googleUser ? String(verifiedUser.email).toLowerCase() : normalizeIp(getClientIp(req));
         const accepted = await saveDailySubmission(db, quotaIdentity, doc);
         if (!accepted) return res.status(429).json({ error: 'You can send one bug report or suggestion every 24 hours.' });
-        const legacyEmail = googleUser ? String(verifiedUser.email || '').trim() : '';
-        const ownSnaps = await Promise.all([
-            db.collection('supportRequests').where('userId', '==', userId).get(),
-            ...(googleUser ? [db.collection('supportRequests').where('email', '==', emailClean).get()] : []),
-            ...(googleUser && legacyEmail !== emailClean ? [db.collection('supportRequests').where('email', '==', legacyEmail).get()] : [])
-        ]);
-        const ownRecordsById = new Map();
-        ownSnaps.forEach((snap, index) => snap.forEach(item => { if (index === 0 || item.data().authProvider === 'google') ownRecordsById.set(item.id, { id: item.id, data: item.data() }); }));
-        const ownRecords = [...ownRecordsById.values()];
+
+        // Update in-memory cache and RTDB
+        memorySupportRequests.set(supportId, doc);
+        if (rtdb) {
+            rtdb.ref(`supportRequests/${supportId}`).set(doc).catch(err => {
+                console.warn('[RTDB] Failed to save support request:', err.message);
+            });
+        }
+
+        // Fast in-memory cleanup of old submissions (0 Firestore query reads)
+        const ownRecords = Array.from(memorySupportRequests.values()).filter(item => {
+            if (item.userId === userId) return true;
+            if (googleUser && item.authProvider === 'google' && item.email && item.email.toLowerCase() === emailClean) return true;
+            return false;
+        }).map(item => ({ id: item.id, data: item }));
+
         const oldIds = removableOldSubmissionIds(ownRecords, 5);
         if (oldIds.length) {
-            const cleanup = db.batch();
-            oldIds.forEach(id => cleanup.delete(db.collection('supportRequests').doc(id)));
-            await cleanup.commit();
+            oldIds.forEach(id => {
+                memorySupportRequests.delete(id);
+                if (rtdb) rtdb.ref(`supportRequests/${id}`).remove().catch(() => {});
+            });
+            if (db) {
+                const cleanup = db.batch();
+                oldIds.forEach(id => cleanup.delete(db.collection('supportRequests').doc(id)));
+                cleanup.commit().catch(() => {});
+            }
         }
 
         let note = '';
@@ -3669,38 +3756,31 @@ app.post('/api/support/submit', rateLimit('claim'), async (req, res) => {
     }
 });
 
-// Public: view my own submissions (direct from Firestore)
+// Public: view my own submissions (0 Firestore reads, instant RAM cache)
 app.get('/api/support/mine', async (req, res) => {
     try {
         const verifiedUser = await verifyUserToken(req, false);
         const userId = verifiedUser?.uid || ('guest_' + crypto.createHash('sha256').update(normalizeIp(getClientIp(req))).digest('hex'));
-        
-        if (!db) return res.json({ requests: [] });
         const googleEmail = verifiedUser?.email_verified && verifiedUser.email && verifiedUser.firebase?.sign_in_provider !== 'anonymous' ? verifiedUser.email.trim().toLowerCase() : '';
         const legacyEmail = googleEmail ? verifiedUser.email.trim() : '';
-        const snaps = await Promise.all([
-            db.collection('supportRequests').where('userId', '==', userId).get(),
-            ...(googleEmail ? [db.collection('supportRequests').where('email', '==', googleEmail).get()] : []),
-            ...(legacyEmail !== googleEmail ? [db.collection('supportRequests').where('email', '==', legacyEmail).get()] : [])
-        ]);
-        const own = new Map();
-        snaps.forEach((snap, index) => snap.forEach(docSnap => { if (index === 0 || docSnap.data().authProvider === 'google') own.set(docSnap.id, docSnap.data()); }));
-        const requests = [...own.values()];
+
+        // Query directly from in-memory cache: 0 Firestore reads!
+        const requests = Array.from(memorySupportRequests.values()).filter(r => {
+            if (r.userId === userId) return true;
+            if (googleEmail && r.authProvider === 'google' && r.email && (r.email.toLowerCase() === googleEmail || (legacyEmail && r.email === legacyEmail))) return true;
+            return false;
+        });
+
         res.json({ requests: latestSubmissions(requests) });
     } catch (e) {
         res.status(500).json({ success: false, error: e.message });
     }
 });
 
-// Admin: list all support requests (direct from Firestore)
+// Admin: list all support requests (0 Firestore reads, instant RAM cache)
 app.get('/api/admin/support', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
-        if (!db) return res.json({ requests: [] });
-        const snap = await db.collection('supportRequests').get();
-        const requests = [];
-        snap.forEach(docSnap => {
-            requests.push(docSnap.data());
-        });
+        const requests = Array.from(memorySupportRequests.values());
         requests.sort((a, b) => (Number(b.pinned) - Number(a.pinned)) || ((b.createdAt || 0) - (a.createdAt || 0)));
         res.json({ requests });
     } catch (e) {
@@ -3713,12 +3793,13 @@ app.post('/api/admin/support/:id/action', verifyAdmin, rateLimit('admin'), async
     try {
         const supportId = req.params.id;
         const { action } = req.body || {};
-        if (!db) return res.status(503).json({ error: 'Firestore database not connected.' });
-
-        const docRef = db.collection('supportRequests').doc(supportId);
-        const docSnap = await docRef.get();
-        if (!docSnap.exists) return res.status(404).json({ error: 'Request not found' });
-        const data = docSnap.data();
+        
+        let data = memorySupportRequests.get(supportId);
+        if (!data && db) {
+            const docSnap = await db.collection('supportRequests').doc(supportId).get();
+            if (docSnap.exists) data = docSnap.data();
+        }
+        if (!data) return res.status(404).json({ error: 'Request not found' });
 
         if (data.status === 'approved' && action === 'approve') {
             return res.json({ success: true, status: 'approved', key: data.rewardKey || data.issuedKey || null, expiresAt: data.issuedExpiresAt || 0, alreadyProcessed: true });
@@ -3726,7 +3807,9 @@ app.post('/api/admin/support/:id/action', verifyAdmin, rateLimit('admin'), async
 
         if (action === 'reject') {
             const updates = { status: 'rejected', resolvedAt: Date.now() };
-            await docRef.update(updates);
+            memorySupportRequests.set(supportId, { ...data, ...updates });
+            if (rtdb) rtdb.ref(`supportRequests/${supportId}`).update(updates).catch(() => {});
+            if (db) db.collection('supportRequests').doc(supportId).update(updates).catch(() => {});
             return res.json({ success: true, status: 'rejected' });
         }
 
@@ -3745,7 +3828,9 @@ app.post('/api/admin/support/:id/action', verifyAdmin, rateLimit('admin'), async
                 const expiresAt = existing.expiresAt === 0 ? 0 : Math.max(now, existing.expiresAt) + rewardMs;
                 await updateKeyInStorage(existing.key, { expiresAt, lastRewardAt: now, lastRewardSupportId: supportId });
                 const updates = { status: 'approved', keyIssued: false, rewardType: 'extended', rewardKey: existing.key, issuedKey: existing.key, issuedExpiresAt: expiresAt, resolvedAt: now };
-                await docRef.update(updates);
+                memorySupportRequests.set(supportId, { ...data, ...updates });
+                if (rtdb) rtdb.ref(`supportRequests/${supportId}`).update(updates).catch(() => {});
+                if (db) db.collection('supportRequests').doc(supportId).update(updates).catch(() => {});
                 return res.json({ success: true, status: 'approved', extended: true, key: existing.key, expiresAt });
             }
 
@@ -3775,7 +3860,9 @@ app.post('/api/admin/support/:id/action', verifyAdmin, rateLimit('admin'), async
             };
             await saveKeyToStorage(keyString, newKey);
             const updates = { status: 'approved', keyIssued: true, issuedKey: keyString, issuedExpiresAt: expiresAt, resolvedAt: now };
-            await docRef.update(updates);
+            memorySupportRequests.set(supportId, { ...data, ...updates });
+            if (rtdb) rtdb.ref(`supportRequests/${supportId}`).update(updates).catch(() => {});
+            if (db) db.collection('supportRequests').doc(supportId).update(updates).catch(() => {});
             return res.json({ success: true, status: 'approved', key: keyString, expiresAt });
         }
 
@@ -3787,38 +3874,52 @@ app.post('/api/admin/support/:id/action', verifyAdmin, rateLimit('admin'), async
 
 app.post('/api/admin/support/:id/pin', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
-        if (!db) return res.status(503).json({ error: 'Firestore database not connected.' });
-        const refDoc = db.collection('supportRequests').doc(req.params.id);
-        const snap = await refDoc.get();
-        if (!snap.exists) return res.status(404).json({ error: 'Request not found' });
-        const pinned = req.body && typeof req.body.pinned === 'boolean' ? req.body.pinned : !snap.data().pinned;
-        await refDoc.update({ pinned, pinnedAt: pinned ? Date.now() : null });
+        const supportId = req.params.id;
+        const current = memorySupportRequests.get(supportId);
+        const pinned = req.body && typeof req.body.pinned === 'boolean' ? req.body.pinned : (current ? !current.pinned : true);
+        const updates = { pinned, pinnedAt: pinned ? Date.now() : null };
+        if (current) {
+            memorySupportRequests.set(supportId, { ...current, ...updates });
+        }
+        if (rtdb) rtdb.ref(`supportRequests/${supportId}`).update(updates).catch(() => {});
+        if (db) db.collection('supportRequests').doc(supportId).update(updates).catch(() => {});
         res.json({ success: true, pinned });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.delete('/api/admin/support/:id', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
-        if (!db) return res.status(503).json({ error: 'Firestore database not connected.' });
-        await db.collection('supportRequests').doc(req.params.id).delete();
+        const supportId = req.params.id;
+        memorySupportRequests.delete(supportId);
+        if (rtdb) rtdb.ref(`supportRequests/${supportId}`).remove().catch(() => {});
+        if (db) db.collection('supportRequests').doc(supportId).delete().catch(() => {});
         res.json({ success: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.delete('/api/admin/support', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
-        if (!db) return res.status(503).json({ error: 'Firestore database not connected.' });
-        const snap = await db.collection('supportRequests').get();
-        let batch = db.batch();
-        let count = 0;
-        for (const docSnap of snap.docs) {
-            if (docSnap.data() && docSnap.data().pinned) continue;
-            batch.delete(docSnap.ref);
-            count++;
-            if (count % 400 === 0) { await batch.commit(); batch = db.batch(); }
+        const toDeleteIds = [];
+        for (const [id, reqDoc] of memorySupportRequests.entries()) {
+            if (!reqDoc.pinned) {
+                toDeleteIds.push(id);
+            }
         }
-        if (count % 400 !== 0) await batch.commit();
-        res.json({ success: true, deleted: count });
+        toDeleteIds.forEach(id => {
+            memorySupportRequests.delete(id);
+            if (rtdb) rtdb.ref(`supportRequests/${id}`).remove().catch(() => {});
+        });
+        if (db && toDeleteIds.length > 0) {
+            let batch = db.batch();
+            let count = 0;
+            for (const id of toDeleteIds) {
+                batch.delete(db.collection('supportRequests').doc(id));
+                count++;
+                if (count % 400 === 0) { await batch.commit(); batch = db.batch(); }
+            }
+            if (count % 400 !== 0) await batch.commit();
+        }
+        res.json({ success: true, deleted: toDeleteIds.length });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
