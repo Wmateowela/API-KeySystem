@@ -45,18 +45,74 @@ function validateConfig(input) {
 function installMembership({ app, db, verifyAdmin, verifyUserToken, getKeyFromStorage, updateKeyInStorage, listKeysFromStorage = async () => [], mutateKeyInStorage = async (name, change) => { const current = await getKeyFromStorage(name); if (!current) throw fail('Key not found.', 404); const patch = change(current); await updateKeyInStorage(name, patch, { strict: true }); return { ...current, ...patch }; } }) {
   const database = () => { if (!db) throw fail('Account storage is unavailable. Please try again.', 503); return db; };
   const configRef = () => database().collection('privateMembership').doc('config');
-  async function config() { const s = await configRef().get(); return s.exists ? { ...defaults, ...s.data() } : structuredClone(defaults); }
+  async function config() {
+    if (configCache && Date.now() - configLoadedAt < CONFIG_TTL_MS) return configCache;
+    const s = await configRef().get();
+    configCache = s.exists ? { ...defaults, ...s.data() } : structuredClone(defaults);
+    configLoadedAt = Date.now();
+    return configCache;
+  }
   const accountRef = email => database().collection('privateMembershipAccounts').doc(hash(emailOf(email)));
   async function assignedKeyForEmail(email) {
     if (!email) return '';
+    const norm = emailOf(email);
+    const cachedHit = assignedKeyCache.get(norm);
+    const hitNow = Date.now();
+    if (cachedHit && cachedHit.expiresAt > hitNow) return cachedHit.value;
     const snap = await accountRef(email).get();
-    return snap.exists ? String(snap.data().assignedKey || '').trim().toUpperCase() : '';
+    const value = snap.exists ? String(snap.data().assignedKey || '').trim().toUpperCase() : '';
+    if (assignedKeyCache.size >= ASSIGNED_KEY_CACHE_MAX) assignedKeyCache.delete(assignedKeyCache.keys().next().value);
+    assignedKeyCache.set(norm, { value, expiresAt: hitNow + ASSIGNED_KEY_TTL_MS });
+    return value;
   }
   const demoMinutesFor = (account, cfg) => {
     const override = Number(account?.demoMinutesOverride);
     return Number.isInteger(override) && override >= 1 && override <= 525600 ? override : cfg.demoMinutes;
   };
   const route = handler => async (req, res) => { try { await handler(req, res); } catch (e) { res.status(e.status || 500).json({ success: false, error: e.message }); } };
+
+  // ---------------------------------------------------------------
+  // Firestore quota guards. Every store page checks access on a ticker
+  // (plus on tab focus), so reading the config/account document — and worse,
+  // writing the account document — on each check emptied the Spark free
+  // quota within hours. Results are memoised per account and the account
+  // document is written only when something actually changed.
+  // ---------------------------------------------------------------
+  const CONFIG_TTL_MS = 10 * 60 * 1000;
+  const ACCESS_TTL_MS = 15 * 60 * 1000;
+  const LAST_SEEN_THROTTLE_MS = 60 * 60 * 1000;
+  const ACCESS_CACHE_MAX = 500;
+  // Every open Store tab re-checks its Google key on a 30s poll, and each of
+  // those calls used to read this account document straight from Firestore.
+  // That single read was most of the free-tier read burn. Admin changes always
+  // go through invalidateAccess()/invalidateConfig(), so the memo is dropped
+  // immediately when a key is assigned, replaced or removed; the TTL only
+  // covers edits made outside this backend (e.g. the Firebase console).
+  const ASSIGNED_KEY_TTL_MS = 2 * 60 * 1000;
+  const ASSIGNED_KEY_CACHE_MAX = 500;
+  let configCache = null;
+  let configLoadedAt = 0;
+  const accessCache = new Map();
+  const assignedKeyCache = new Map();
+
+  function invalidateConfig() {
+    configCache = null;
+    configLoadedAt = 0;
+    accessCache.clear();
+    assignedKeyCache.clear();
+  }
+  function invalidateAccess(email) {
+    if (!email) { accessCache.clear(); assignedKeyCache.clear(); return; }
+    assignedKeyCache.delete(emailOf(email));
+    const needle = `|${emailOf(email)}|`;
+    for (const key of [...accessCache.keys()]) {
+      if (key.includes(needle)) accessCache.delete(key);
+    }
+  }
+  function rememberAccess(cacheKey, value) {
+    if (accessCache.size >= ACCESS_CACHE_MAX) accessCache.delete(accessCache.keys().next().value);
+    accessCache.set(cacheKey, { value, expiresAt: Date.now() + ACCESS_TTL_MS });
+  }
   // Keys live in RTDB while account grants live in Firestore. There is no
   // cross-database transaction, so record the exact fields each key mutation
   // changed and compensate in reverse order if a later step fails. Never
@@ -99,26 +155,65 @@ function installMembership({ app, db, verifyAdmin, verifyUserToken, getKeyFromSt
     const user = await verifyUserToken(req, true).catch(() => { throw fail('Sign in again to continue.', 401); });
     return { user, email: user.email && user.email_verified && user.firebase?.sign_in_provider !== 'anonymous' ? emailOf(user.email) : '' };
   }
-  async function entitlement(req, start = false) {
+  // Reads the account document. The old code re-wrote it on every poll, which
+  // alone emptied the Spark free-tier write quota on a 100+ user site.
+  async function readAccount(user, email, now) {
+    const ref = accountRef(email);
+    const snap = await ref.get();
+    if (snap.exists) {
+      const account = snap.data();
+      const stale = now - Number(account.lastSeen || 0) >= LAST_SEEN_THROTTLE_MS;
+      const identityChanged = account.uid !== user.uid || account.name !== (user.name || '');
+      if (stale || identityChanged) {
+        account.uid = user.uid; account.name = user.name || ''; account.lastSeen = now;
+        ref.set({ uid: user.uid, name: user.name || '', lastSeen: now }, { merge: true }).catch(() => {});
+      }
+      return account;
+    }
+    const account = { email, role: 'basic', demoStartedAt: null, demoExpiresAt: null, subscriptionExpiresAt: 0, uid: user.uid, name: user.name || '', lastSeen: now };
+    ref.set(account, { merge: true }).catch(() => {});
+    return account;
+  }
+  // Only "start the demo" mutates the document, so it keeps the transaction.
+  async function startDemoAccount(user, email, cfg, now) {
+    const ref = accountRef(email);
+    const a = await database().runTransaction(async tx => {
+      const snap = await tx.get(ref);
+      const doc = snap.exists ? snap.data() : { email, role: 'basic', demoStartedAt: null, demoExpiresAt: null, subscriptionExpiresAt: 0 };
+      doc.uid = user.uid; doc.name = user.name || ''; doc.lastSeen = now;
+      const paidRole = cfg.roles.find(r => r.id === doc.role && !['basic', 'none'].includes(r.id));
+      const paid = paidRole && (!doc.subscriptionExpiresAt || doc.subscriptionExpiresAt > now);
+      if (!paid && cfg.demoEnabled && doc.demoEnabled !== false && doc.demoStartedAt == null) {
+        doc.demoStartedAt = now;
+        doc.demoExpiresAt = now + demoMinutesFor(doc, cfg) * 60000;
+      }
+      tx.set(ref, doc);
+      return doc;
+    });
+    invalidateAccess(email);
+    return a;
+  }
+  async function entitlement(req, start = false, bypassCache = false) {
     const { user, email } = await identity(req);
-    const cfg = await config();
     const now = Date.now();
-    let account = null;
-    if (email) {
-      const ref = accountRef(email);
-      account = await database().runTransaction(async tx => {
-        const snap = await tx.get(ref);
-        const a = snap.exists ? snap.data() : { email, role: 'basic', demoStartedAt: null, demoExpiresAt: null, subscriptionExpiresAt: 0 };
-        a.uid = user.uid; a.name = user.name || ''; a.lastSeen = now;
-        const paidRole = cfg.roles.find(r => r.id === a.role && !['basic', 'none'].includes(r.id));
-        const paid = paidRole && (!a.subscriptionExpiresAt || a.subscriptionExpiresAt > now);
-        if (start && !paid && cfg.demoEnabled && a.demoEnabled !== false && a.demoStartedAt == null) {
-          a.demoStartedAt = now;
-          a.demoExpiresAt = now + demoMinutesFor(a, cfg) * 60000;
-        }
-        tx.set(ref, a);
-        return a;
-      });
+    const keyName = String(req.body?.key || '').trim().toUpperCase();
+    const cacheKey = `${user.uid}|${email}|${keyName}`;
+    // Only the Firestore-backed part (config + account) is memoised. Key data
+    // still comes from the live RTDB/memory map on every call, so revoking a
+    // key takes effect immediately instead of waiting for the cache to age out.
+    let snapshot = null;
+    if (!start && !bypassCache) {
+      const hit = accessCache.get(cacheKey);
+      if (hit && hit.expiresAt > now) snapshot = hit.value;
+    }
+    let cfg, account = null;
+    if (snapshot) {
+      cfg = snapshot.cfg;
+      account = snapshot.account;
+    } else {
+      cfg = await config();
+      if (email) account = start ? await startDemoAccount(user, email, cfg, now) : await readAccount(user, email, now);
+      if (!start) rememberAccess(cacheKey, { cfg, account });
     }
     const assignedKey = account?.assignedKey ? await getKeyFromStorage(account.assignedKey) : null;
     const assignedExpiry = assignedKey ? effectiveKeyExpiry(assignedKey) : 0;
@@ -126,7 +221,6 @@ function installMembership({ app, db, verifyAdmin, verifyUserToken, getKeyFromSt
     let role = cfg.roles.find(r => r.id === account?.role && !['basic', 'none'].includes(r.id) && (!account.subscriptionExpiresAt || account.subscriptionExpiresAt > now) && validAssignedKey);
     let expiresAt = role ? (assignedExpiry && account.subscriptionExpiresAt ? Math.min(assignedExpiry, account.subscriptionExpiresAt) : assignedExpiry || account.subscriptionExpiresAt) : 0;
     let source = role ? 'subscription' : 'locked';
-    const keyName = String(req.body?.key || '').trim().toUpperCase();
     if (keyName) {
       const key = await getKeyFromStorage(keyName);
       const member = key && (!email || !(key.excludedEmails || []).some(value => emailOf(value) === email)) && (key.userId === user.uid || key.googleUid === user.uid || (key.usedBy || []).includes(user.uid) || (key.accountUsers || []).some(a => a.uid === user.uid));
@@ -156,12 +250,12 @@ function installMembership({ app, db, verifyAdmin, verifyUserToken, getKeyFromSt
     res.json(access);
   }));
   app.post('/api/membership/cycle', route(async (req, res) => {
-    const access = await entitlement(req, false);
+    const access = await entitlement(req, false, true);
     if (!access.allowed) throw fail('Auto Gift is locked. Upgrade to unlock.', 403);
     res.json(access);
   }));
   app.get('/api/admin/membership/config', verifyAdmin, route(async (req, res) => res.json(await config())));
-  app.put('/api/admin/membership/config', verifyAdmin, route(async (req, res) => { const value = validateConfig(req.body); await configRef().set(value); res.json(value); }));
+  app.put('/api/admin/membership/config', verifyAdmin, route(async (req, res) => { const value = validateConfig(req.body); await configRef().set(value); invalidateConfig(); res.json(value); }));
   app.get('/api/admin/membership/account', verifyAdmin, route(async (req, res) => {
     const email = emailOf(req.query.email);
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw fail('Enter a valid email.');
@@ -190,12 +284,13 @@ function installMembership({ app, db, verifyAdmin, verifyUserToken, getKeyFromSt
     } catch (e) {
       try {
         const check = await accountRef(email).get();
-        if (check.exists && check.data().accessOperationId === updates.accessOperationId) return res.json({ success: true });
+        if (check.exists && check.data().accessOperationId === updates.accessOperationId) { invalidateAccess(email); return res.json({ success: true }); }
       } catch (_) {}
       const rollbackErrors = await journal.rollback();
       if (rollbackErrors.length) throw fail(`Account update failed and rollback needs review: ${rollbackErrors.join('; ')}. Original error: ${e.message}`, 503);
       throw e;
     }
+    invalidateAccess(email);
     res.json({ success: true });
   }));
   app.get('/api/admin/membership/accounts', verifyAdmin, route(async (req, res) => {
@@ -249,6 +344,7 @@ function installMembership({ app, db, verifyAdmin, verifyUserToken, getKeyFromSt
         try {
           const check = await accountRef(email).get();
           if (check.exists && check.data().accessOperationId === account.accessOperationId) {
+            invalidateAccess(email);
             res.json({ success: true, account: { ...oldAccount, ...account }, key: keyName, keyExpiresAt: expiry, replacedKeys: linkedOldKeys.map(item => item.key) });
             return;
           }
@@ -258,6 +354,7 @@ function installMembership({ app, db, verifyAdmin, verifyUserToken, getKeyFromSt
       if (rollbackErrors.length) throw fail(`Assignment failed and rollback needs review: ${rollbackErrors.join('; ')}. Original error: ${e.message}`, 503);
       throw e;
     }
+    invalidateAccess(email);
     res.json({ success: true, account: { ...oldAccount, ...account }, key: keyName, keyExpiresAt: expiry, replacedKeys: linkedOldKeys.map(item => item.key) });
   }));
   app.delete('/api/admin/membership/account', verifyAdmin, route(async (req, res) => {
@@ -277,12 +374,13 @@ function installMembership({ app, db, verifyAdmin, verifyUserToken, getKeyFromSt
     } catch (e) {
       try {
         const check = await ref.get();
-        if (check.exists && check.data().accessOperationId === removalOperationId) return res.json({ success: true, email, removedKey: linkedKey?.key || '' });
+        if (check.exists && check.data().accessOperationId === removalOperationId) { invalidateAccess(email); return res.json({ success: true, email, removedKey: linkedKey?.key || '' }); }
       } catch (_) {}
       const rollbackErrors = await journal.rollback();
       if (rollbackErrors.length) throw fail(`Removal failed and rollback needs review: ${rollbackErrors.join('; ')}. Original error: ${e.message}`, 503);
       throw e;
     }
+    invalidateAccess(email);
     res.json({ success: true, email, removedKey: linkedKey?.key || '' });
   }));
   app.post('/api/admin/membership/reset-demo', verifyAdmin, route(async (req, res) => {
@@ -293,6 +391,7 @@ function installMembership({ app, db, verifyAdmin, verifyUserToken, getKeyFromSt
     const cfg = await config();
     if (!cfg.demoEnabled) throw fail('Free demos are globally disabled. Enable "Allow free demo" in Plans & Demo and save before resetting an account.', 409);
     await accountRef(email).set({ email, demoEnabled: true, demoStartedAt: null, demoExpiresAt: null, demoMinutesOverride: minutes }, { merge: true });
+    invalidateAccess(email);
     res.json({ success: true, email, demoMinutes: minutes, demoStatus: 'available' });
   }));
   app.put('/api/admin/membership/key', verifyAdmin, route(async (req, res) => {
@@ -300,7 +399,9 @@ function installMembership({ app, db, verifyAdmin, verifyUserToken, getKeyFromSt
     if (!await getKeyFromStorage(key)) throw fail('Key not found.', 404);
     const expiry = Number(req.body.subscriptionExpiresAt);
     if (!Number.isFinite(expiry) || expiry < 0) throw fail('Invalid subscription expiry.');
-    await updateKeyInStorage(key, { subscriptionExpiresAt: expiry }); res.json({ success: true });
+    await updateKeyInStorage(key, { subscriptionExpiresAt: expiry });
+    accessCache.clear();
+    res.json({ success: true });
   }));
   return { config, entitlement, assignedKeyForEmail };
 }

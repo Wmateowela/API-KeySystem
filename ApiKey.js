@@ -20,7 +20,6 @@ const memoryLootlabsPending = new Map(); // postbackValue -> { userId, time, red
 const memoryWorkinkPending = new Map();  // postbackValue -> { userId, time, redeemed, ip, country }
 const memoryBans = new Map();           // ip -> { ip, reason, banUntil, bannedAt, active }
 const memoryAnnouncements = new Map();  // id -> announcementDoc
-const memorySupportRequests = new Map(); // id -> supportDoc
 const memoryInvalidKeys = new Map();     // key -> timestamp (negative cache to prevent 404 DB spam)
 const onlineUsers = new Map();          // userId -> lastSeen (ms)
 const presenceSessions = new Map();     // session/node id -> canonical live visitor record
@@ -29,9 +28,14 @@ const authHandoffs = new Map();         // one-time token -> verified Google/key
 let announcementsLastLoaded = 0;
 const ANNOUNCEMENTS_CACHE_TTL = 10 * 60 * 1000; // 10 mins
 let keysLastLoaded = 0;
+let keysFirestoreFallbackAt = 0;
+const KEYS_FIRESTORE_FALLBACK_TTL = 15 * 60 * 1000; // full Firestore key scans are expensive on the free tier
+// Keys are actively stored in RTDB. The old full-collection Firestore fallback
+// consumed roughly one read per historical key whenever RTDB was unavailable.
+// Keep it as an explicit disaster-recovery switch only, never a default path.
+const ENABLE_FIRESTORE_KEYS_FALLBACK = process.env.ENABLE_FIRESTORE_KEYS_FALLBACK === 'true';
 let bansLastLoaded = 0;
 let usedHashesLastLoaded = 0;
-let supportRequestsLastLoaded = 0;
 const STARTUP_CACHE_TTL = 15 * 60 * 1000; // 15 min guard: skip full reload if recently loaded
 
 const FIREBASE_DATABASE_URL = process.env.FIREBASE_DATABASE_URL || 'https://buy-r-bl0x-default-rtdb.asia-southeast1.firebasedatabase.app/';
@@ -78,6 +82,11 @@ const memorySettings = {
 const PROVIDER_KEYS = ['linkvertise', 'lootlabs', 'workink'];
 const MIN_PROVIDER_HOURS = 1;
 const MAX_PROVIDER_HOURS = 24 * 365; // 1 year cap
+
+// Resolves once the first settings/store-config hydration finishes. Request
+// handlers (e.g. /api/store-config) await it so a cold start can never answer
+// with the built-in defaults while RTDB still holds the published UI.
+let settingsLoadPromise = Promise.resolve();
 
 function getProviderDurationMs(provider) {
     const hours = (memorySettings.providerSettings[provider] && memorySettings.providerSettings[provider].duration) || memorySettings.providerDurations[provider];
@@ -296,35 +305,40 @@ async function loadKeysFromStorage(force = false) {
     let loadedRtdb = 0;
     let loadedFirestore = 0;
     let rtdbReadSucceeded = false;
-
-    // A forced refresh must be an exact snapshot. Keeping deleted entries in this
-    // map was the reason the Admin "Total Keys" card slowly became inaccurate.
-    if (force) memoryKeys.clear();
+    const snapshot = new Map();
 
     // 1. Load from Realtime Database
     if (rtdb) {
         try {
             const snap = await rtdb.ref('keys').once('value');
-            rtdbReadSucceeded = true;
             const val = snap.val();
             if (val && typeof val === 'object') {
                 Object.keys(val).forEach(k => {
                     const data = val[k];
                     if (data && (data.key || k)) {
                         const keyName = (data.key || k).toUpperCase();
-                        memoryKeys.set(keyName, { key: keyName, ...data });
+                        snapshot.set(keyName, { key: keyName, ...data });
                         loadedRtdb++;
                     }
                 });
             }
+            rtdbReadSucceeded = true;
         } catch (e) {
             console.warn("Could not load keys from RTDB:", e.message);
         }
     }
 
-    // 2. Firestore is legacy/fallback storage. Do not union it with RTDB: old
-    // Firestore documents would otherwise resurrect deleted keys in the totals.
-    if (db && !rtdbReadSucceeded) {
+    if (rtdbReadSucceeded) {
+        // A forced refresh must be an exact snapshot. Keeping deleted entries in
+        // this map was the reason the Admin "Total Keys" card slowly became
+        // inaccurate. The map is only rebuilt after RTDB actually answered, so a
+        // failed read can no longer wipe a good cache (and then re-scan
+        // Firestore for every admin refresh — that scan burned the free tier).
+        if (force) memoryKeys.clear();
+        for (const [keyName, data] of snapshot) memoryKeys.set(keyName, data);
+    } else if (ENABLE_FIRESTORE_KEYS_FALLBACK && db && (!memoryKeys.size || now - keysFirestoreFallbackAt >= KEYS_FIRESTORE_FALLBACK_TTL)) {
+        // 2. Firestore is legacy/fallback storage. Do not union it with RTDB: old
+        // Firestore documents would otherwise resurrect deleted keys in the totals.
         try {
             const snap = await db.collection('keys').get();
             snap.forEach(docSnap => {
@@ -335,63 +349,19 @@ async function loadKeysFromStorage(force = false) {
                     loadedFirestore++;
                 }
             });
+            keysFirestoreFallbackAt = Date.now();
         } catch (e) {
             console.warn("Could not load keys from Firestore:", e.message);
         }
+    } else {
+        console.warn("Could not load keys from RTDB: keeping the in-memory snapshot instead of re-scanning Firestore.");
     }
 
     keysLastLoaded = Date.now();
     console.log(`✅ Loaded keys into memory: ${loadedRtdb} from RTDB, ${loadedFirestore} from Firestore. Total in memory: ${memoryKeys.size}`);
-}
-
-async function loadSupportFromStorage(force = false) {
-    const now = Date.now();
-    if (!force && supportRequestsLastLoaded && (now - supportRequestsLastLoaded) < STARTUP_CACHE_TTL && memorySupportRequests.size > 0) return;
-
-    let loadedRtdb = 0;
-    let loadedFirestore = 0;
-    let rtdbReadSucceeded = false;
-
-    if (force) memorySupportRequests.clear();
-
-    if (rtdb) {
-        try {
-            const snap = await rtdb.ref('supportRequests').once('value');
-            rtdbReadSucceeded = true;
-            const val = snap.val();
-            if (val && typeof val === 'object') {
-                Object.keys(val).forEach(id => {
-                    const data = val[id];
-                    if (data && (data.id || id)) {
-                        const supId = data.id || id;
-                        memorySupportRequests.set(supId, { id: supId, ...data });
-                        loadedRtdb++;
-                    }
-                });
-            }
-        } catch (e) {
-            console.warn("Could not load support requests from RTDB:", e.message);
-        }
-    }
-
-    if (db && !rtdbReadSucceeded && memorySupportRequests.size === 0) {
-        try {
-            const snap = await db.collection('supportRequests').limit(100).get();
-            snap.forEach(docSnap => {
-                const data = docSnap.data();
-                if (data && (data.id || docSnap.id)) {
-                    const supId = data.id || docSnap.id;
-                    memorySupportRequests.set(supId, { id: supId, ...data });
-                    loadedFirestore++;
-                }
-            });
-        } catch (e) {
-            console.warn("Could not load support requests from Firestore:", e.message);
-        }
-    }
-
-    supportRequestsLastLoaded = Date.now();
-    console.log(`✅ Loaded support requests into memory: ${loadedRtdb} from RTDB, ${loadedFirestore} from Firestore. Total in memory: ${memorySupportRequests.size}`);
+    // Never leave a user auto-suspended just because a longer key replaced
+    // theirs. Runs after every (re)load, including backend cold starts.
+    await releaseSupersededKeys();
 }
 
 function setupRTDBListeners() {
@@ -413,27 +383,6 @@ function setupRTDBListeners() {
             const data = snap.val();
             const keyName = (data && data.key) ? data.key.toUpperCase() : (snap.key || '').toUpperCase();
             if (keyName) memoryKeys.delete(keyName);
-        });
-
-        // Live sync for support requests (Zero Firestore read operations)
-        rtdb.ref('supportRequests').on('child_added', (snap) => {
-            const data = snap.val();
-            if (data && (data.id || snap.key)) {
-                const supId = data.id || snap.key;
-                memorySupportRequests.set(supId, { id: supId, ...data });
-            }
-        });
-        rtdb.ref('supportRequests').on('child_changed', (snap) => {
-            const data = snap.val();
-            if (data && (data.id || snap.key)) {
-                const supId = data.id || snap.key;
-                memorySupportRequests.set(supId, { id: supId, ...data });
-            }
-        });
-        rtdb.ref('supportRequests').on('child_removed', (snap) => {
-            if (snap.key) {
-                memorySupportRequests.delete(snap.key);
-            }
         });
 
         // Real-time synchronization of online presence from RTDB
@@ -482,6 +431,22 @@ function setupRTDBListeners() {
                     }
                 });
             }
+        });
+
+        // Keep the served Store UI in lockstep with RTDB. The boot-time
+        // "once" read can fail silently on a cold start, which left the API
+        // answering with the built-in defaults until someone re-published.
+        // Only while RTDB is the active source, so a Firestore-saved catalog
+        // can never be clobbered by an older RTDB copy.
+        rtdb.ref('settings/storeConfig').on('value', (snap) => {
+            try {
+                if ((memorySettings.storeConfigStorageSource || 'rtdb') !== 'rtdb') return;
+                const val = snap.val();
+                if (!val || typeof val !== 'object' || Array.isArray(val)) return;
+                memorySettings.storeConfig = val;
+                const stamp = Number(val.updatedAt);
+                if (Number.isFinite(stamp) && stamp > 0) memorySettings.storeConfigUpdatedAt = stamp;
+            } catch (e) {}
         });
 
         console.log("✅ Realtime Database (RTDB) live sync & presence listeners active.");
@@ -724,11 +689,10 @@ try {
         // Start loading data
         loadKeysFromStorage();
         setupRTDBListeners();
-        loadSettingsFromStorage();
+        settingsLoadPromise = loadSettingsFromStorage();
         loadBansFromFirestore();
         loadAnnouncementsFromFirestore(true);
         loadUsedHashesFromFirestore();
-        loadSupportFromStorage();
     } else {
         console.warn("❌ CREDENTIAL IS NULL. Please set FIREBASE_SERVICE_ACCOUNT env var or add serviceAccountKey.json.");
         console.log("⚡ Running with internal key management engine.");
@@ -740,7 +704,7 @@ try {
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const API_BUILD_VERSION = '2026.09.29-assigned-key-sync-v16';
+const API_BUILD_VERSION = '2026.10.03-stability-mobile-v19';
 
 // Default Tokens
 const LINKVERTISE_TOKEN = process.env.LINKVERTISE_TOKEN || '05bea4d469e02f8573931ff654597345edb6092d8c418ffc588c91de1678325a';
@@ -925,12 +889,32 @@ function keysOnIp(ip) {
     return Array.from(memoryKeys.values()).filter(k => k.ip && normalizeIp(k.ip) === clean);
 }
 
+function isAutomaticLongerKeyReplacement(k) {
+    if (!k) return false;
+    if (k.supersededReason) return true;
+    const reason = String(k.banReason || k.reason || '').trim().toLowerCase();
+    const actor = String(k.bannedBy || '').trim().toLowerCase();
+    const automaticActor = !actor || actor === 'system' || actor === 'auto' || actor === 'automatic' || actor.startsWith('auto-');
+    const longerAccountKeyReason = reason.includes('longer') &&
+        reason.includes('key') &&
+        (reason.includes('google') || reason.includes('account') || reason.includes('duration') || reason.includes('expiration'));
+    return automaticActor && longerAccountKeyReason;
+}
+
 // Human readable ban reason + whether this looks like an automatic (system)
-// suspension instead of an explicit admin action.
+// suspension instead of an explicit admin action. A longer-key replacement is
+// bookkeeping, not a ban, including records written by older deployments.
 function describeKeyBan(k) {
+    if (isAutomaticLongerKeyReplacement(k)) return { reason: '', auto: false, superseded: true };
     if (k.banReason) return { reason: k.banReason, auto: false };
-    if (k.supersededReason) return { reason: 'Auto: replaced by a longer key for this Google account', auto: true };
     return { reason: 'Auto ban (no ban record found)', auto: true };
+}
+
+// A key that was only superseded by a longer key for the same account stays
+// usable. Only an explicit admin ban/revoke (or an IP ban) blocks a user.
+function isKeyBlocked(k) {
+    if (!k) return false;
+    return !!k.revoked && !isAutomaticLongerKeyReplacement(k);
 }
 
 // Active ban record for an IP as the Admin tooling sees it (no localhost
@@ -955,6 +939,34 @@ async function restoreKey(key) {
         bannedBy: null,
         bannedAt: null
     });
+}
+
+// Release every key that an older build auto-suspended simply because a longer
+// key replaced it for the same Google account. Superseding is bookkeeping, not
+// a ban, so those keys must become usable again without an admin action.
+// Admin bans/revokes have a banReason and are left untouched. Safe to call
+// repeatedly; only writes the fields that are actually stale.
+async function releaseSupersededKeys() {
+    let released = 0;
+    for (const k of Array.from(memoryKeys.values())) {
+        if (!isAutomaticLongerKeyReplacement(k)) continue;
+        const legacyReason = !k.supersededReason;
+        if (k.revoked || k.revokedAt || legacyReason) {
+            // Legacy builds saved the longer-duration replacement as a ban
+            // reason. Normalize it once while preserving replacement history.
+            await updateKeyInStorage(k.key, {
+                revoked: false,
+                revokedAt: null,
+                supersededReason: k.supersededReason || 'longer_google_key_selected',
+                banReason: legacyReason ? null : k.banReason,
+                bannedBy: legacyReason ? null : k.bannedBy,
+                bannedAt: legacyReason ? null : k.bannedAt
+            });
+            released++;
+        }
+    }
+    if (released > 0) console.log(`♻️ Released ${released} key(s) previously auto-suspended by a longer-key replacement.`);
+    return released;
 }
 
 // ---------------- ONLINE TRACKING ----------------
@@ -1393,18 +1405,24 @@ app.post('/api/sync-google-key', rateLimit('verify'), async (req, res) => {
 
         // If active key exists / was bound
         if (targetKey) {
-            // One Google account owns one effective timer. Revoke every shorter
-            // linked key so generating another key cannot stack or duplicate time.
+            // One Google account owns one effective timer. Retire every shorter
+            // linked key so generating another key cannot stack or duplicate
+            // time — but NEVER as a suspension: a superseded key is not a ban
+            // and must not block the user or show up as "Auto Ban".
             for (const oldKey of usableLinkedKeys()) {
                 if (oldKey.key && oldKey.key !== targetKey.key && (parseInt(oldKey.maxUsers, 10) || 1) <= 1) {
                     await updateKeyInStorage(oldKey.key, {
-                        revoked: true,
-                        revokedAt: now,
+                        revoked: false,
+                        revokedAt: null,
                         supersededBy: targetKey.key,
-                        supersededReason: 'longer_google_key_selected'
+                        supersededReason: 'longer_google_key_selected',
+                        supersededAt: now
                     });
                 }
             }
+            // Self-heal keys that were auto-suspended by an older build of this
+            // logic: replacing a shorter key must never lock anyone out.
+            await releaseSupersededKeys();
             const sessionUpdates = { lastSeen: now };
             const selectedSlot = accountKeySlot(targetKey, cleanUid, ip, previousGuestUid, cleanEmail);
             if (selectedSlot.usedBy) {
@@ -2457,7 +2475,7 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
         }
 
         // Check if revoked
-        if (keyData.revoked) {
+        if (isKeyBlocked(keyData)) {
             return res.status(403).json({ valid: false, error: "This key has been revoked." });
         }
         if (verifiedUser?.email && (keyData.excludedEmails || []).some(value => String(value).toLowerCase() === String(verifiedUser.email).toLowerCase())) {
@@ -2952,16 +2970,20 @@ app.post('/api/admin/login', rateLimit('admin'), (req, res) => {
 app.get('/api/admin/stats', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
         const now = Date.now();
-        // Reload from storage if cache is empty or explicitly requested by admin
-        if (memoryKeys.size === 0 || req.query.refresh === '1') {
-            await loadKeysFromStorage(req.query.refresh === '1');
+        // memoryKeys is kept in sync live by the RTDB child_added/changed/
+        // removed listeners, so the expensive part here is only rebuilding the
+        // snapshot. A full `keys` download every 30s (the dashboard polls this
+        // endpoint) was what pushed RTDB downloads into the hundreds of MB a
+        // month. The admin Refresh button still forces ?refresh=1.
+        if (memoryKeys.size === 0 || req.query.refresh === '1' || (now - keysLastLoaded) > STARTUP_CACHE_TTL) {
+            await loadKeysFromStorage(true);
         }
         // Fast in-memory stats calculation
         const allKeys = Array.from(memoryKeys.values());
 
         const totalKeys = allKeys.length;
-        const activeKeys = allKeys.filter(k => !k.revoked && (!k.expiresAt || k.expiresAt === 0 || k.expiresAt > now)).length;
-        const expiredKeys = allKeys.filter(k => !k.revoked && k.expiresAt > 0 && k.expiresAt <= now).length;
+        const activeKeys = allKeys.filter(k => !isKeyBlocked(k) && (!k.expiresAt || k.expiresAt === 0 || k.expiresAt > now)).length;
+        const expiredKeys = allKeys.filter(k => !isKeyBlocked(k) && k.expiresAt > 0 && k.expiresAt <= now).length;
         
         const uniqueUsersSet = new Set();
         allKeys.forEach(k => {
@@ -3000,7 +3022,7 @@ app.get('/api/admin/stats', verifyAdmin, rateLimit('admin'), async (req, res) =>
         allKeys.forEach(k => {
             const ban = k.ip ? memoryBans.get(normalizeIp(k.ip)) : null;
             const ipBanned = !!(ban && ban.active && (!ban.banUntil || ban.banUntil > now));
-            if (k.revoked || ipBanned) bannedCount++;
+            if (isKeyBlocked(k) || ipBanned) bannedCount++;
         });
 
         const tierCounts = { basic: 0, plus: 0, vip: 0 };
@@ -3060,8 +3082,9 @@ app.get('/api/admin/keys', verifyAdmin, rateLimit('admin'), async (req, res) => 
                 isUserOnline(k.email) || 
                 isUserOnline(k.ip) || 
                 (Array.isArray(k.usedBy) && k.usedBy.some(u => isUserOnline(u)));
-            const online = !expired && !k.revoked && !ipBanned && isOnlineKey;
+            const online = !expired && !isKeyBlocked(k) && !ipBanned && isOnlineKey;
             const onlineBreakdown = getKeyOnlineBreakdown(k.key, sharedKeyPresence);
+            const described = describeKeyBan(k);
             return {
                 key: k.key,
                 provider: provider,
@@ -3073,10 +3096,11 @@ app.get('/api/admin/keys', verifyAdmin, rateLimit('admin'), async (req, res) => 
                 expired: expired,
                 online: online || onlineBreakdown.onlineUsers > 0,
                 ...onlineBreakdown,
-                banned: (k.revoked || false) || ipBanned,
+                banned: isKeyBlocked(k) || ipBanned,
                 banUntil: ipBan ? (ipBan.banUntil || 0) : 0,
-                banReason: (k.revoked || ipBanned) ? describeKeyBan(k).reason : '',
-                autoBan: (k.revoked || ipBanned) ? describeKeyBan(k).auto : false,
+                banReason: (isKeyBlocked(k) || ipBanned) ? described.reason : '',
+                autoBan: (isKeyBlocked(k) || ipBanned) ? described.auto : false,
+                superseded: described.superseded === true,
                 createdAt: k.createdAt || 0,
                 maxUsers: k.maxUsers || 1,
                 usedUsers: Array.isArray(k.usedBy) ? k.usedBy.length : (k.usedUsers || 0),
@@ -3344,9 +3368,10 @@ app.get('/api/admin/bans', verifyAdmin, rateLimit('admin'), async (req, res) => 
 
         // Suspended keys (auto-banned or revoked) have no ban record at all, so
         // they never appeared in this tab and could not be undone from here.
+        // A superseded key (a longer key replaced it) is NOT a suspension.
         const keyBans = [];
         for (const k of memoryKeys.values()) {
-            if (!k.revoked) continue;
+            if (!isKeyBlocked(k)) continue;
             const kIp = k.ip && k.ip !== '-' ? normalizeIp(k.ip) : '';
             const ipBan = kIp ? memoryBans.get(kIp) : null;
             const ipBanned = !!(ipBan && ipBan.active && (!ipBan.banUntil || ipBan.banUntil > now));
@@ -3663,6 +3688,17 @@ function todayKey() {
     return new Date().toISOString().slice(0, 10);
 }
 
+// Firestore free tier: /api/support/mine is polled by every open tab and used
+// to cost 1–3 queries per call. Memoise the merged answer per identity for a
+// minute, and drop it as soon as a report is submitted or an admin touches one.
+const supportMineCache = new Map();
+const SUPPORT_MINE_TTL_MS = 5 * 60 * 1000;
+function invalidateSupportMine() { supportMineCache.clear(); }
+function rememberSupportMine(cacheKey, value) {
+    if (supportMineCache.size > 200) supportMineCache.clear();
+    supportMineCache.set(cacheKey, { value, expiresAt: Date.now() + SUPPORT_MINE_TTL_MS });
+}
+
 // Public: submit a bug report or feature suggestion (stored 100% in Firestore only)
 app.post('/api/support/submit', rateLimit('claim'), async (req, res) => {
     try {
@@ -3704,38 +3740,26 @@ app.post('/api/support/submit', rateLimit('claim'), async (req, res) => {
             dayKey: day
         };
 
-        // 100% Zero-Read Firestore store for support reports/suggestions
+        // 100% Firestore store for support reports/suggestions
         if (!db) return res.status(503).json({ error: 'Support storage is unavailable. Please try again.' });
         const quotaIdentity = googleUser ? String(verifiedUser.email).toLowerCase() : normalizeIp(getClientIp(req));
         const accepted = await saveDailySubmission(db, quotaIdentity, doc);
         if (!accepted) return res.status(429).json({ error: 'You can send one bug report or suggestion every 24 hours.' });
-
-        // Update in-memory cache and RTDB
-        memorySupportRequests.set(supportId, doc);
-        if (rtdb) {
-            rtdb.ref(`supportRequests/${supportId}`).set(doc).catch(err => {
-                console.warn('[RTDB] Failed to save support request:', err.message);
-            });
-        }
-
-        // Fast in-memory cleanup of old submissions (0 Firestore query reads)
-        const ownRecords = Array.from(memorySupportRequests.values()).filter(item => {
-            if (item.userId === userId) return true;
-            if (googleUser && item.authProvider === 'google' && item.email && item.email.toLowerCase() === emailClean) return true;
-            return false;
-        }).map(item => ({ id: item.id, data: item }));
-
+        invalidateSupportMine();
+        const legacyEmail = googleUser ? String(verifiedUser.email || '').trim() : '';
+        const ownSnaps = await Promise.all([
+            db.collection('supportRequests').where('userId', '==', userId).get(),
+            ...(googleUser ? [db.collection('supportRequests').where('email', '==', emailClean).get()] : []),
+            ...(googleUser && legacyEmail !== emailClean ? [db.collection('supportRequests').where('email', '==', legacyEmail).get()] : [])
+        ]);
+        const ownRecordsById = new Map();
+        ownSnaps.forEach((snap, index) => snap.forEach(item => { if (index === 0 || item.data().authProvider === 'google') ownRecordsById.set(item.id, { id: item.id, data: item.data() }); }));
+        const ownRecords = [...ownRecordsById.values()];
         const oldIds = removableOldSubmissionIds(ownRecords, 5);
         if (oldIds.length) {
-            oldIds.forEach(id => {
-                memorySupportRequests.delete(id);
-                if (rtdb) rtdb.ref(`supportRequests/${id}`).remove().catch(() => {});
-            });
-            if (db) {
-                const cleanup = db.batch();
-                oldIds.forEach(id => cleanup.delete(db.collection('supportRequests').doc(id)));
-                cleanup.commit().catch(() => {});
-            }
+            const cleanup = db.batch();
+            oldIds.forEach(id => cleanup.delete(db.collection('supportRequests').doc(id)));
+            await cleanup.commit();
         }
 
         let note = '';
@@ -3756,31 +3780,43 @@ app.post('/api/support/submit', rateLimit('claim'), async (req, res) => {
     }
 });
 
-// Public: view my own submissions (0 Firestore reads, instant RAM cache)
+// Public: view my own submissions (direct from Firestore)
 app.get('/api/support/mine', async (req, res) => {
     try {
         const verifiedUser = await verifyUserToken(req, false);
         const userId = verifiedUser?.uid || ('guest_' + crypto.createHash('sha256').update(normalizeIp(getClientIp(req))).digest('hex'));
+        
+        if (!db) return res.json({ requests: [] });
         const googleEmail = verifiedUser?.email_verified && verifiedUser.email && verifiedUser.firebase?.sign_in_provider !== 'anonymous' ? verifiedUser.email.trim().toLowerCase() : '';
         const legacyEmail = googleEmail ? verifiedUser.email.trim() : '';
-
-        // Query directly from in-memory cache: 0 Firestore reads!
-        const requests = Array.from(memorySupportRequests.values()).filter(r => {
-            if (r.userId === userId) return true;
-            if (googleEmail && r.authProvider === 'google' && r.email && (r.email.toLowerCase() === googleEmail || (legacyEmail && r.email === legacyEmail))) return true;
-            return false;
-        });
-
-        res.json({ requests: latestSubmissions(requests) });
+        const cacheKey = `${userId}|${googleEmail}|${legacyEmail}`;
+        const hit = supportMineCache.get(cacheKey);
+        if (hit && hit.expiresAt > Date.now()) return res.json(hit.value);
+        const snaps = await Promise.all([
+            db.collection('supportRequests').where('userId', '==', userId).get(),
+            ...(googleEmail ? [db.collection('supportRequests').where('email', '==', googleEmail).get()] : []),
+            ...(legacyEmail !== googleEmail ? [db.collection('supportRequests').where('email', '==', legacyEmail).get()] : [])
+        ]);
+        const own = new Map();
+        snaps.forEach((snap, index) => snap.forEach(docSnap => { if (index === 0 || docSnap.data().authProvider === 'google') own.set(docSnap.id, docSnap.data()); }));
+        const requests = [...own.values()];
+        const payload = { requests: latestSubmissions(requests) };
+        rememberSupportMine(cacheKey, payload);
+        res.json(payload);
     } catch (e) {
         res.status(500).json({ success: false, error: e.message });
     }
 });
 
-// Admin: list all support requests (0 Firestore reads, instant RAM cache)
+// Admin: list all support requests (direct from Firestore)
 app.get('/api/admin/support', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
-        const requests = Array.from(memorySupportRequests.values());
+        if (!db) return res.json({ requests: [] });
+        const snap = await db.collection('supportRequests').get();
+        const requests = [];
+        snap.forEach(docSnap => {
+            requests.push(docSnap.data());
+        });
         requests.sort((a, b) => (Number(b.pinned) - Number(a.pinned)) || ((b.createdAt || 0) - (a.createdAt || 0)));
         res.json({ requests });
     } catch (e) {
@@ -3793,13 +3829,13 @@ app.post('/api/admin/support/:id/action', verifyAdmin, rateLimit('admin'), async
     try {
         const supportId = req.params.id;
         const { action } = req.body || {};
-        
-        let data = memorySupportRequests.get(supportId);
-        if (!data && db) {
-            const docSnap = await db.collection('supportRequests').doc(supportId).get();
-            if (docSnap.exists) data = docSnap.data();
-        }
-        if (!data) return res.status(404).json({ error: 'Request not found' });
+        if (!db) return res.status(503).json({ error: 'Firestore database not connected.' });
+        invalidateSupportMine();
+
+        const docRef = db.collection('supportRequests').doc(supportId);
+        const docSnap = await docRef.get();
+        if (!docSnap.exists) return res.status(404).json({ error: 'Request not found' });
+        const data = docSnap.data();
 
         if (data.status === 'approved' && action === 'approve') {
             return res.json({ success: true, status: 'approved', key: data.rewardKey || data.issuedKey || null, expiresAt: data.issuedExpiresAt || 0, alreadyProcessed: true });
@@ -3807,9 +3843,7 @@ app.post('/api/admin/support/:id/action', verifyAdmin, rateLimit('admin'), async
 
         if (action === 'reject') {
             const updates = { status: 'rejected', resolvedAt: Date.now() };
-            memorySupportRequests.set(supportId, { ...data, ...updates });
-            if (rtdb) rtdb.ref(`supportRequests/${supportId}`).update(updates).catch(() => {});
-            if (db) db.collection('supportRequests').doc(supportId).update(updates).catch(() => {});
+            await docRef.update(updates);
             return res.json({ success: true, status: 'rejected' });
         }
 
@@ -3828,9 +3862,7 @@ app.post('/api/admin/support/:id/action', verifyAdmin, rateLimit('admin'), async
                 const expiresAt = existing.expiresAt === 0 ? 0 : Math.max(now, existing.expiresAt) + rewardMs;
                 await updateKeyInStorage(existing.key, { expiresAt, lastRewardAt: now, lastRewardSupportId: supportId });
                 const updates = { status: 'approved', keyIssued: false, rewardType: 'extended', rewardKey: existing.key, issuedKey: existing.key, issuedExpiresAt: expiresAt, resolvedAt: now };
-                memorySupportRequests.set(supportId, { ...data, ...updates });
-                if (rtdb) rtdb.ref(`supportRequests/${supportId}`).update(updates).catch(() => {});
-                if (db) db.collection('supportRequests').doc(supportId).update(updates).catch(() => {});
+                await docRef.update(updates);
                 return res.json({ success: true, status: 'approved', extended: true, key: existing.key, expiresAt });
             }
 
@@ -3860,9 +3892,7 @@ app.post('/api/admin/support/:id/action', verifyAdmin, rateLimit('admin'), async
             };
             await saveKeyToStorage(keyString, newKey);
             const updates = { status: 'approved', keyIssued: true, issuedKey: keyString, issuedExpiresAt: expiresAt, resolvedAt: now };
-            memorySupportRequests.set(supportId, { ...data, ...updates });
-            if (rtdb) rtdb.ref(`supportRequests/${supportId}`).update(updates).catch(() => {});
-            if (db) db.collection('supportRequests').doc(supportId).update(updates).catch(() => {});
+            await docRef.update(updates);
             return res.json({ success: true, status: 'approved', key: keyString, expiresAt });
         }
 
@@ -3874,52 +3904,41 @@ app.post('/api/admin/support/:id/action', verifyAdmin, rateLimit('admin'), async
 
 app.post('/api/admin/support/:id/pin', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
-        const supportId = req.params.id;
-        const current = memorySupportRequests.get(supportId);
-        const pinned = req.body && typeof req.body.pinned === 'boolean' ? req.body.pinned : (current ? !current.pinned : true);
-        const updates = { pinned, pinnedAt: pinned ? Date.now() : null };
-        if (current) {
-            memorySupportRequests.set(supportId, { ...current, ...updates });
-        }
-        if (rtdb) rtdb.ref(`supportRequests/${supportId}`).update(updates).catch(() => {});
-        if (db) db.collection('supportRequests').doc(supportId).update(updates).catch(() => {});
+        if (!db) return res.status(503).json({ error: 'Firestore database not connected.' });
+        const refDoc = db.collection('supportRequests').doc(req.params.id);
+        const snap = await refDoc.get();
+        if (!snap.exists) return res.status(404).json({ error: 'Request not found' });
+        const pinned = req.body && typeof req.body.pinned === 'boolean' ? req.body.pinned : !snap.data().pinned;
+        await refDoc.update({ pinned, pinnedAt: pinned ? Date.now() : null });
+        invalidateSupportMine();
         res.json({ success: true, pinned });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.delete('/api/admin/support/:id', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
-        const supportId = req.params.id;
-        memorySupportRequests.delete(supportId);
-        if (rtdb) rtdb.ref(`supportRequests/${supportId}`).remove().catch(() => {});
-        if (db) db.collection('supportRequests').doc(supportId).delete().catch(() => {});
+        if (!db) return res.status(503).json({ error: 'Firestore database not connected.' });
+        await db.collection('supportRequests').doc(req.params.id).delete();
+        invalidateSupportMine();
         res.json({ success: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.delete('/api/admin/support', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
-        const toDeleteIds = [];
-        for (const [id, reqDoc] of memorySupportRequests.entries()) {
-            if (!reqDoc.pinned) {
-                toDeleteIds.push(id);
-            }
+        if (!db) return res.status(503).json({ error: 'Firestore database not connected.' });
+        const snap = await db.collection('supportRequests').get();
+        let batch = db.batch();
+        let count = 0;
+        for (const docSnap of snap.docs) {
+            if (docSnap.data() && docSnap.data().pinned) continue;
+            batch.delete(docSnap.ref);
+            count++;
+            if (count % 400 === 0) { await batch.commit(); batch = db.batch(); }
         }
-        toDeleteIds.forEach(id => {
-            memorySupportRequests.delete(id);
-            if (rtdb) rtdb.ref(`supportRequests/${id}`).remove().catch(() => {});
-        });
-        if (db && toDeleteIds.length > 0) {
-            let batch = db.batch();
-            let count = 0;
-            for (const id of toDeleteIds) {
-                batch.delete(db.collection('supportRequests').doc(id));
-                count++;
-                if (count % 400 === 0) { await batch.commit(); batch = db.batch(); }
-            }
-            if (count % 400 !== 0) await batch.commit();
-        }
-        res.json({ success: true, deleted: toDeleteIds.length });
+        if (count % 400 !== 0) await batch.commit();
+        invalidateSupportMine();
+        res.json({ success: true, deleted: count });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -4030,6 +4049,13 @@ const DEFAULT_STORE_CONFIG = {
 // Public: Get current store catalog configuration with zero-bandwidth 304/notModified check
 app.get('/api/store-config', async (req, res) => {
     try {
+        // Never answer from a half-booted memory image: the published UI
+        // must be visible on the very first request after a cold start.
+        await settingsLoadPromise.catch(() => {});
+        // The version query string is stable, so forbid every cache layer
+        // (browser, CDN, Render's proxy) from replaying an older snapshot.
+        res.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+        res.set('Pragma', 'no-cache');
         const clientVersion = req.query.v ? parseInt(req.query.v, 10) : null;
         const currentUpdated = memorySettings.storeConfigUpdatedAt || Date.now();
         const activeSource = memorySettings.storeConfigStorageSource || 'rtdb';
@@ -4053,6 +4079,7 @@ app.get('/api/store-config', async (req, res) => {
         });
     } catch (e) {
         console.error('[Store Config GET Error]:', e.message);
+        res.set('Cache-Control', 'no-store');
         return res.json({ 
             success: true, 
             config: DEFAULT_STORE_CONFIG, 
