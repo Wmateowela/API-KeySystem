@@ -385,51 +385,65 @@ function setupRTDBListeners() {
             if (keyName) memoryKeys.delete(keyName);
         });
 
-        // Real-time synchronization of online presence from RTDB
-        rtdb.ref('presence').on('value', (snap) => {
-            const val = snap.val();
-            // Refresh only Firebase records. API heartbeat sessions live in the
-            // same map and must not be erased whenever RTDB changes.
-            for (const nodeId of presenceSessions.keys()) {
-                if (nodeId.startsWith('rtdb:')) presenceSessions.delete(nodeId);
-            }
-            if (val && typeof val === 'object') {
-                const now = Date.now();
-                const cutoff = now - ONLINE_WINDOW_MS;
-                Object.entries(val).forEach(([vid, p]) => {
-                    if (p && (p.lastSeen || 0) > cutoff) {
-                        const ts = p.lastSeen || now;
-                        presenceSessions.set(`rtdb:${vid}`, { ...p, visitorId: vid, lastSeen: ts });
-                        onlineUsers.set(vid, ts);
-                        if (p.uid) {
-                            onlineUsers.set(p.uid, ts);
-                            onlineUsers.set(`guid:${p.uid}`, ts);
-                        }
-                        if (p.key) {
-                            const cleanK = String(p.key).trim().toUpperCase();
-                            onlineUsers.set(`key:${cleanK}`, ts);
+        // Real-time synchronization of online presence from RTDB.
+        // Bandwidth guard: these used to be one root .on('value') listener that
+        // re-downloaded the ENTIRE presence node every time any single visitor
+        // heartbeated (every ~25s per user). Child listeners only download the
+        // one changed record, which cuts that traffic by hundreds of times.
+        const handlePresenceNode = (snap) => {
+            const vid = snap.key;
+            const p = snap.val();
+            if (!vid || !p || typeof p !== 'object') return;
+            const now = Date.now();
+            const cutoff = now - ONLINE_WINDOW_MS;
+            const nodeId = `rtdb:${vid}`;
+            if ((p.lastSeen || 0) > cutoff) {
+                const ts = p.lastSeen || now;
+                presenceSessions.set(nodeId, { ...p, visitorId: vid, lastSeen: ts });
+                onlineUsers.set(vid, ts);
+                if (p.uid) {
+                    onlineUsers.set(p.uid, ts);
+                    onlineUsers.set(`guid:${p.uid}`, ts);
+                }
+                if (p.key) {
+                    const cleanK = String(p.key).trim().toUpperCase();
+                    onlineUsers.set(`key:${cleanK}`, ts);
 
-                            const keyObj = memoryKeys.get(cleanK);
-                            if (keyObj && p.email && !keyObj.googleEmail) {
-                                keyObj.googleEmail = p.email;
-                                if (p.displayName) keyObj.displayName = p.displayName;
-                                keyObj.authProvider = 'google';
-                            }
-                        }
-                        if (p.email) {
-                            onlineUsers.set(`email:${String(p.email).toLowerCase()}`, ts);
-                        }
-                    } else if (p && (p.lastSeen || 0) <= cutoff) {
-                        onlineUsers.delete(vid);
-                        if (p.uid) {
-                            onlineUsers.delete(p.uid);
-                            onlineUsers.delete(`guid:${p.uid}`);
-                        }
-                        if (p.key) {
-                            onlineUsers.delete(`key:${String(p.key).trim().toUpperCase()}`);
-                        }
+                    const keyObj = memoryKeys.get(cleanK);
+                    if (keyObj && p.email && !keyObj.googleEmail) {
+                        keyObj.googleEmail = p.email;
+                        if (p.displayName) keyObj.displayName = p.displayName;
+                        keyObj.authProvider = 'google';
                     }
-                });
+                }
+                if (p.email) {
+                    onlineUsers.set(`email:${String(p.email).toLowerCase()}`, ts);
+                }
+            } else {
+                presenceSessions.delete(nodeId);
+                onlineUsers.delete(vid);
+                if (p.uid) {
+                    onlineUsers.delete(p.uid);
+                    onlineUsers.delete(`guid:${p.uid}`);
+                }
+                if (p.key) {
+                    onlineUsers.delete(`key:${String(p.key).trim().toUpperCase()}`);
+                }
+            }
+        };
+        rtdb.ref('presence').on('child_added', handlePresenceNode);
+        rtdb.ref('presence').on('child_changed', handlePresenceNode);
+        rtdb.ref('presence').on('child_removed', (snap) => {
+            const vid = snap.key;
+            const p = snap.val() || {};
+            presenceSessions.delete(`rtdb:${vid}`);
+            onlineUsers.delete(vid);
+            if (p.uid) {
+                onlineUsers.delete(p.uid);
+                onlineUsers.delete(`guid:${p.uid}`);
+            }
+            if (p.key) {
+                onlineUsers.delete(`key:${String(p.key).trim().toUpperCase()}`);
             }
         });
 
@@ -1423,20 +1437,28 @@ app.post('/api/sync-google-key', rateLimit('verify'), async (req, res) => {
             // Self-heal keys that were auto-suspended by an older build of this
             // logic: replacing a shorter key must never lock anyone out.
             await releaseSupersededKeys();
-            const sessionUpdates = { lastSeen: now };
+            const sessionUpdates = {};
+            // Bandwidth guard: only touch lastSeen when it is stale. Writing it
+            // every sync fires the RTDB listener on every open Store tab and
+            // re-downloads the whole key document each time.
+            if (!targetKey.lastSeen || now - Number(targetKey.lastSeen) > 10 * 60 * 1000) {
+                sessionUpdates.lastSeen = now;
+            }
             const selectedSlot = accountKeySlot(targetKey, cleanUid, ip, previousGuestUid, cleanEmail);
             if (selectedSlot.usedBy) {
                 sessionUpdates.usedBy = selectedSlot.usedBy;
                 sessionUpdates.usedUsers = selectedSlot.usedBy.length;
             }
             if (selectedSlot.usedIps) sessionUpdates.usedIps = selectedSlot.usedIps;
-            if (cleanSessionId) sessionUpdates.activeSessionId = cleanSessionId;
+            if (cleanSessionId && cleanSessionId !== targetKey.activeSessionId) sessionUpdates.activeSessionId = cleanSessionId;
             if (!targetKey.googleEmail && cleanEmail) sessionUpdates.googleEmail = cleanEmail;
             if (!targetKey.displayName && cleanName) sessionUpdates.displayName = cleanName;
             if (!targetKey.googleUid && (parseInt(targetKey.maxUsers, 10) || 1) <= 1) sessionUpdates.googleUid = cleanUid;
-            sessionUpdates.authProvider = 'google';
+            if (targetKey.authProvider !== 'google') sessionUpdates.authProvider = 'google';
 
-            await updateKeyInStorage(targetKey.key, sessionUpdates);
+            if (Object.keys(sessionUpdates).length) {
+                await updateKeyInStorage(targetKey.key, sessionUpdates);
+            }
 
             if (rtdb) {
                 try {
@@ -2547,9 +2569,14 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
         }
 
         // Session & Concurrency Tracking (Single active device / session per key)
+        // Bandwidth guard: only write when something actually changed — RTDB
+        // listeners re-download the whole key document on every write below it.
         const sessionId = req.body.sessionId ? String(req.body.sessionId).trim() : null;
-        const updates = { lastSeen: Date.now() };
-        if (sessionId) {
+        const updates = {};
+        if (!keyData.lastSeen || Date.now() - Number(keyData.lastSeen) > 10 * 60 * 1000) {
+            updates.lastSeen = Date.now();
+        }
+        if (sessionId && sessionId !== keyData.activeSessionId) {
             updates.activeSessionId = sessionId;
         }
         if (verifiedUser && verifiedUser.email) {
@@ -2569,7 +2596,9 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
             }
         }
 
-        await updateKeyInStorage(cleanKey, updates);
+        if (Object.keys(updates).length) {
+            await updateKeyInStorage(cleanKey, updates);
+        }
 
         const providerUsage = keyData.providerUsage || (keyData.provider ? { [keyData.provider]: keyData.createdAt || Date.now() } : {});
 
