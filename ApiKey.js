@@ -208,6 +208,157 @@ let firestoreAvailable = false;
 let rtdbAvailable = false;
 
 // ============================================================
+// PERSISTENT DAILY ACTIVITY TRACKER (12:00 AM - 12:00 AM)
+// Preserves daily key generation & Google login counts even when keys are deleted!
+// ============================================================
+const memoryDailyActivity = new Map();
+
+function getDailyDateKey(timestamp = Date.now()) {
+    const d = new Date(timestamp);
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+}
+
+function getDailyBounds(timestamp = Date.now()) {
+    const d = new Date(timestamp);
+    d.setHours(0, 0, 0, 0);
+    const startOfDay = d.getTime();
+    const endOfDay = startOfDay + (24 * 60 * 60 * 1000);
+    return { startOfDay, endOfDay };
+}
+
+async function getDailyActivityRecord(dateKey = getDailyDateKey()) {
+    let rec = memoryDailyActivity.get(dateKey);
+    if (!rec) {
+        if (rtdb) {
+            try {
+                const snap = await rtdb.ref(`daily_activity/${dateKey}`).once('value');
+                if (snap.exists()) {
+                    rec = snap.val();
+                }
+            } catch (e) {
+                console.warn('[DailyActivity] RTDB read error:', e.message);
+            }
+        }
+    }
+    if (!rec) {
+        const bounds = getDailyBounds();
+        rec = {
+            date: dateKey,
+            startOfDay: bounds.startOfDay,
+            endOfDay: bounds.endOfDay,
+            totalKeysGenerated: 0,
+            lootlabsCount: 0,
+            linkvertiseCount: 0,
+            workinkCount: 0,
+            adminCount: 0,
+            otherCount: 0,
+            keysLog: {},
+            googleLogins: {},
+            visitors: {},
+            lastUpdated: Date.now()
+        };
+    }
+    if (!rec.keysLog) rec.keysLog = {};
+    if (!rec.googleLogins) rec.googleLogins = {};
+    if (!rec.visitors) rec.visitors = {};
+    memoryDailyActivity.set(dateKey, rec);
+    return rec;
+}
+
+async function recordDailyKeyGeneration(key, keyData) {
+    try {
+        const cleanKey = String(key || '').toUpperCase();
+        if (!cleanKey) return;
+        const createdAt = keyData?.createdAt || Date.now();
+        const dateKey = getDailyDateKey(createdAt);
+        const rec = await getDailyActivityRecord(dateKey);
+
+        if (rec.keysLog && rec.keysLog[cleanKey]) {
+            return;
+        }
+
+        const provider = (keyData?.provider || (keyData?.adminCreated ? 'admin' : (keyData?.lootlabsPostback || keyData?.lootlabsLocal ? 'lootlabs' : (keyData?.linkvertiseHash ? 'linkvertise' : (keyData?.workinkPostback ? 'workink' : 'other'))))).toLowerCase();
+
+        rec.totalKeysGenerated = (rec.totalKeysGenerated || 0) + 1;
+        if (provider === 'lootlabs') rec.lootlabsCount = (rec.lootlabsCount || 0) + 1;
+        else if (provider === 'linkvertise') rec.linkvertiseCount = (rec.linkvertiseCount || 0) + 1;
+        else if (provider === 'workink') rec.workinkCount = (rec.workinkCount || 0) + 1;
+        else if (provider === 'admin') rec.adminCount = (rec.adminCount || 0) + 1;
+        else rec.otherCount = (rec.otherCount || 0) + 1;
+
+        rec.keysLog[cleanKey] = {
+            key: cleanKey,
+            provider,
+            tier: keyData?.tier || 'basic',
+            createdAt,
+            expiresAt: keyData?.expiresAt || 0,
+            googleEmail: keyData?.googleEmail || keyData?.boundEmail || '',
+            googleUid: keyData?.googleUid || '',
+            ip: keyData?.ip || ''
+        };
+        rec.lastUpdated = Date.now();
+        memoryDailyActivity.set(dateKey, rec);
+
+        if (rtdb) {
+            rtdb.ref(`daily_activity/${dateKey}`).update({
+                date: rec.date,
+                startOfDay: rec.startOfDay,
+                endOfDay: rec.endOfDay,
+                totalKeysGenerated: rec.totalKeysGenerated,
+                lootlabsCount: rec.lootlabsCount,
+                linkvertiseCount: rec.linkvertiseCount,
+                workinkCount: rec.workinkCount,
+                adminCount: rec.adminCount,
+                otherCount: rec.otherCount,
+                lastUpdated: rec.lastUpdated,
+                [`keysLog/${cleanKey}`]: rec.keysLog[cleanKey]
+            }).catch(e => console.warn('[DailyActivity] Key save error:', e.message));
+        }
+    } catch (err) {
+        console.warn('[DailyActivity] recordDailyKeyGeneration error:', err.message);
+    }
+}
+
+async function recordDailyGoogleLogin({ email, displayName, photoURL, googleUid, ip, keyUsed }) {
+    try {
+        if (!email && !googleUid) return;
+        const now = Date.now();
+        const dateKey = getDailyDateKey(now);
+        const rec = await getDailyActivityRecord(dateKey);
+
+        const cleanEmail = (email || '').toLowerCase().trim();
+        const cleanUid = (googleUid || '').trim();
+        const idKey = cleanUid || cleanEmail.replace(/[^a-zA-Z0-9]/g, '_');
+
+        const existing = rec.googleLogins[idKey] || {};
+        const entry = {
+            uid: cleanUid || existing.uid || '',
+            email: cleanEmail || existing.email || '',
+            displayName: displayName || existing.displayName || (cleanEmail ? cleanEmail.split('@')[0] : 'Google User'),
+            photoURL: photoURL || existing.photoURL || '',
+            firstSeen: existing.firstSeen || now,
+            lastSeen: now,
+            ip: ip || existing.ip || '',
+            keyUsed: keyUsed || existing.keyUsed || ''
+        };
+
+        rec.googleLogins[idKey] = entry;
+        rec.lastUpdated = now;
+        memoryDailyActivity.set(dateKey, rec);
+
+        if (rtdb) {
+            rtdb.ref(`daily_activity/${dateKey}/googleLogins/${idKey}`).set(entry)
+                .catch(e => console.warn('[DailyActivity] Google login save error:', e.message));
+        }
+    } catch (err) {
+        console.warn('[DailyActivity] recordDailyGoogleLogin error:', err.message);
+    }
+}
+
+// ============================================================
 // STORAGE HELPERS (RAM + RTDB + FIRESTORE DUAL-STORE)
 // ============================================================
 async function saveKeyToStorage(key, keyData) {
@@ -226,11 +377,24 @@ async function saveKeyToStorage(key, keyData) {
         }
     }
 
+    // 3. Record in Persistent Daily Activity
+    void recordDailyKeyGeneration(cleanKey, keyData);
 }
 
 async function updateKeyInStorage(key, updates, options = {}) {
     const cleanKey = (key || '').toUpperCase();
     if (!cleanKey) return;
+
+    if (updates.googleEmail || updates.googleUid) {
+        void recordDailyGoogleLogin({
+            email: updates.googleEmail,
+            googleUid: updates.googleUid,
+            displayName: updates.googleName,
+            photoURL: updates.googlePhoto,
+            ip: updates.ip,
+            keyUsed: cleanKey
+        });
+    }
 
     // Account-access changes must not report success when persistent key
     // storage was unavailable. Ordinary heartbeat/verification updates retain
@@ -3091,29 +3255,90 @@ app.get('/api/admin/stats', verifyAdmin, rateLimit('admin'), async (req, res) =>
         allKeys.forEach(k => { if (tierCounts[k.tier] !== undefined) tierCounts[k.tier]++; });
 
         // ---------------- 24-HOUR DAILY STATS (12:00 AM - 12:00 AM) ----------------
+        const dateKey = getDailyDateKey(now);
+        const dailyRec = await getDailyActivityRecord(dateKey);
+
         const midnightToday = new Date();
         midnightToday.setHours(0, 0, 0, 0);
         const dayStartMs = midnightToday.getTime();
         const nextMidnight = dayStartMs + (24 * 60 * 60 * 1000);
 
-        // Keys generated today (since 12:00 AM midnight)
-        const keysToday = allKeys.filter(k => (k.createdAt || 0) >= dayStartMs);
-        const totalKeysToday = keysToday.length;
-        const linkvertiseToday = keysToday.filter(k => k.provider === 'linkvertise' || k.linkvertiseHash).length;
-        const lootlabsToday = keysToday.filter(k => k.provider === 'lootlabs' || k.lootlabsPostback || k.lootlabsLocal).length;
-        const workinkToday = keysToday.filter(k => k.provider === 'workink' || k.workinkPostback).length;
-        const adminToday = keysToday.filter(k => k.provider === 'admin' || k.adminCreated).length;
+        // Sync any key currently in memoryKeys created today that might not be in keysLog
+        allKeys.forEach(k => {
+            if ((k.createdAt || 0) >= dayStartMs && (!dailyRec.keysLog || !dailyRec.keysLog[k.key])) {
+                void recordDailyKeyGeneration(k.key, k);
+            }
+        });
 
-        // Unique logins / active users today (since 12:00 AM midnight)
+        const totalKeysToday = Math.max(dailyRec.totalKeysGenerated || 0, Object.keys(dailyRec.keysLog || {}).length);
+        const lootlabsToday = dailyRec.lootlabsCount || 0;
+        const linkvertiseToday = dailyRec.linkvertiseCount || 0;
+        const workinkToday = dailyRec.workinkCount || 0;
+        const adminToday = dailyRec.adminCount || 0;
+
+        // Calculate active vs expired vs deleted among today's generated keys
+        let activeKeysToday = 0;
+        let expiredKeysToday = 0;
+        let deletedKeysToday = 0;
+
+        const loggedTodayKeys = Object.values(dailyRec.keysLog || {});
+        loggedTodayKeys.forEach(loggedKey => {
+            const current = memoryKeys.get(loggedKey.key);
+            if (!current) {
+                deletedKeysToday++;
+            } else if (isKeyBlocked(current)) {
+                expiredKeysToday++;
+            } else if (!current.expiresAt || current.expiresAt === 0 || current.expiresAt > now) {
+                activeKeysToday++;
+            } else {
+                expiredKeysToday++;
+            }
+        });
+
+        // Google accounts logged in today
+        const googleUsersMap = new Map();
+        if (dailyRec.googleLogins) {
+            Object.values(dailyRec.googleLogins).forEach(u => {
+                if (u && (u.email || u.uid)) {
+                    googleUsersMap.set((u.uid || u.email).toLowerCase(), u);
+                }
+            });
+        }
+        allKeys.forEach(k => {
+            if (k.googleEmail || k.googleUid) {
+                if ((k.lastSeen && k.lastSeen >= dayStartMs) || (k.createdAt && k.createdAt >= dayStartMs)) {
+                    const id = (k.googleUid || k.googleEmail).toLowerCase();
+                    if (!googleUsersMap.has(id)) {
+                        googleUsersMap.set(id, {
+                            uid: k.googleUid || '',
+                            email: k.googleEmail || '',
+                            displayName: k.googleName || (k.googleEmail ? k.googleEmail.split('@')[0] : 'Google User'),
+                            photoURL: k.googlePhoto || '',
+                            firstSeen: k.createdAt || dayStartMs,
+                            lastSeen: k.lastSeen || k.createdAt || now,
+                            ip: k.ip || '',
+                            keyUsed: k.key || ''
+                        });
+                    }
+                }
+            }
+        });
+
+        const googleUsers = Array.from(googleUsersMap.values()).sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
+        const googleLoginsCount = googleUsers.length;
+
+        // Unique logins / active users today (Google + visitors)
         const dailyLoginsSet = new Set();
-        // 1. Visitors/sessions who checked in today
         for (const [nodeId, p] of Object.entries({ ...sharedPresence, ...Object.fromEntries(presenceSessions) })) {
             if (p && (p.lastSeen || 0) >= dayStartMs) {
                 const identifier = p.email || p.googleUid || p.uid || p.visitorId || nodeId;
                 if (identifier) dailyLoginsSet.add(identifier);
             }
         }
-        // 2. Keys active or used today
+        googleUsers.forEach(u => {
+            if (u.email) dailyLoginsSet.add(u.email);
+            else if (u.uid) dailyLoginsSet.add(u.uid);
+        });
         allKeys.forEach(k => {
             if ((k.lastSeen && k.lastSeen >= dayStartMs) || (k.createdAt && k.createdAt >= dayStartMs)) {
                 if (k.googleEmail) dailyLoginsSet.add(k.googleEmail);
@@ -3121,17 +3346,24 @@ app.get('/api/admin/stats', verifyAdmin, rateLimit('admin'), async (req, res) =>
                 else if (k.userId) dailyLoginsSet.add(k.userId);
             }
         });
-        const loginsToday = dailyLoginsSet.size;
+        const loginsToday = Math.max(dailyLoginsSet.size, googleLoginsCount);
 
+        const anonymousLoginsToday = Math.max(0, loginsToday - googleLoginsCount);
         const dailyStats = {
+            date: dateKey,
             startOfDay: dayStartMs,
             endOfDay: nextMidnight,
             totalKeysToday,
+            activeKeysToday,
+            expiredKeysToday,
+            deletedKeysToday,
             linkvertiseToday,
             lootlabsToday,
             workinkToday,
             adminToday,
-            loginsToday
+            loginsToday,
+            googleLoginsCount,
+            anonymousLoginsToday
         };
 
         res.json({
