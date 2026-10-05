@@ -394,6 +394,31 @@ function installMembership({ app, db, verifyAdmin, verifyUserToken, getKeyFromSt
     invalidateAccess(email);
     res.json({ success: true, email, demoMinutes: minutes, demoStatus: 'available' });
   }));
+  app.post('/api/admin/membership/reset-basic-demos', verifyAdmin, route(async (req, res) => {
+    const cfg = await config();
+    if (!cfg.demoEnabled) throw fail('Free demos are globally disabled. Enable "Allow free demo" in Plans & Demo and save before resetting.', 409);
+    const coll = database().collection('privateMembershipAccounts');
+    const snap = coll.get ? await coll.get() : (coll.where ? await coll.where('role', '==', 'basic').get() : { docs: [] });
+    let count = 0;
+    const writePromises = [];
+    for (const doc of (snap?.docs || [])) {
+      const data = typeof doc.data === 'function' ? doc.data() : (doc.data || {});
+      const isBasic = !data.role || data.role === 'basic';
+      if (isBasic) {
+        count++;
+        const targetRef = doc.ref || accountRef(data.email);
+        writePromises.push(targetRef.set({
+          demoEnabled: true,
+          demoStartedAt: null,
+          demoExpiresAt: null,
+          demoMinutesOverride: null
+        }, { merge: true }));
+      }
+    }
+    await Promise.all(writePromises);
+    accessCache.clear();
+    res.json({ success: true, count, message: `Successfully reset demo timer for ${count} Basic user(s).` });
+  }));
   app.put('/api/admin/membership/key', verifyAdmin, route(async (req, res) => {
     const key = String(req.body.key || '').trim().toUpperCase();
     if (!await getKeyFromStorage(key)) throw fail('Key not found.', 404);

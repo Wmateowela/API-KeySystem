@@ -463,6 +463,21 @@ function setupRTDBListeners() {
             } catch (e) {}
         });
 
+        // Prune stale serverPresence from memory and RTDB every 15 minutes
+        setInterval(() => {
+            const now = Date.now();
+            const staleCutoff = now - (15 * 60 * 1000);
+            for (const [nodeId, p] of presenceSessions.entries()) {
+                if (!p || (p.lastSeen || 0) < staleCutoff) {
+                    presenceSessions.delete(nodeId);
+                    if (nodeId.startsWith('api:')) {
+                        const sessionKey = nodeId.slice(4);
+                        rtdb.ref('serverPresence/' + crypto.createHash('sha256').update(sessionKey).digest('hex')).remove().catch(() => {});
+                    }
+                }
+            }
+        }, 15 * 60 * 1000);
+
         console.log("✅ Realtime Database (RTDB) live sync & presence listeners active.");
     } catch (e) {
         console.warn("RTDB listener setup warning:", e.message);
@@ -2996,6 +3011,30 @@ app.post('/api/admin/login', rateLimit('admin'), (req, res) => {
     }
 });
 
+// Presence cache: both /api/admin/stats and /api/admin/keys hit this,
+// so 4 full presence-node reads per dashboard poll collapse to at most 1.
+let presenceCache = { at: 0, value: null };
+const PRESENCE_CACHE_TTL_MS = 15000;
+
+async function getSharedPresence() {
+    const now = Date.now();
+    if (presenceCache.value && (now - presenceCache.at) < PRESENCE_CACHE_TTL_MS) {
+        return presenceCache.value;
+    }
+    if (!rtdb) return {};
+    try {
+        const [browserSnap, serverSnap] = await Promise.all([
+            rtdb.ref('presence').once('value'),
+            rtdb.ref('serverPresence').once('value')
+        ]);
+        presenceCache = { at: now, value: { ...(browserSnap.val() || {}), ...(serverSnap.val() || {}) } };
+        return presenceCache.value;
+    } catch (e) {
+        console.warn('[Presence] Shared presence read unavailable:', e.message);
+        return {};
+    }
+}
+
 app.get('/api/admin/stats', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
         const now = Date.now();
@@ -3004,7 +3043,7 @@ app.get('/api/admin/stats', verifyAdmin, rateLimit('admin'), async (req, res) =>
         // snapshot. A full `keys` download every 30s (the dashboard polls this
         // endpoint) was what pushed RTDB downloads into the hundreds of MB a
         // month. The admin Refresh button still forces ?refresh=1.
-        if (memoryKeys.size === 0 || req.query.refresh === '1' || (now - keysLastLoaded) > STARTUP_CACHE_TTL) {
+        if (memoryKeys.size === 0 || req.query.refresh === '1') {
             await loadKeysFromStorage(true);
         }
         // Fast in-memory stats calculation
@@ -3030,13 +3069,7 @@ app.get('/api/admin/stats', verifyAdmin, rateLimit('admin'), async (req, res) =>
         const adminCount = allKeys.filter(k => k.provider === 'admin' || k.adminCreated).length;
 
         // Accurate online count from active visitors & sessions & RTDB presence
-        let sharedPresence = {};
-        if (rtdb) {
-            try {
-                const [browserSnap, serverSnap] = await Promise.all([rtdb.ref('presence').once('value'), rtdb.ref('serverPresence').once('value')]);
-                sharedPresence = { ...(browserSnap.val() || {}), ...(serverSnap.val() || {}) };
-            } catch (e) {}
-        }
+        let sharedPresence = await getSharedPresence();
         const cutoff = now - ONLINE_WINDOW_MS;
         const apiDevices = new Set();
         for (const [nodeId, p] of presenceSessions.entries()) {
@@ -3057,10 +3090,55 @@ app.get('/api/admin/stats', verifyAdmin, rateLimit('admin'), async (req, res) =>
         const tierCounts = { basic: 0, plus: 0, vip: 0 };
         allKeys.forEach(k => { if (tierCounts[k.tier] !== undefined) tierCounts[k.tier]++; });
 
+        // ---------------- 24-HOUR DAILY STATS (12:00 AM - 12:00 AM) ----------------
+        const midnightToday = new Date();
+        midnightToday.setHours(0, 0, 0, 0);
+        const dayStartMs = midnightToday.getTime();
+        const nextMidnight = dayStartMs + (24 * 60 * 60 * 1000);
+
+        // Keys generated today (since 12:00 AM midnight)
+        const keysToday = allKeys.filter(k => (k.createdAt || 0) >= dayStartMs);
+        const totalKeysToday = keysToday.length;
+        const linkvertiseToday = keysToday.filter(k => k.provider === 'linkvertise' || k.linkvertiseHash).length;
+        const lootlabsToday = keysToday.filter(k => k.provider === 'lootlabs' || k.lootlabsPostback || k.lootlabsLocal).length;
+        const workinkToday = keysToday.filter(k => k.provider === 'workink' || k.workinkPostback).length;
+        const adminToday = keysToday.filter(k => k.provider === 'admin' || k.adminCreated).length;
+
+        // Unique logins / active users today (since 12:00 AM midnight)
+        const dailyLoginsSet = new Set();
+        // 1. Visitors/sessions who checked in today
+        for (const [nodeId, p] of Object.entries({ ...sharedPresence, ...Object.fromEntries(presenceSessions) })) {
+            if (p && (p.lastSeen || 0) >= dayStartMs) {
+                const identifier = p.email || p.googleUid || p.uid || p.visitorId || nodeId;
+                if (identifier) dailyLoginsSet.add(identifier);
+            }
+        }
+        // 2. Keys active or used today
+        allKeys.forEach(k => {
+            if ((k.lastSeen && k.lastSeen >= dayStartMs) || (k.createdAt && k.createdAt >= dayStartMs)) {
+                if (k.googleEmail) dailyLoginsSet.add(k.googleEmail);
+                else if (k.googleUid) dailyLoginsSet.add(k.googleUid);
+                else if (k.userId) dailyLoginsSet.add(k.userId);
+            }
+        });
+        const loginsToday = dailyLoginsSet.size;
+
+        const dailyStats = {
+            startOfDay: dayStartMs,
+            endOfDay: nextMidnight,
+            totalKeysToday,
+            linkvertiseToday,
+            lootlabsToday,
+            workinkToday,
+            adminToday,
+            loginsToday
+        };
+
         res.json({
             totalKeys, activeKeys, expiredKeys, uniqueUsers,
             linkvertiseCount, lootlabsCount, workinkCount, adminCount,
-            onlineCount, localOnlineCount: apiPresenceCount, sharedPresence: true, bannedCount, tierCounts
+            onlineCount, localOnlineCount: apiPresenceCount, sharedPresence: true, bannedCount, tierCounts,
+            daily: dailyStats
         });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -3091,13 +3169,7 @@ app.get('/api/admin/keys', verifyAdmin, rateLimit('admin'), async (req, res) => 
         }
 
         const now = Date.now();
-        let sharedKeyPresence = {};
-        if (rtdb) {
-            try {
-                const [browserSnap, serverSnap] = await Promise.all([rtdb.ref('presence').once('value'), rtdb.ref('serverPresence').once('value')]);
-                sharedKeyPresence = { ...(browserSnap.val() || {}), ...(serverSnap.val() || {}) };
-            } catch (e) { console.warn('[Presence] Key status read unavailable:', e.message); }
-        }
+        let sharedKeyPresence = await getSharedPresence();
         const enrichOne = (k) => {
             const provider = k.provider || (k.linkvertiseHash ? 'linkvertise' : (k.lootlabsPostback || k.lootlabsLocal ? 'lootlabs' : (k.workinkPostback ? 'workink' : (k.adminCreated ? 'admin' : 'unknown'))));
             const isLifetime = !k.expiresAt || k.expiresAt === 0;
