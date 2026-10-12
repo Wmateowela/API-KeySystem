@@ -8,10 +8,16 @@ const { getAuth } = require('firebase-admin/auth');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { countDevices } = require('./presence');
+const { WINDOW_MS, countDevices } = require('./presence');
+const ONLINE_WINDOW_MS = WINDOW_MS || (120 * 1000);
 const { saveDailySubmission, latestSubmissions, removableOldSubmissionIds } = require('./support-store');
 const { isLinkedToGoogleAccount, findActiveGoogleKeys, findUsableGoogleKeys, accountKeySlot } = require('./google-key-lookup');
 const { mayDisconnectKeySession, mayDisconnectGuestSession } = require('./logout-authorization');
+
+let dashboardRevision = 1;
+function bumpDashboardRevision() {
+    dashboardRevision++;
+}
 
 // Local in-memory caches for lightning-fast lookups & 0-read operations
 const memoryKeys = new Map();
@@ -21,12 +27,14 @@ const memoryWorkinkPending = new Map();  // postbackValue -> { userId, time, red
 const memoryBans = new Map();           // ip -> { ip, reason, banUntil, bannedAt, active }
 const memoryAnnouncements = new Map();  // id -> announcementDoc
 const memoryInvalidKeys = new Map();     // key -> timestamp (negative cache to prevent 404 DB spam)
+const NEGATIVE_CACHE_TTL_MS = 30 * 1000;  // 30-second TTL: prevents DB spam without locking out new/corrected keys
 const onlineUsers = new Map();          // userId -> lastSeen (ms)
 const presenceSessions = new Map();     // session/node id -> canonical live visitor record
 const authHandoffs = new Map();         // one-time token -> verified Google/key session
 
 let announcementsLastLoaded = 0;
-const ANNOUNCEMENTS_CACHE_TTL = 10 * 60 * 1000; // 10 mins
+let announcementsRevision = Date.now();
+const ANNOUNCEMENTS_CACHE_TTL = 30 * 1000; // 30s cache TTL (allows fast propagation of disable/delete)
 let keysLastLoaded = 0;
 let keysFirestoreFallbackAt = 0;
 const KEYS_FIRESTORE_FALLBACK_TTL = 15 * 60 * 1000; // full Firestore key scans are expensive on the free tier
@@ -69,7 +77,7 @@ const DEFAULT_PROVIDER_SETTINGS = {
 const DEFAULT_STORE_DOMAINS = {
     primaryStoreUrl: 'https://buyrobux-store.pages.dev',
     keyGatewayUrl: 'https://nmc-key.vercel.app',
-    allowedDomains: ['https://buyrobux-store.pages.dev']
+    allowedDomains: ['https://buyrobux-store.pages.dev', 'https://pathan-sand.vercel.app']
 };
 const memorySettings = {
     providerDurations: { ...DEFAULT_PROVIDER_DURATIONS },
@@ -365,6 +373,9 @@ async function saveKeyToStorage(key, keyData) {
     const cleanKey = (key || '').toUpperCase();
     if (!cleanKey) return;
     
+    // Invalidate negative cache immediately so newly minted/saved keys are instantly valid
+    memoryInvalidKeys.delete(cleanKey);
+
     // 1. RAM Cache (Instant 0ms access)
     memoryKeys.set(cleanKey, keyData);
 
@@ -379,11 +390,14 @@ async function saveKeyToStorage(key, keyData) {
 
     // 3. Record in Persistent Daily Activity
     void recordDailyKeyGeneration(cleanKey, keyData);
+    bumpDashboardRevision();
 }
 
 async function updateKeyInStorage(key, updates, options = {}) {
     const cleanKey = (key || '').toUpperCase();
     if (!cleanKey) return;
+    memoryInvalidKeys.delete(cleanKey);
+    bumpDashboardRevision();
 
     if (updates.googleEmail || updates.googleUid) {
         void recordDailyGoogleLogin({
@@ -426,6 +440,7 @@ async function updateKeyInStorage(key, updates, options = {}) {
 async function deleteKeyFromStorage(key) {
     const cleanKey = (key || '').toUpperCase();
     if (!cleanKey) return;
+    bumpDashboardRevision();
 
     // 1. RAM Cache
     memoryKeys.delete(cleanKey);
@@ -535,25 +550,27 @@ function setupRTDBListeners() {
             const data = snap.val();
             if (data && data.key) {
                 memoryKeys.set(data.key.toUpperCase(), data);
+                bumpDashboardRevision();
             }
         });
         rtdb.ref('keys').on('child_changed', (snap) => {
             const data = snap.val();
             if (data && data.key) {
                 memoryKeys.set(data.key.toUpperCase(), data);
+                bumpDashboardRevision();
             }
         });
         rtdb.ref('keys').on('child_removed', (snap) => {
             const data = snap.val();
             const keyName = (data && data.key) ? data.key.toUpperCase() : (snap.key || '').toUpperCase();
-            if (keyName) memoryKeys.delete(keyName);
+            if (keyName) {
+                memoryKeys.delete(keyName);
+                bumpDashboardRevision();
+            }
         });
 
         // Real-time synchronization of online presence from RTDB.
-        // Bandwidth guard: these used to be one root .on('value') listener that
-        // re-downloaded the ENTIRE presence node every time any single visitor
-        // heartbeated (every ~25s per user). Child listeners only download the
-        // one changed record, which cuts that traffic by hundreds of times.
+        // Bandwidth guard: child listeners only download the one changed record.
         const handlePresenceNode = (snap) => {
             const vid = snap.key;
             const p = snap.val();
@@ -609,6 +626,41 @@ function setupRTDBListeners() {
             if (p.key) {
                 onlineUsers.delete(`key:${String(p.key).trim().toUpperCase()}`);
             }
+        });
+
+        // Mirror serverPresence child events in-memory to prevent full node reads
+        const handleServerPresenceNode = (snap) => {
+            const hash = snap.key;
+            const p = snap.val();
+            if (!hash || !p || typeof p !== 'object') return;
+            const now = Date.now();
+            const cutoff = now - ONLINE_WINDOW_MS;
+            const nodeId = `server:${hash}`;
+            if ((p.lastSeen || 0) > cutoff) {
+                const ts = p.lastSeen || now;
+                const vid = String(p.visitorId || p.uid || hash);
+                presenceSessions.set(nodeId, { ...p, visitorId: vid, lastSeen: ts });
+                onlineUsers.set(vid, ts);
+                if (p.uid) {
+                    onlineUsers.set(p.uid, ts);
+                    onlineUsers.set(`guid:${p.uid}`, ts);
+                }
+                if (p.key) {
+                    const cleanK = String(p.key).trim().toUpperCase();
+                    onlineUsers.set(`key:${cleanK}`, ts);
+                }
+                if (p.email) {
+                    onlineUsers.set(`email:${String(p.email).toLowerCase()}`, ts);
+                }
+            } else {
+                presenceSessions.delete(nodeId);
+            }
+        };
+        rtdb.ref('serverPresence').on('child_added', handleServerPresenceNode);
+        rtdb.ref('serverPresence').on('child_changed', handleServerPresenceNode);
+        rtdb.ref('serverPresence').on('child_removed', (snap) => {
+            const hash = snap.key;
+            presenceSessions.delete(`server:${hash}`);
         });
 
         // Keep the served Store UI in lockstep with RTDB. The boot-time
@@ -683,17 +735,20 @@ async function loadAnnouncementsFromFirestore(force = false) {
     if (rtdb) {
         try {
             const snap = await rtdb.ref('announcements').once('value');
+            memoryAnnouncements.clear();
             if (snap.exists()) {
-                memoryAnnouncements.clear();
                 const dataObj = snap.val() || {};
                 Object.keys(dataObj).forEach(id => {
                     const item = dataObj[id];
                     if (item) memoryAnnouncements.set(id, { id, ...item });
                 });
-                announcementsLastLoaded = now;
                 console.log(`✅ Loaded ${memoryAnnouncements.size} announcements from RTDB into memory cache.`);
-                return Array.from(memoryAnnouncements.values());
+            } else {
+                console.log(`✅ RTDB announcements node is empty/deleted (cleared memory cache).`);
             }
+            announcementsLastLoaded = now;
+            announcementsRevision = now;
+            return Array.from(memoryAnnouncements.values());
         } catch (e) {
             console.warn("RTDB load announcements warning:", e.message);
         }
@@ -1163,7 +1218,7 @@ async function releaseSupersededKeys() {
 }
 
 // ---------------- ONLINE TRACKING ----------------
-const ONLINE_WINDOW_MS = 60 * 1000; // heartbeat is every 25s; expire ghost sessions quickly
+// ONLINE_WINDOW_MS is 120s (from presence.js), providing safety margin for 50s frontend heartbeat
 function markOnline(userId, ip, key, googleInfo) {
     const now = Date.now();
     if (userId && typeof userId === 'string') {
@@ -2657,7 +2712,7 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
 
         // 1. Negative cache: if known invalid, reject immediately (0 Firestore reads)
         const invalidSince = memoryInvalidKeys.get(cleanKey);
-        if (invalidSince && (Date.now() - invalidSince) < 10 * 60 * 1000) {
+        if (invalidSince && (Date.now() - invalidSince) < NEGATIVE_CACHE_TTL_MS) {
             return res.status(404).json({ valid: false, error: "Key not found. Please verify you entered it correctly." });
         }
 
@@ -2667,7 +2722,7 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
         if (!keyData) {
             keyData = await getKeyFromStorage(cleanKey);
             if (!keyData) {
-                memoryInvalidKeys.set(cleanKey, Date.now()); // Cache negative result for 10 mins
+                memoryInvalidKeys.set(cleanKey, Date.now()); // Cache negative result for 30s only
             }
         }
 
@@ -3175,203 +3230,270 @@ app.post('/api/admin/login', rateLimit('admin'), (req, res) => {
     }
 });
 
-// Presence cache: both /api/admin/stats and /api/admin/keys hit this,
-// so 4 full presence-node reads per dashboard poll collapse to at most 1.
-let presenceCache = { at: 0, value: null };
-const PRESENCE_CACHE_TTL_MS = 15000;
-
+// In-memory presence snapshot (0 RTDB reads on normal path)
+// presence and serverPresence are continuously maintained in RAM by child listeners.
 async function getSharedPresence() {
+    const snapshot = {};
     const now = Date.now();
-    if (presenceCache.value && (now - presenceCache.at) < PRESENCE_CACHE_TTL_MS) {
-        return presenceCache.value;
+    const cutoff = now - ONLINE_WINDOW_MS;
+    for (const [nodeId, p] of presenceSessions.entries()) {
+        if (p && (p.lastSeen || 0) > cutoff) {
+            snapshot[nodeId] = p;
+        }
     }
-    if (!rtdb) return {};
-    try {
-        const [browserSnap, serverSnap] = await Promise.all([
-            rtdb.ref('presence').once('value'),
-            rtdb.ref('serverPresence').once('value')
-        ]);
-        presenceCache = { at: now, value: { ...(browserSnap.val() || {}), ...(serverSnap.val() || {}) } };
-        return presenceCache.value;
-    } catch (e) {
-        console.warn('[Presence] Shared presence read unavailable:', e.message);
-        return {};
-    }
+    return snapshot;
 }
+
+function enrichKeyForAdmin(k, now, sharedKeyPresence) {
+    const provider = k.provider || (k.linkvertiseHash ? 'linkvertise' : (k.lootlabsPostback || k.lootlabsLocal ? 'lootlabs' : (k.workinkPostback ? 'workink' : (k.adminCreated ? 'admin' : 'unknown'))));
+    const isLifetime = !k.expiresAt || k.expiresAt === 0;
+    const expired = !isLifetime && k.expiresAt <= now;
+    const ipBan = k.ip ? memoryBans.get(normalizeIp(k.ip)) : null;
+    const ipBanned = !!(ipBan && ipBan.active && (!ipBan.banUntil || ipBan.banUntil > now));
+    const isOnlineKey = isKeyOnline(k.key) || 
+        isUserOnline(k.userId) || 
+        isUserOnline(k.googleUid) || 
+        isUserOnline(k.googleEmail) || 
+        isUserOnline(k.email) || 
+        isUserOnline(k.ip) || 
+        (Array.isArray(k.usedBy) && k.usedBy.some(u => isUserOnline(u)));
+    const online = !expired && !isKeyBlocked(k) && !ipBanned && isOnlineKey;
+    const onlineBreakdown = getKeyOnlineBreakdown(k.key, sharedKeyPresence);
+    const described = describeKeyBan(k);
+    return {
+        key: k.key,
+        provider: provider,
+        userId: k.userId || '-',
+        ip: k.ip || '-',
+        country: k.country || '-',
+        expiresAt: k.expiresAt || 0,
+        revoked: k.revoked || false,
+        expired: expired,
+        online: online || onlineBreakdown.onlineUsers > 0,
+        ...onlineBreakdown,
+        banned: isKeyBlocked(k) || ipBanned,
+        banUntil: ipBan ? (ipBan.banUntil || 0) : 0,
+        banReason: (isKeyBlocked(k) || ipBanned) ? described.reason : '',
+        autoBan: (isKeyBlocked(k) || ipBanned) ? described.auto : false,
+        superseded: described.superseded === true,
+        createdAt: k.createdAt || 0,
+        maxUsers: k.maxUsers || 1,
+        usedUsers: Array.isArray(k.usedBy) ? k.usedBy.length : (k.usedUsers || 0),
+        usedBy: k.usedBy || [],
+        usedIps: k.usedIps || [],
+        ipCheck: !!k.ipCheck,
+        tier: k.tier || 'none',
+        boundEmail: k.boundEmail || '',
+        subscriptionExpiresAt: k.subscriptionExpiresAt || 0,
+        note: k.note || '',
+        googleUser: k.authProvider === 'google' || !!k.googleEmail || !!k.userEmail,
+        email: k.googleEmail || k.userEmail || k.email || '',
+        displayName: k.displayName || k.name || '',
+        authProvider: k.authProvider || (k.googleEmail ? 'google' : 'anonymous'),
+        accountUsers: Array.isArray(k.accountUsers) ? k.accountUsers : []
+    };
+}
+
+async function computeDashboardStats(now, sharedPresence) {
+    const allKeys = Array.from(memoryKeys.values());
+    const totalKeys = allKeys.length;
+    const activeKeys = allKeys.filter(k => !isKeyBlocked(k) && (!k.expiresAt || k.expiresAt === 0 || k.expiresAt > now)).length;
+    const expiredKeys = allKeys.filter(k => !isKeyBlocked(k) && k.expiresAt > 0 && k.expiresAt <= now).length;
+    
+    const uniqueUsersSet = new Set();
+    allKeys.forEach(k => {
+        if (Array.isArray(k.usedBy) && k.usedBy.length > 0) {
+            k.usedBy.forEach(u => uniqueUsersSet.add(u));
+        } else if (k.userId) {
+            uniqueUsersSet.add(k.userId);
+        }
+    });
+    const uniqueUsers = uniqueUsersSet.size;
+
+    const linkvertiseCount = allKeys.filter(k => k.provider === 'linkvertise' || k.linkvertiseHash).length;
+    const lootlabsCount = allKeys.filter(k => k.provider === 'lootlabs' || k.lootlabsPostback || k.lootlabsLocal).length;
+    const workinkCount = allKeys.filter(k => k.provider === 'workink' || k.workinkPostback).length;
+    const adminCount = allKeys.filter(k => k.provider === 'admin' || k.adminCreated).length;
+
+    const cutoff = now - ONLINE_WINDOW_MS;
+    const apiDevices = new Set();
+    for (const [nodeId, p] of presenceSessions.entries()) {
+        if (!nodeId.startsWith('api:') || !p || (p.lastSeen || 0) <= cutoff) continue;
+        apiDevices.add(String(p.visitorId || nodeId));
+    }
+    const apiPresenceCount = apiDevices.size;
+    const onlineCount = countDevices({ ...sharedPresence, ...Object.fromEntries(presenceSessions) }, now);
+
+    let bannedCount = 0;
+    allKeys.forEach(k => {
+        const ban = k.ip ? memoryBans.get(normalizeIp(k.ip)) : null;
+        const ipBanned = !!(ban && ban.active && (!ban.banUntil || ban.banUntil > now));
+        if (isKeyBlocked(k) || ipBanned) bannedCount++;
+    });
+
+    const tierCounts = { basic: 0, plus: 0, vip: 0 };
+    allKeys.forEach(k => { if (tierCounts[k.tier] !== undefined) tierCounts[k.tier]++; });
+
+    const dateKey = getDailyDateKey(now);
+    const dailyRec = await getDailyActivityRecord(dateKey);
+
+    const midnightToday = new Date();
+    midnightToday.setHours(0, 0, 0, 0);
+    const dayStartMs = midnightToday.getTime();
+    const nextMidnight = dayStartMs + (24 * 60 * 60 * 1000);
+
+    allKeys.forEach(k => {
+        if ((k.createdAt || 0) >= dayStartMs && (!dailyRec.keysLog || !dailyRec.keysLog[k.key])) {
+            void recordDailyKeyGeneration(k.key, k);
+        }
+    });
+
+    const totalKeysToday = Math.max(dailyRec.totalKeysGenerated || 0, Object.keys(dailyRec.keysLog || {}).length);
+    const lootlabsToday = dailyRec.lootlabsCount || 0;
+    const linkvertiseToday = dailyRec.linkvertiseCount || 0;
+    const workinkToday = dailyRec.workinkCount || 0;
+    const adminToday = dailyRec.adminCount || 0;
+
+    let activeKeysToday = 0;
+    let expiredKeysToday = 0;
+    let deletedKeysToday = 0;
+
+    const loggedTodayKeys = Object.values(dailyRec.keysLog || {});
+    loggedTodayKeys.forEach(loggedKey => {
+        const current = memoryKeys.get(loggedKey.key);
+        if (!current) {
+            deletedKeysToday++;
+        } else if (isKeyBlocked(current)) {
+            expiredKeysToday++;
+        } else if (!current.expiresAt || current.expiresAt === 0 || current.expiresAt > now) {
+            activeKeysToday++;
+        } else {
+            expiredKeysToday++;
+        }
+    });
+
+    const googleUsersMap = new Map();
+    if (dailyRec.googleLogins) {
+        Object.values(dailyRec.googleLogins).forEach(u => {
+            if (u && (u.email || u.uid)) {
+                googleUsersMap.set((u.uid || u.email).toLowerCase(), u);
+            }
+        });
+    }
+    allKeys.forEach(k => {
+        if (k.googleEmail || k.googleUid) {
+            if ((k.lastSeen && k.lastSeen >= dayStartMs) || (k.createdAt && k.createdAt >= dayStartMs)) {
+                const id = (k.googleUid || k.googleEmail).toLowerCase();
+                if (!googleUsersMap.has(id)) {
+                    googleUsersMap.set(id, {
+                        uid: k.googleUid || '',
+                        email: k.googleEmail || '',
+                        displayName: k.googleName || (k.googleEmail ? k.googleEmail.split('@')[0] : 'Google User'),
+                        photoURL: k.googlePhoto || '',
+                        firstSeen: k.createdAt || dayStartMs,
+                        lastSeen: k.lastSeen || k.createdAt || now,
+                        ip: k.ip || '',
+                        keyUsed: k.key || ''
+                    });
+                }
+            }
+        }
+    });
+
+    const googleUsers = Array.from(googleUsersMap.values()).sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
+    const googleLoginsCount = googleUsers.length;
+
+    const dailyLoginsSet = new Set();
+    for (const [nodeId, p] of Object.entries({ ...sharedPresence, ...Object.fromEntries(presenceSessions) })) {
+        if (p && (p.lastSeen || 0) >= dayStartMs) {
+            const identifier = p.email || p.googleUid || p.uid || p.visitorId || nodeId;
+            if (identifier) dailyLoginsSet.add(identifier);
+        }
+    }
+    googleUsers.forEach(u => {
+        if (u.email) dailyLoginsSet.add(u.email);
+        else if (u.uid) dailyLoginsSet.add(u.uid);
+    });
+    allKeys.forEach(k => {
+        if ((k.lastSeen && k.lastSeen >= dayStartMs) || (k.createdAt && k.createdAt >= dayStartMs)) {
+            if (k.googleEmail) dailyLoginsSet.add(k.googleEmail);
+            else if (k.googleUid) dailyLoginsSet.add(k.googleUid);
+            else if (k.userId) dailyLoginsSet.add(k.userId);
+        }
+    });
+    const loginsToday = Math.max(dailyLoginsSet.size, googleLoginsCount);
+    const anonymousLoginsToday = Math.max(0, loginsToday - googleLoginsCount);
+
+    const dailyStats = {
+        date: dateKey,
+        startOfDay: dayStartMs,
+        endOfDay: nextMidnight,
+        totalKeysToday,
+        activeKeysToday,
+        expiredKeysToday,
+        deletedKeysToday,
+        linkvertiseToday,
+        lootlabsToday,
+        workinkToday,
+        adminToday,
+        loginsToday,
+        googleLoginsCount,
+        anonymousLoginsToday
+    };
+
+    return {
+        totalKeys, activeKeys, expiredKeys, uniqueUsers,
+        linkvertiseCount, lootlabsCount, workinkCount, adminCount,
+        onlineCount, localOnlineCount: apiPresenceCount, sharedPresence: true, bannedCount, tierCounts,
+        daily: dailyStats
+    };
+}
+
+app.get('/api/admin/dashboard-snapshot', verifyAdmin, rateLimit('admin'), async (req, res) => {
+    try {
+        const clientETag = req.headers['if-none-match'];
+        const clientRev = req.query.revision;
+        const currentRevStr = String(dashboardRevision);
+        if (clientETag === `"${currentRevStr}"` || clientRev === currentRevStr) {
+            return res.status(304).end();
+        }
+
+        if (memoryKeys.size === 0 || req.query.refresh === '1') {
+            await loadKeysFromStorage(true);
+        }
+
+        const now = Date.now();
+        const sharedKeyPresence = await getSharedPresence();
+        const stats = await computeDashboardStats(now, sharedKeyPresence);
+
+        const keys = Array.from(memoryKeys.values());
+        const enriched = keys.map(k => enrichKeyForAdmin(k, now, sharedKeyPresence));
+        enriched.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
+        res.set('ETag', `"${currentRevStr}"`);
+        res.set('Cache-Control', 'private, no-cache');
+        return res.json({
+            success: true,
+            revision: currentRevStr,
+            generatedAt: now,
+            stats,
+            keys: enriched,
+            totalKeys: enriched.length
+        });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
 
 app.get('/api/admin/stats', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
         const now = Date.now();
-        // memoryKeys is kept in sync live by the RTDB child_added/changed/
-        // removed listeners, so the expensive part here is only rebuilding the
-        // snapshot. A full `keys` download every 30s (the dashboard polls this
-        // endpoint) was what pushed RTDB downloads into the hundreds of MB a
-        // month. The admin Refresh button still forces ?refresh=1.
         if (memoryKeys.size === 0 || req.query.refresh === '1') {
             await loadKeysFromStorage(true);
         }
-        // Fast in-memory stats calculation
-        const allKeys = Array.from(memoryKeys.values());
-
-        const totalKeys = allKeys.length;
-        const activeKeys = allKeys.filter(k => !isKeyBlocked(k) && (!k.expiresAt || k.expiresAt === 0 || k.expiresAt > now)).length;
-        const expiredKeys = allKeys.filter(k => !isKeyBlocked(k) && k.expiresAt > 0 && k.expiresAt <= now).length;
-        
-        const uniqueUsersSet = new Set();
-        allKeys.forEach(k => {
-            if (Array.isArray(k.usedBy) && k.usedBy.length > 0) {
-                k.usedBy.forEach(u => uniqueUsersSet.add(u));
-            } else if (k.userId) {
-                uniqueUsersSet.add(k.userId);
-            }
-        });
-        const uniqueUsers = uniqueUsersSet.size;
-
-        const linkvertiseCount = allKeys.filter(k => k.provider === 'linkvertise' || k.linkvertiseHash).length;
-        const lootlabsCount = allKeys.filter(k => k.provider === 'lootlabs' || k.lootlabsPostback || k.lootlabsLocal).length;
-        const workinkCount = allKeys.filter(k => k.provider === 'workink' || k.workinkPostback).length;
-        const adminCount = allKeys.filter(k => k.provider === 'admin' || k.adminCreated).length;
-
-        // Accurate online count from active visitors & sessions & RTDB presence
-        let sharedPresence = await getSharedPresence();
-        const cutoff = now - ONLINE_WINDOW_MS;
-        const apiDevices = new Set();
-        for (const [nodeId, p] of presenceSessions.entries()) {
-            if (!nodeId.startsWith('api:') || !p || (p.lastSeen || 0) <= cutoff) continue;
-            apiDevices.add(String(p.visitorId || nodeId));
-        }
-        const apiPresenceCount = apiDevices.size;
-        const onlineCount = countDevices({ ...sharedPresence, ...Object.fromEntries(presenceSessions) }, now);
-
-        // Banned: keys whose IP is currently banned (plus revoked)
-        let bannedCount = 0;
-        allKeys.forEach(k => {
-            const ban = k.ip ? memoryBans.get(normalizeIp(k.ip)) : null;
-            const ipBanned = !!(ban && ban.active && (!ban.banUntil || ban.banUntil > now));
-            if (isKeyBlocked(k) || ipBanned) bannedCount++;
-        });
-
-        const tierCounts = { basic: 0, plus: 0, vip: 0 };
-        allKeys.forEach(k => { if (tierCounts[k.tier] !== undefined) tierCounts[k.tier]++; });
-
-        // ---------------- 24-HOUR DAILY STATS (12:00 AM - 12:00 AM) ----------------
-        const dateKey = getDailyDateKey(now);
-        const dailyRec = await getDailyActivityRecord(dateKey);
-
-        const midnightToday = new Date();
-        midnightToday.setHours(0, 0, 0, 0);
-        const dayStartMs = midnightToday.getTime();
-        const nextMidnight = dayStartMs + (24 * 60 * 60 * 1000);
-
-        // Sync any key currently in memoryKeys created today that might not be in keysLog
-        allKeys.forEach(k => {
-            if ((k.createdAt || 0) >= dayStartMs && (!dailyRec.keysLog || !dailyRec.keysLog[k.key])) {
-                void recordDailyKeyGeneration(k.key, k);
-            }
-        });
-
-        const totalKeysToday = Math.max(dailyRec.totalKeysGenerated || 0, Object.keys(dailyRec.keysLog || {}).length);
-        const lootlabsToday = dailyRec.lootlabsCount || 0;
-        const linkvertiseToday = dailyRec.linkvertiseCount || 0;
-        const workinkToday = dailyRec.workinkCount || 0;
-        const adminToday = dailyRec.adminCount || 0;
-
-        // Calculate active vs expired vs deleted among today's generated keys
-        let activeKeysToday = 0;
-        let expiredKeysToday = 0;
-        let deletedKeysToday = 0;
-
-        const loggedTodayKeys = Object.values(dailyRec.keysLog || {});
-        loggedTodayKeys.forEach(loggedKey => {
-            const current = memoryKeys.get(loggedKey.key);
-            if (!current) {
-                deletedKeysToday++;
-            } else if (isKeyBlocked(current)) {
-                expiredKeysToday++;
-            } else if (!current.expiresAt || current.expiresAt === 0 || current.expiresAt > now) {
-                activeKeysToday++;
-            } else {
-                expiredKeysToday++;
-            }
-        });
-
-        // Google accounts logged in today
-        const googleUsersMap = new Map();
-        if (dailyRec.googleLogins) {
-            Object.values(dailyRec.googleLogins).forEach(u => {
-                if (u && (u.email || u.uid)) {
-                    googleUsersMap.set((u.uid || u.email).toLowerCase(), u);
-                }
-            });
-        }
-        allKeys.forEach(k => {
-            if (k.googleEmail || k.googleUid) {
-                if ((k.lastSeen && k.lastSeen >= dayStartMs) || (k.createdAt && k.createdAt >= dayStartMs)) {
-                    const id = (k.googleUid || k.googleEmail).toLowerCase();
-                    if (!googleUsersMap.has(id)) {
-                        googleUsersMap.set(id, {
-                            uid: k.googleUid || '',
-                            email: k.googleEmail || '',
-                            displayName: k.googleName || (k.googleEmail ? k.googleEmail.split('@')[0] : 'Google User'),
-                            photoURL: k.googlePhoto || '',
-                            firstSeen: k.createdAt || dayStartMs,
-                            lastSeen: k.lastSeen || k.createdAt || now,
-                            ip: k.ip || '',
-                            keyUsed: k.key || ''
-                        });
-                    }
-                }
-            }
-        });
-
-        const googleUsers = Array.from(googleUsersMap.values()).sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
-        const googleLoginsCount = googleUsers.length;
-
-        // Unique logins / active users today (Google + visitors)
-        const dailyLoginsSet = new Set();
-        for (const [nodeId, p] of Object.entries({ ...sharedPresence, ...Object.fromEntries(presenceSessions) })) {
-            if (p && (p.lastSeen || 0) >= dayStartMs) {
-                const identifier = p.email || p.googleUid || p.uid || p.visitorId || nodeId;
-                if (identifier) dailyLoginsSet.add(identifier);
-            }
-        }
-        googleUsers.forEach(u => {
-            if (u.email) dailyLoginsSet.add(u.email);
-            else if (u.uid) dailyLoginsSet.add(u.uid);
-        });
-        allKeys.forEach(k => {
-            if ((k.lastSeen && k.lastSeen >= dayStartMs) || (k.createdAt && k.createdAt >= dayStartMs)) {
-                if (k.googleEmail) dailyLoginsSet.add(k.googleEmail);
-                else if (k.googleUid) dailyLoginsSet.add(k.googleUid);
-                else if (k.userId) dailyLoginsSet.add(k.userId);
-            }
-        });
-        const loginsToday = Math.max(dailyLoginsSet.size, googleLoginsCount);
-
-        const anonymousLoginsToday = Math.max(0, loginsToday - googleLoginsCount);
-        const dailyStats = {
-            date: dateKey,
-            startOfDay: dayStartMs,
-            endOfDay: nextMidnight,
-            totalKeysToday,
-            activeKeysToday,
-            expiredKeysToday,
-            deletedKeysToday,
-            linkvertiseToday,
-            lootlabsToday,
-            workinkToday,
-            adminToday,
-            loginsToday,
-            googleLoginsCount,
-            anonymousLoginsToday
-        };
-
-        res.json({
-            totalKeys, activeKeys, expiredKeys, uniqueUsers,
-            linkvertiseCount, lootlabsCount, workinkCount, adminCount,
-            onlineCount, localOnlineCount: apiPresenceCount, sharedPresence: true, bannedCount, tierCounts,
-            daily: dailyStats
-        });
+        const sharedPresence = await getSharedPresence();
+        const stats = await computeDashboardStats(now, sharedPresence);
+        res.json(stats);
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -3384,7 +3506,6 @@ app.get('/api/admin/keys', verifyAdmin, rateLimit('admin'), async (req, res) => 
         }
         const search = (req.query.search || '').toLowerCase();
         const sort = (req.query.sort || 'newest').toLowerCase();
-        // Fast in-memory key listing (0 Firestore reads)
         let keys = Array.from(memoryKeys.values());
 
         if (search) {
@@ -3401,58 +3522,8 @@ app.get('/api/admin/keys', verifyAdmin, rateLimit('admin'), async (req, res) => 
         }
 
         const now = Date.now();
-        let sharedKeyPresence = await getSharedPresence();
-        const enrichOne = (k) => {
-            const provider = k.provider || (k.linkvertiseHash ? 'linkvertise' : (k.lootlabsPostback || k.lootlabsLocal ? 'lootlabs' : (k.workinkPostback ? 'workink' : (k.adminCreated ? 'admin' : 'unknown'))));
-            const isLifetime = !k.expiresAt || k.expiresAt === 0;
-            const expired = !isLifetime && k.expiresAt <= now;
-            const ipBan = k.ip ? memoryBans.get(normalizeIp(k.ip)) : null;
-            const ipBanned = !!(ipBan && ipBan.active && (!ipBan.banUntil || ipBan.banUntil > now));
-            const isOnlineKey = isKeyOnline(k.key) || 
-                isUserOnline(k.userId) || 
-                isUserOnline(k.googleUid) || 
-                isUserOnline(k.googleEmail) || 
-                isUserOnline(k.email) || 
-                isUserOnline(k.ip) || 
-                (Array.isArray(k.usedBy) && k.usedBy.some(u => isUserOnline(u)));
-            const online = !expired && !isKeyBlocked(k) && !ipBanned && isOnlineKey;
-            const onlineBreakdown = getKeyOnlineBreakdown(k.key, sharedKeyPresence);
-            const described = describeKeyBan(k);
-            return {
-                key: k.key,
-                provider: provider,
-                userId: k.userId || '-',
-                ip: k.ip || '-',
-                country: k.country || '-',
-                expiresAt: k.expiresAt || 0,
-                revoked: k.revoked || false,
-                expired: expired,
-                online: online || onlineBreakdown.onlineUsers > 0,
-                ...onlineBreakdown,
-                banned: isKeyBlocked(k) || ipBanned,
-                banUntil: ipBan ? (ipBan.banUntil || 0) : 0,
-                banReason: (isKeyBlocked(k) || ipBanned) ? described.reason : '',
-                autoBan: (isKeyBlocked(k) || ipBanned) ? described.auto : false,
-                superseded: described.superseded === true,
-                createdAt: k.createdAt || 0,
-                maxUsers: k.maxUsers || 1,
-                usedUsers: Array.isArray(k.usedBy) ? k.usedBy.length : (k.usedUsers || 0),
-                usedBy: k.usedBy || [],
-                usedIps: k.usedIps || [],
-                ipCheck: !!k.ipCheck,
-                tier: k.tier || 'none',
-                boundEmail: k.boundEmail || '',
-                subscriptionExpiresAt: k.subscriptionExpiresAt || 0,
-                note: k.note || '',
-                googleUser: k.authProvider === 'google' || !!k.googleEmail || !!k.userEmail,
-                email: k.googleEmail || k.userEmail || k.email || '',
-                displayName: k.displayName || k.name || '',
-                authProvider: k.authProvider || (k.googleEmail ? 'google' : 'anonymous'),
-                accountUsers: Array.isArray(k.accountUsers) ? k.accountUsers : []
-            };
-        };
-
-        let enriched = keys.map(enrichOne);
+        const sharedKeyPresence = await getSharedPresence();
+        let enriched = keys.map(k => enrichKeyForAdmin(k, now, sharedKeyPresence));
 
         // Sorting / grouping. Most options group matching keys first, then newest.
         const newest = (a, b) => (b.createdAt || 0) - (a.createdAt || 0);
@@ -3808,7 +3879,8 @@ app.post('/api/admin/purge-expired', verifyAdmin, async (req, res) => {
 // ============================================================
 app.get('/api/admin/announcements', verifyAdmin, async (req, res) => {
     try {
-        const list = await loadAnnouncementsFromFirestore(false);
+        res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+        const list = await loadAnnouncementsFromFirestore(true);
         const announcements = [...list];
         announcements.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
         res.json({ announcements });
@@ -3819,23 +3891,27 @@ app.get('/api/admin/announcements', verifyAdmin, async (req, res) => {
 
 app.post('/api/admin/announcements', verifyAdmin, async (req, res) => {
     try {
-        const { heading, content, startAt, endAt, theme } = req.body;
+        const { heading, content, startAt, endAt, theme, username } = req.body;
         if (!heading || !content || !startAt || !endAt) {
             return res.status(400).json({ error: 'Missing required announcement fields' });
         }
         const id = `ann_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
         const data = {
             id,
+            username: username ? String(username).trim() : 'Roblox',
             heading,
             content,
             startAt: new Date(startAt).toISOString(),
             endAt: new Date(endAt).toISOString(),
             theme: theme || 'info',
             active: true,
+            activeUpdatedAt: new Date().toISOString(),
             createdAt: new Date().toISOString(),
             createdBy: 'admin'
         };
         memoryAnnouncements.set(id, data);
+        announcementsLastLoaded = Date.now();
+        announcementsRevision = Date.now();
 
         if (rtdb) {
             try {
@@ -3853,24 +3929,34 @@ app.post('/api/admin/announcements', verifyAdmin, async (req, res) => {
 app.put('/api/admin/announcements/:id', verifyAdmin, async (req, res) => {
     try {
         const id = req.params.id;
-        const { heading, content, startAt, endAt, theme } = req.body;
+        const { heading, content, startAt, endAt, theme, username } = req.body;
         const updates = {};
         if (heading) updates.heading = heading;
         if (content) updates.content = content;
+        if (username !== undefined) updates.username = String(username).trim() || 'Roblox';
         if (startAt) updates.startAt = new Date(startAt).toISOString();
         if (endAt) updates.endAt = new Date(endAt).toISOString();
         if (theme) updates.theme = theme;
+        updates.activeUpdatedAt = new Date().toISOString();
 
-        const existing = memoryAnnouncements.get(id) || {};
-        const merged = { ...existing, ...updates };
+        let existing = memoryAnnouncements.get(id);
+        if (!existing && rtdb) {
+            const snap = await rtdb.ref(`announcements/${id}`).once('value');
+            if (snap.exists()) {
+                existing = { id, ...snap.val() };
+            }
+        }
+        const merged = { ...(existing || { id }), ...updates };
         memoryAnnouncements.set(id, merged);
+        announcementsLastLoaded = Date.now();
+        announcementsRevision = Date.now();
 
         if (rtdb) {
             try {
                 await rtdb.ref(`announcements/${id}`).update(updates);
             } catch (e) {}
         }
-        res.json({ success: true });
+        res.json({ success: true, data: merged });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -3880,13 +3966,15 @@ app.delete('/api/admin/announcements/:id', verifyAdmin, async (req, res) => {
     try {
         const id = req.params.id;
         memoryAnnouncements.delete(id);
+        announcementsLastLoaded = Date.now();
+        announcementsRevision = Date.now();
 
         if (rtdb) {
             try {
                 await rtdb.ref(`announcements/${id}`).remove();
             } catch (e) {}
         }
-        res.json({ success: true });
+        res.json({ success: true, id });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -3895,20 +3983,38 @@ app.delete('/api/admin/announcements/:id', verifyAdmin, async (req, res) => {
 app.post('/api/admin/announcements/:id/toggle', verifyAdmin, async (req, res) => {
     try {
         const id = req.params.id;
-        let current = true;
-        const inMem = memoryAnnouncements.get(id);
-        if (inMem) {
-            current = inMem.active;
+        if (memoryAnnouncements.size === 0) {
+            await loadAnnouncementsFromFirestore(true);
         }
-        const newActive = !current;
-        if (inMem) inMem.active = newActive;
+        let inMem = memoryAnnouncements.get(id);
+        if (!inMem && rtdb) {
+            const snap = await rtdb.ref(`announcements/${id}`).once('value');
+            if (snap.exists()) {
+                inMem = { id, ...snap.val() };
+                memoryAnnouncements.set(id, inMem);
+            }
+        }
+        if (!inMem) {
+            return res.status(404).json({ error: 'Announcement not found' });
+        }
+        const newActive = !inMem.active;
+        inMem.active = newActive;
+        const nowIso = new Date().toISOString();
+        if (newActive) {
+            inMem.activeUpdatedAt = nowIso;
+        }
+        memoryAnnouncements.set(id, inMem);
+        announcementsLastLoaded = Date.now();
+        announcementsRevision = Date.now();
 
         if (rtdb) {
             try {
-                await rtdb.ref(`announcements/${id}`).update({ active: newActive });
+                const rtdbUpdate = { active: newActive };
+                if (newActive) rtdbUpdate.activeUpdatedAt = nowIso;
+                await rtdb.ref(`announcements/${id}`).update(rtdbUpdate);
             } catch (e) {}
         }
-        res.json({ success: true, active: newActive });
+        res.json({ success: true, id, active: newActive, activeUpdatedAt: inMem.activeUpdatedAt });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -3917,17 +4023,59 @@ app.post('/api/admin/announcements/:id/toggle', verifyAdmin, async (req, res) =>
 // Public endpoint for frontend to fetch active announcements (cached in memory)
 app.get('/api/announcements/active', async (req, res) => {
     try {
+        res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
         const all = await loadAnnouncementsFromFirestore(false);
         const nowIso = new Date().toISOString();
         const announcements = [];
         all.forEach(data => {
-            if (data.active && data.startAt <= nowIso && data.endAt >= nowIso) {
+            if (data.active === true && data.startAt <= nowIso && data.endAt >= nowIso) {
                 announcements.push(data);
             }
         });
-        res.json({ announcements });
+        res.json({ announcements, revision: announcementsRevision });
     } catch (e) {
         res.status(500).json({ error: e.message });
+    }
+});
+
+// Roblox avatar headshot lookup endpoint (resolves any username to real Roblox avatar headshot)
+const robloxAvatarMemoryCache = new Map();
+app.get('/api/roblox-avatar', async (req, res) => {
+    try {
+        const username = String(req.query.username || '').trim();
+        if (!username) {
+            return res.status(400).json({ success: false, error: 'Username required' });
+        }
+        const cacheKey = username.toLowerCase();
+        const cached = robloxAvatarMemoryCache.get(cacheKey);
+        if (cached && (Date.now() - cached.time < 3600 * 1000 * 12)) {
+            return res.json({ success: true, avatar: cached.avatar, userId: cached.userId, username: cached.username });
+        }
+
+        // 1. Resolve username to userId via Roblox API
+        const uRes = await fetch('https://users.roblox.com/v1/usernames/users', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ usernames: [username], excludeBannedUsers: false })
+        });
+        const uData = await uRes.json().catch(() => ({}));
+        const user = uData && Array.isArray(uData.data) && uData.data[0];
+        if (!user || !user.id) {
+            return res.json({ success: false, error: 'User not found on Roblox' });
+        }
+
+        // 2. Resolve userId to avatar headshot
+        const tRes = await fetch(`https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${user.id}&size=150x150&format=Png&isCircular=false`);
+        const tData = await tRes.json().catch(() => ({}));
+        const thumb = tData && Array.isArray(tData.data) && tData.data[0];
+        const avatarUrl = thumb && thumb.imageUrl ? thumb.imageUrl : null;
+        if (avatarUrl) {
+            robloxAvatarMemoryCache.set(cacheKey, { avatar: avatarUrl, userId: user.id, username: user.name, time: Date.now() });
+            return res.json({ success: true, avatar: avatarUrl, userId: user.id, username: user.name });
+        }
+        return res.json({ success: false, error: 'Thumbnail not available' });
+    } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
     }
 });
 
@@ -4479,7 +4627,12 @@ app.post('/api/store-config', verifyAdmin, rateLimit('admin'), async (req, res) 
 // Store Domains: Get active store domains and gateway config
 app.get('/api/store-domains', async (req, res) => {
     try {
-        const domains = memorySettings.storeDomains || DEFAULT_STORE_DOMAINS;
+        const domains = JSON.parse(JSON.stringify(memorySettings.storeDomains || DEFAULT_STORE_DOMAINS));
+        const list = Array.isArray(domains.allowedDomains) ? domains.allowedDomains : [];
+        if (!list.some(d => String(d).includes('pathan-sand.vercel.app'))) {
+            list.push('https://pathan-sand.vercel.app');
+        }
+        domains.allowedDomains = list;
         return res.json({ success: true, domains });
     } catch (e) {
         return res.json({ success: true, domains: DEFAULT_STORE_DOMAINS });
