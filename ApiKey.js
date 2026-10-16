@@ -728,7 +728,9 @@ async function loadBansFromFirestore(force = false) {
 
 async function loadAnnouncementsFromFirestore(force = false) {
     const now = Date.now();
-    if (!force && (now - announcementsLastLoaded) < ANNOUNCEMENTS_CACHE_TTL && memoryAnnouncements.size > 0) {
+    // An empty announcement list is also a valid cached result. Requiring a
+    // non-empty map made every fallback request download the empty RTDB node.
+    if (!force && announcementsLastLoaded > 0 && (now - announcementsLastLoaded) < ANNOUNCEMENTS_CACHE_TTL) {
         return Array.from(memoryAnnouncements.values());
     }
 
@@ -758,6 +760,7 @@ async function loadAnnouncementsFromFirestore(force = false) {
 
 const DEFAULT_FEATURES_NOTICE = {
     active: true,
+    displayMode: "features", // "features" or "poll"
     title: "What's New in Update",
     badge: "v2.5 UPDATE",
     subtitle: "Explore our latest features, realistic store upgrades, and simulation tools!",
@@ -808,12 +811,24 @@ const DEFAULT_FEATURES_NOTICE = {
             color: "rose"
         }
     ],
+    poll: {
+        enabled: false,
+        id: "poll_v1",
+        question: "What update would you like to see next?",
+        options: [
+            { id: "opt_1", text: "Instant 1-Click Checkout", votes: 0 },
+            { id: "opt_2", text: "More Avatar Items & Bundles", votes: 0 },
+            { id: "opt_3", text: "VIP Discord Community Access", votes: 0 }
+        ],
+        totalVotes: 0
+    },
     version: 1,
     updatedAt: new Date().toISOString()
 };
 
 let cachedFeaturesNotice = null;
 let featuresNoticeLastLoaded = 0;
+const pollVotersCache = new Map();
 
 async function loadFeaturesNoticeFromFirestore(force = false) {
     const now = Date.now();
@@ -829,6 +844,17 @@ async function loadFeaturesNoticeFromFirestore(force = false) {
                 cachedFeaturesNotice = { ...DEFAULT_FEATURES_NOTICE, ...data };
                 if (Array.isArray(data.items)) {
                     cachedFeaturesNotice.items = data.items;
+                }
+                if (data.poll) {
+                    cachedFeaturesNotice.poll = {
+                        ...DEFAULT_FEATURES_NOTICE.poll,
+                        ...data.poll,
+                        options: Array.isArray(data.poll.options) ? data.poll.options : DEFAULT_FEATURES_NOTICE.poll.options
+                    };
+                }
+                // Determine displayMode if missing
+                if (!cachedFeaturesNotice.displayMode) {
+                    cachedFeaturesNotice.displayMode = cachedFeaturesNotice.poll?.enabled ? 'poll' : 'features';
                 }
                 featuresNoticeLastLoaded = now;
                 return cachedFeaturesNotice;
@@ -979,7 +1005,9 @@ const WORKINK_MIN_COMPLETE_SECS = parseInt(process.env.WORKINK_MIN_COMPLETE_SECS
 const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || 'https://nmc-key.vercel.app';
 
 // Middleware
-app.use(cors());
+// Cache successful CORS preflights so periodic JSON heartbeats do not need a
+// separate OPTIONS request every time. Express still answers OPTIONS itself.
+app.use(cors({ maxAge: 3600 }));
 app.use(express.json({ limit: '10kb' })); // Limit body size to prevent abuse
 
 // 🔒 Security headers
@@ -4087,7 +4115,27 @@ app.get('/api/roblox-avatar', async (req, res) => {
 app.get('/api/features-notice', async (req, res) => {
     try {
         const notice = await loadFeaturesNoticeFromFirestore(false);
-        res.json(notice || DEFAULT_FEATURES_NOTICE);
+        const copy = JSON.parse(JSON.stringify(notice || DEFAULT_FEATURES_NOTICE));
+        if (copy.poll && copy.poll.enabled) {
+            try {
+                const voterIp = normalizeIp(getClientIp(req));
+                const verifiedUser = await verifyUserToken(req, false).catch(() => null);
+                const voterKey = verifiedUser?.uid || ('ip_' + crypto.createHash('sha256').update(voterIp).digest('hex').slice(0, 20));
+                if (pollVotersCache.has(voterKey)) {
+                    copy.poll.userVotedOption = pollVotersCache.get(voterKey);
+                } else if (rtdb) {
+                    const snap = await rtdb.ref(`featuresNotice/poll/voters/${voterKey}`).once('value').catch(() => null);
+                    if (snap && snap.exists()) {
+                        const votedOpt = snap.val()?.optionId;
+                        if (votedOpt) {
+                            pollVotersCache.set(voterKey, votedOpt);
+                            copy.poll.userVotedOption = votedOpt;
+                        }
+                    }
+                }
+            } catch (e) {}
+        }
+        res.json(copy);
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -4103,18 +4151,44 @@ app.get('/api/admin/features-notice', verifyAdmin, async (req, res) => {
     }
 });
 
-// Admin: Save / Publish features notice configuration
+// Admin: Save / Publish features notice configuration (including poll)
 app.post('/api/admin/features-notice', verifyAdmin, async (req, res) => {
     try {
-        const { title, badge, subtitle, items, active } = req.body || {};
+        const { title, badge, subtitle, items, active, poll, displayMode, resetPollVotes } = req.body || {};
         const current = await loadFeaturesNoticeFromFirestore(false);
+        const effectiveMode = displayMode || (poll?.enabled ? 'poll' : (current.displayMode || 'features'));
+        let updatedPoll = current.poll || DEFAULT_FEATURES_NOTICE.poll;
+        if (poll !== undefined) {
+            updatedPoll = {
+                ...DEFAULT_FEATURES_NOTICE.poll,
+                ...(current.poll || {}),
+                ...poll,
+                enabled: effectiveMode === 'poll',
+                options: Array.isArray(poll.options) ? poll.options : (current.poll?.options || DEFAULT_FEATURES_NOTICE.poll.options)
+            };
+            if (resetPollVotes) {
+                updatedPoll.totalVotes = 0;
+                updatedPoll.options = updatedPoll.options.map(opt => ({ ...opt, votes: 0 }));
+                pollVotersCache.clear();
+                if (rtdb) {
+                    try { await rtdb.ref('featuresNotice/poll/voters').remove(); } catch (e) {}
+                }
+            }
+        } else {
+            updatedPoll = {
+                ...updatedPoll,
+                enabled: effectiveMode === 'poll'
+            };
+        }
         const updated = {
             ...current,
+            displayMode: effectiveMode,
             title: title !== undefined ? String(title).trim() : current.title,
             badge: badge !== undefined ? String(badge).trim() : current.badge,
             subtitle: subtitle !== undefined ? String(subtitle).trim() : current.subtitle,
             items: Array.isArray(items) ? items : current.items,
             active: active !== undefined ? !!active : current.active,
+            poll: updatedPoll,
             version: (parseInt(current.version, 10) || 0) + 1,
             updatedAt: new Date().toISOString()
         };
@@ -4131,6 +4205,64 @@ app.post('/api/admin/features-notice', verifyAdmin, async (req, res) => {
         res.json({ success: true, notice: updated });
     } catch (e) {
         res.status(500).json({ error: e.message });
+    }
+});
+
+// Public: Submit vote on community poll (Single vote per user)
+app.post('/api/features-notice/vote', async (req, res) => {
+    try {
+        const { optionId } = req.body || {};
+        if (!optionId) return res.status(400).json({ success: false, error: 'Option ID is required.' });
+        const notice = await loadFeaturesNoticeFromFirestore(false);
+        const isPollActive = notice && notice.poll && (notice.poll.enabled || notice.displayMode === 'poll');
+        if (!isPollActive) {
+            return res.status(400).json({ success: false, error: 'No active poll is currently open.' });
+        }
+        const voterIp = normalizeIp(getClientIp(req));
+        const verifiedUser = await verifyUserToken(req, false).catch(() => null);
+        const voterKey = verifiedUser?.uid || ('ip_' + crypto.createHash('sha256').update(voterIp).digest('hex').slice(0, 20));
+
+        if (pollVotersCache.has(voterKey)) {
+            return res.status(400).json({ success: false, error: 'You have already voted in this poll.', userVotedOption: pollVotersCache.get(voterKey) });
+        }
+
+        if (rtdb) {
+            try {
+                const snap = await rtdb.ref(`featuresNotice/poll/voters/${voterKey}`).once('value');
+                if (snap.exists()) {
+                    const votedOpt = snap.val()?.optionId || true;
+                    pollVotersCache.set(voterKey, votedOpt);
+                    return res.status(400).json({ success: false, error: 'You have already voted in this poll.', userVotedOption: votedOpt });
+                }
+            } catch (err) {}
+        }
+
+        const poll = notice.poll;
+        const opt = (poll.options || []).find(o => o.id === optionId);
+        if (!opt) return res.status(400).json({ success: false, error: 'Option not found in poll.' });
+
+        opt.votes = (opt.votes || 0) + 1;
+        poll.totalVotes = (poll.totalVotes || 0) + 1;
+        pollVotersCache.set(voterKey, optionId);
+        cachedFeaturesNotice = notice;
+
+        if (rtdb) {
+            try {
+                await rtdb.ref('featuresNotice/poll').update({
+                    options: poll.options,
+                    totalVotes: poll.totalVotes
+                });
+                await rtdb.ref(`featuresNotice/poll/voters/${voterKey}`).set({
+                    optionId,
+                    votedAt: Date.now()
+                });
+            } catch (err) {
+                console.warn("RTDB vote update warning:", err.message);
+            }
+        }
+        res.json({ success: true, poll, userVotedOption: optionId });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
     }
 });
 
@@ -4296,7 +4428,7 @@ app.get('/api/admin/support', verifyAdmin, rateLimit('admin'), async (req, res) 
         const snap = await db.collection('supportRequests').get();
         const requests = [];
         snap.forEach(docSnap => {
-            requests.push(docSnap.data());
+            requests.push({ id: docSnap.id, ...docSnap.data() });
         });
         requests.sort((a, b) => (Number(b.pinned) - Number(a.pinned)) || ((b.createdAt || 0) - (a.createdAt || 0)));
         res.json({ requests });
@@ -4421,6 +4553,163 @@ app.delete('/api/admin/support', verifyAdmin, rateLimit('admin'), async (req, re
         invalidateSupportMine();
         res.json({ success: true, deleted: count });
     } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: Reply to a bug report or suggestion
+app.post('/api/admin/support/:id/reply', verifyAdmin, rateLimit('admin'), async (req, res) => {
+    try {
+        const supportId = req.params.id;
+        const { username, message } = req.body || {};
+        const cleanUser = String(username || '').trim();
+        const cleanMsg = String(message || '').trim();
+
+        if (!cleanUser) {
+            return res.status(400).json({ success: false, error: 'Roblox Username is required for reply profile.' });
+        }
+        if (!cleanMsg) {
+            return res.status(400).json({ success: false, error: 'Reply message cannot be empty.' });
+        }
+        if (!db) return res.status(503).json({ success: false, error: 'Firestore database not connected.' });
+
+        let docRef = db.collection('supportRequests').doc(supportId);
+        let docSnap = await docRef.get();
+        if (!docSnap.exists) {
+            const qSnap = await db.collection('supportRequests').where('id', '==', supportId).limit(1).get();
+            if (!qSnap.empty) {
+                docSnap = qSnap.docs[0];
+                docRef = docSnap.ref;
+            }
+        }
+        if (!docSnap || !docSnap.exists) return res.status(404).json({ success: false, error: 'Support request not found.' });
+
+        const data = docSnap.data() || {};
+        const isBug = data.type === 'bug';
+        const replyTitle = isBug ? 'Bug Replay' : 'Suggestion Replay';
+
+        const replyObj = {
+            title: replyTitle,
+            username: cleanUser,
+            message: cleanMsg,
+            repliedAt: Date.now()
+        };
+
+        const updates = {
+            reply: replyObj,
+            replied: true,
+            replyAt: Date.now()
+        };
+        await docRef.update(updates);
+
+        if (rtdb) {
+            try {
+                await rtdb.ref(`support_replies/${supportId}`).set({
+                    supportId,
+                    userId: data.userId || '',
+                    googleUid: data.googleUid || '',
+                    email: data.email || '',
+                    type: data.type || (isBug ? 'bug' : 'suggestion'),
+                    ...replyObj
+                });
+            } catch (err) {
+                console.warn('RTDB support reply save warning:', err.message);
+            }
+        }
+
+        invalidateSupportMine();
+        res.json({ success: true, reply: replyObj });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// Public: Get support replies for current user (via Auth, IP hash, submitted IDs, or username)
+app.get('/api/support/my-replies', async (req, res) => {
+    try {
+        const verifiedUser = await verifyUserToken(req, false).catch(() => null);
+        const userId = verifiedUser?.uid || ('guest_' + crypto.createHash('sha256').update(normalizeIp(getClientIp(req))).digest('hex'));
+        const googleEmail = verifiedUser?.email_verified && verifiedUser.email && verifiedUser.firebase?.sign_in_provider !== 'anonymous' ? verifiedUser.email.trim().toLowerCase() : '';
+        const submittedIds = req.query.ids ? String(req.query.ids).split(',').map(s => s.trim()).filter(Boolean) : [];
+        const queryUsername = req.query.username ? String(req.query.username).trim().toLowerCase() : '';
+
+        const repliesMap = new Map();
+
+        // 1. Check RTDB for immediate replies if available
+        if (rtdb) {
+            try {
+                const rSnap = await rtdb.ref('support_replies').once('value');
+                if (rSnap.exists()) {
+                    const val = rSnap.val() || {};
+                    Object.entries(val).forEach(([k, item]) => {
+                        if (!item) return;
+                        const sId = item.supportId || k;
+                        const matchesId = submittedIds.includes(sId) || submittedIds.includes(k);
+                        const matchesUser = (item.userId && item.userId === userId) || (item.googleUid && verifiedUser?.uid && item.googleUid === verifiedUser.uid);
+                        const matchesEmail = googleEmail && item.email && item.email.toLowerCase() === googleEmail;
+                        const matchesUserQuery = queryUsername && item.username && item.username.toLowerCase() === queryUsername;
+
+                        if (matchesId || matchesUser || matchesEmail || matchesUserQuery) {
+                            repliesMap.set(sId, {
+                                id: sId,
+                                type: item.type || 'bug',
+                                title: item.title,
+                                username: item.username,
+                                message: item.message,
+                                repliedAt: item.repliedAt,
+                                repliedBy: item.repliedBy
+                            });
+                        }
+                    });
+                }
+            } catch (err) {}
+        }
+
+        // 2. Query Firestore if available
+        if (db) {
+            const snaps = await Promise.all([
+                db.collection('supportRequests').where('userId', '==', userId).get(),
+                ...(googleEmail ? [db.collection('supportRequests').where('email', '==', googleEmail).get()] : [])
+            ]);
+
+            snaps.forEach(snap => snap.forEach(docSnap => {
+                const d = docSnap.data();
+                if (d && d.reply) {
+                    repliesMap.set(docSnap.id, { id: docSnap.id, type: d.type, ...d.reply });
+                }
+            }));
+
+            if (submittedIds.length) {
+                for (const sId of submittedIds.slice(0, 15)) {
+                    if (!repliesMap.has(sId)) {
+                        try {
+                            const sDoc = await db.collection('supportRequests').doc(sId).get();
+                            if (sDoc.exists) {
+                                const d = sDoc.data();
+                                if (d && d.reply) {
+                                    repliesMap.set(sId, { id: sId, type: d.type, ...d.reply });
+                                }
+                            }
+                        } catch (e) {}
+                    }
+                }
+            }
+
+            if (queryUsername) {
+                try {
+                    const uSnap = await db.collection('supportRequests').where('reply.username', '==', queryUsername).get();
+                    uSnap.forEach(docSnap => {
+                        const d = docSnap.data();
+                        if (d && d.reply) {
+                            repliesMap.set(docSnap.id, { id: docSnap.id, type: d.type, ...d.reply });
+                        }
+                    });
+                } catch (e) {}
+            }
+        }
+
+        res.json({ replies: [...repliesMap.values()] });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
 });
 
 // Background Auto-Purge job: runs every 6 hours to clean expired keys > 2 days (48h) (RTDB + Firestore)
