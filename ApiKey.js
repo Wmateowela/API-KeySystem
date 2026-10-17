@@ -31,6 +31,7 @@ const NEGATIVE_CACHE_TTL_MS = 30 * 1000;  // 30-second TTL: prevents DB spam wit
 const onlineUsers = new Map();          // userId -> lastSeen (ms)
 const presenceSessions = new Map();     // session/node id -> canonical live visitor record
 const authHandoffs = new Map();         // one-time token -> verified Google/key session
+const keyEventClients = new Map();       // hashed key channel -> Set<SSE response>
 
 let announcementsLastLoaded = 0;
 let announcementsRevision = Date.now();
@@ -369,6 +370,80 @@ async function recordDailyGoogleLogin({ email, displayName, photoURL, googleUid,
 // ============================================================
 // STORAGE HELPERS (RAM + RTDB + FIRESTORE DUAL-STORE)
 // ============================================================
+function keyActionChannel(key) {
+    const cleanKey = String(key || '').trim().toUpperCase();
+    return cleanKey ? crypto.createHash('sha256').update(`key-action:${cleanKey}`).digest('hex') : '';
+}
+
+function keyActionPayload(action, reason = '', banUntil = 0) {
+    return {
+        action,
+        reason: String(reason || '').slice(0, 300),
+        banUntil: Number(banUntil || 0),
+        issuedAt: Date.now()
+    };
+}
+
+function broadcastKeyAction(key, payload) {
+    const channel = keyActionChannel(key);
+    const clients = keyEventClients.get(channel);
+    if (!clients || !clients.size) return;
+    const frame = `event: key-action\ndata: ${JSON.stringify(payload)}\n\n`;
+    for (const response of [...clients]) {
+        try { response.write(frame); } catch (e) { clients.delete(response); }
+    }
+    if (!clients.size) keyEventClients.delete(channel);
+}
+
+function collectPresenceRemovalUpdates(keys) {
+    const targets = new Set((Array.isArray(keys) ? keys : [keys]).map(key => String(key || '').trim().toUpperCase()).filter(Boolean));
+    const updates = {};
+    for (const [nodeId, record] of presenceSessions.entries()) {
+        if (!targets.has(String(record?.key || '').trim().toUpperCase())) continue;
+        if (nodeId.startsWith('rtdb:')) updates[`presence/${nodeId.slice(5)}`] = null;
+        if (nodeId.startsWith('server:')) updates[`serverPresence/${nodeId.slice(7)}`] = null;
+        if (nodeId.startsWith('api:')) updates[`serverPresence/${crypto.createHash('sha256').update(nodeId.slice(4)).digest('hex')}`] = null;
+    }
+    return updates;
+}
+
+function forgetKeyPresence(keys) {
+    const targets = new Set((Array.isArray(keys) ? keys : [keys]).map(key => String(key || '').trim().toUpperCase()).filter(Boolean));
+    for (const [nodeId, record] of presenceSessions.entries()) {
+        if (targets.has(String(record?.key || '').trim().toUpperCase())) presenceSessions.delete(nodeId);
+    }
+    for (const target of targets) onlineUsers.delete(`key:${target}`);
+}
+
+async function publishKeyAction(key, action, reason = '', banUntil = 0) {
+    const channel = keyActionChannel(key);
+    if (!channel) return;
+    const payload = keyActionPayload(action, reason, banUntil);
+    // SSE is the immediate path and performs zero Firebase reads. RTDB below is
+    // only a tiny persistent fallback record for older clients.
+    broadcastKeyAction(key, payload);
+    if (!rtdb) {
+        forgetKeyPresence(key);
+        return;
+    }
+    try {
+        const updates = {
+            [`key_actions/${channel}`]: payload,
+            ...collectPresenceRemovalUpdates(key)
+        };
+        await rtdb.ref().update(updates);
+        forgetKeyPresence(key);
+    } catch (e) {
+        console.warn(`[RTDB] Failed to publish ${action} action for key:`, e.message);
+    }
+}
+
+async function clearKeyAction(key) {
+    const channel = keyActionChannel(key);
+    if (!rtdb || !channel) return;
+    await rtdb.ref(`key_actions/${channel}`).remove().catch(() => {});
+}
+
 async function saveKeyToStorage(key, keyData) {
     const cleanKey = (key || '').toUpperCase();
     if (!cleanKey) return;
@@ -382,7 +457,10 @@ async function saveKeyToStorage(key, keyData) {
     // 2. Realtime Database (Primary persistent store, unlimited reads)
     if (rtdb) {
         try {
-            await rtdb.ref(`keys/${cleanKey}`).set(keyData);
+            await rtdb.ref().update({
+                [`keys/${cleanKey}`]: keyData,
+                [`key_actions/${keyActionChannel(cleanKey)}`]: null
+            });
         } catch (rtdbErr) {
             console.warn(`[RTDB] Failed to save key ${cleanKey}:`, rtdbErr.message);
         }
@@ -437,10 +515,14 @@ async function updateKeyInStorage(key, updates, options = {}) {
 
 }
 
-async function deleteKeyFromStorage(key) {
+async function deleteKeyFromStorage(key, reason = 'This access key was deleted by an administrator.') {
     const cleanKey = (key || '').toUpperCase();
     if (!cleanKey) return;
     bumpDashboardRevision();
+
+    // Notify every browser using this key and remove its online presence before
+    // deleting the key record itself.
+    await publishKeyAction(cleanKey, 'deleted', reason, 0);
 
     // 1. RAM Cache
     memoryKeys.delete(cleanKey);
@@ -1213,8 +1295,10 @@ async function restoreKey(key) {
         supersededReason: null,
         banReason: null,
         bannedBy: null,
-        bannedAt: null
+        bannedAt: null,
+        banUntil: null
     });
+    await clearKeyAction(key);
 }
 
 // Release every key that an older build auto-suspended simply because a longer
@@ -1420,8 +1504,38 @@ app.get('/api/check-ban', async (req, res) => {
     res.json({ banned: false });
 });
 
+// Lightweight real-time invalidation stream. The browser sends only a salted
+// SHA-256 channel, never the raw access key. Connections live in RAM and cause
+// no Firestore/RTDB reads.
+app.get('/api/key-events', (req, res) => {
+    const channel = String(req.query.channel || '').trim().toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(channel)) return res.status(400).json({ error: 'Invalid key event channel.' });
+    const clients = keyEventClients.get(channel) || new Set();
+    if (clients.size >= 50) return res.status(429).json({ error: 'Too many listeners for this key.' });
+
+    res.set({
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache, no-transform',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no'
+    });
+    res.flushHeaders?.();
+    res.write('retry: 5000\nevent: ready\ndata: {}\n\n');
+    clients.add(res);
+    keyEventClients.set(channel, clients);
+
+    const keepAlive = setInterval(() => {
+        try { res.write(': keepalive\n\n'); } catch (e) {}
+    }, 25000);
+    req.on('close', () => {
+        clearInterval(keepAlive);
+        clients.delete(res);
+        if (!clients.size) keyEventClients.delete(channel);
+    });
+});
+
 // Heartbeat: frontend pings this to appear "online" (real tracking for all visitors)
-app.post('/api/heartbeat', rateLimit('verify'), (req, res) => {
+app.post('/api/heartbeat', rateLimit('verify'), async (req, res) => {
     let { userId, key, email, displayName, googleUid, authProvider, sessionId, visitorId, offline } = req.body || {};
     const ip = getClientIp(req);
     if (!userId || typeof userId !== 'string' || !/^[a-zA-Z0-9_.:-]+$/.test(userId)) {
@@ -1430,8 +1544,39 @@ app.post('/api/heartbeat', rateLimit('verify'), (req, res) => {
     const sessionKey = String(sessionId || visitorId || userId || `ip:${normalizeIp(ip)}`).slice(0, 180);
     if (offline === true) {
         presenceSessions.delete(`api:${sessionKey}`);
+        bumpDashboardRevision();
         if (rtdb) rtdb.ref('serverPresence/' + crypto.createHash('sha256').update(sessionKey).digest('hex')).remove().catch(() => {});
         return res.json({ success: true, offline: true });
+    }
+    if (key) {
+        const cleanKey = String(key).trim().toUpperCase();
+        const wasOnline = isKeyOnline(cleanKey);
+        let keyData = memoryKeys.get(cleanKey) || await getKeyFromStorage(cleanKey);
+        if (!keyData) {
+            forgetKeyPresence(cleanKey);
+            return res.status(403).json({ success: false, valid: false, deleted: true, error: 'This access key was deleted.' });
+        }
+        if (keyData.revoked && Number(keyData.banUntil || 0) > 0 && Number(keyData.banUntil) <= Date.now()) {
+            await restoreKey(cleanKey);
+            keyData = memoryKeys.get(cleanKey) || keyData;
+        }
+        if (isKeyBlocked(keyData) || keyData.banned) {
+            const described = describeKeyBan(keyData);
+            forgetKeyPresence(cleanKey);
+            return res.status(403).json({
+                success: false,
+                valid: false,
+                banned: true,
+                reason: described.reason || keyData.banReason || 'Key banned by admin',
+                banUntil: Number(keyData.banUntil || 0),
+                error: 'This key has been banned.'
+            });
+        }
+        if (keyData.expiresAt > 0 && keyData.expiresAt <= Date.now()) {
+            forgetKeyPresence(cleanKey);
+            return res.status(403).json({ success: false, valid: false, expired: true, error: 'This key has expired.' });
+        }
+        if (!wasOnline) bumpDashboardRevision();
     }
     const googleInfo = (email || displayName || googleUid) ? {
         email: email || '',
@@ -2758,9 +2903,21 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
             return res.status(404).json({ valid: false, error: "Key not found. Please verify you entered it correctly." });
         }
 
+        if (keyData.revoked && Number(keyData.banUntil || 0) > 0 && Number(keyData.banUntil) <= Date.now()) {
+            await restoreKey(cleanKey);
+            keyData = memoryKeys.get(cleanKey) || keyData;
+        }
+
         // Check if revoked
         if (isKeyBlocked(keyData)) {
-            return res.status(403).json({ valid: false, error: "This key has been revoked." });
+            const described = describeKeyBan(keyData);
+            return res.status(403).json({
+                valid: false,
+                banned: true,
+                reason: described.reason || keyData.banReason || 'Key banned by admin',
+                banUntil: Number(keyData.banUntil || 0),
+                error: 'This key has been banned.'
+            });
         }
         if (verifiedUser?.email && (keyData.excludedEmails || []).some(value => String(value).toLowerCase() === String(verifiedUser.email).toLowerCase())) {
             return res.status(403).json({ valid: false, error: 'This account has been moved to a different key.' });
@@ -3481,7 +3638,9 @@ app.get('/api/admin/dashboard-snapshot', verifyAdmin, rateLimit('admin'), async 
     try {
         const clientETag = req.headers['if-none-match'];
         const clientRev = req.query.revision;
-        const currentRevStr = String(dashboardRevision);
+        // Presence is held in RAM, so a short time bucket refreshes online/offline
+        // status without a single Firebase read even when no key record changed.
+        const currentRevStr = `${dashboardRevision}-${Math.floor(Date.now() / 10000)}`;
         if (clientETag === `"${currentRevStr}"` || clientRev === currentRevStr) {
             return res.status(304).end();
         }
@@ -3663,7 +3822,9 @@ app.post('/api/admin/revoke-key/:key', verifyAdmin, rateLimit('admin'), async (r
         let data = await getKeyFromStorage(key);
         if (!data) return res.status(404).json({ error: 'Key not found' });
 
-        await updateKeyInStorage(key, { revoked: true, revokedAt: Date.now(), banReason: 'Key revoked by admin', bannedBy: req.adminEmail || 'admin', bannedAt: Date.now() });
+        const reason = 'Key revoked by admin';
+        await updateKeyInStorage(key, { revoked: true, revokedAt: Date.now(), banReason: reason, bannedBy: req.adminEmail || 'admin', bannedAt: Date.now() });
+        await publishKeyAction(key, 'banned', reason, 0);
         res.json({ success: true });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -3701,21 +3862,25 @@ app.post('/api/admin/ban-key/:key', verifyAdmin, rateLimit('admin'), async (req,
         if (!data) return res.status(404).json({ error: 'Key not found' });
 
         const banReason = reason || 'Key banned by admin';
+        const cleanDurationMs = Math.max(0, parseInt(durationMs, 10) || 0);
+        const banUntil = cleanDurationMs > 0 ? Date.now() + cleanDurationMs : 0;
         // Revoke the key across RAM + RTDB + Firestore
         await updateKeyInStorage(key, {
             revoked: true,
             revokedAt: Date.now(),
             banReason,
             bannedBy: req.adminEmail || 'admin',
-            bannedAt: Date.now()
+            bannedAt: Date.now(),
+            banUntil
         });
 
         // Ban the IP if available
         const banIp = data.ip && data.ip !== '-' ? data.ip : null;
         let ban = null;
         if (banIp) {
-            ban = await saveBan(banIp, parseInt(durationMs, 10) || 0, banReason, req.adminEmail);
+            ban = await saveBan(banIp, cleanDurationMs, banReason, req.adminEmail);
         }
+        await publishKeyAction(key, 'banned', banReason, ban?.banUntil || banUntil);
         res.json({ success: true, bannedIp: banIp, ban });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -3899,6 +4064,50 @@ app.post('/api/admin/purge-expired', verifyAdmin, async (req, res) => {
         res.json({ success: true, deleted: deletedCount, force });
     } catch (e) {
         res.status(500).json({ error: e.message });
+    }
+});
+
+// Preview or delete active timed keys that are close to expiry. This never
+// touches lifetime, expired, revoked or banned keys.
+app.post('/api/admin/keys/short-expiry', verifyAdmin, rateLimit('admin'), async (req, res) => {
+    try {
+        const minutes = Number(req.body?.minutes);
+        const action = req.body?.action === 'delete' ? 'delete' : 'preview';
+        if (!Number.isInteger(minutes) || minutes < 1 || minutes > 525600) {
+            return res.status(400).json({ success: false, error: 'Minutes must be a whole number between 1 and 525600.' });
+        }
+
+        const now = Date.now();
+        const cutoff = now + (minutes * 60000);
+        const keys = [];
+        for (const [key, data] of memoryKeys.entries()) {
+            const expiresAt = Number(data?.expiresAt || 0);
+            if (!expiresAt || expiresAt <= now || expiresAt > cutoff) continue;
+            if (data.revoked || data.banned || isKeyBlocked(data)) continue;
+            keys.push(key);
+        }
+
+        if (action === 'preview') {
+            return res.json({ success: true, count: keys.length, minutes });
+        }
+        if (!rtdb) return res.status(503).json({ success: false, error: 'Persistent key storage is unavailable.' });
+
+        if (keys.length) {
+            const updates = { ...collectPresenceRemovalUpdates(keys) };
+            keys.forEach(key => {
+                updates[`keys/${key}`] = null;
+                const payload = keyActionPayload('deleted', 'This access key was deleted by an administrator.', 0);
+                updates[`key_actions/${keyActionChannel(key)}`] = payload;
+                broadcastKeyAction(key, payload);
+            });
+            await rtdb.ref().update(updates);
+            keys.forEach(key => memoryKeys.delete(key));
+            forgetKeyPresence(keys);
+            bumpDashboardRevision();
+        }
+        res.json({ success: true, deleted: keys.length, minutes });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
     }
 });
 
@@ -4301,6 +4510,43 @@ function todayKey() {
     return new Date().toISOString().slice(0, 10);
 }
 
+// Support replies are routed to the access key that created the report. Only
+// this one-way channel is persisted; the user's raw site key is never stored in
+// a support document or RTDB reply.
+function supportKeyChannel(key) {
+    const cleanKey = String(key || '').trim().toUpperCase();
+    return cleanKey ? crypto.createHash('sha256').update(`support-reply:${cleanKey}`).digest('hex') : '';
+}
+
+function isUsableSupportKey(keyData) {
+    if (!keyData || isKeyBlocked(keyData)) return false;
+    return !keyData.expiresAt || Number(keyData.expiresAt) <= 0 || Number(keyData.expiresAt) > Date.now();
+}
+
+// Reports created before key-channel routing did not record their key. Resolve
+// the best active key belonging to that identity once, then persist the channel
+// so every later "Reply Again" goes to the same key.
+function resolveLegacySupportKeyChannel(report) {
+    const userId = String(report?.userId || report?.googleUid || '').trim();
+    const email = String(report?.email || '').trim().toLowerCase();
+    const matches = [];
+    for (const [key, keyData] of memoryKeys.entries()) {
+        if (!isUsableSupportKey(keyData)) continue;
+        const usedBy = Array.isArray(keyData.usedBy) ? keyData.usedBy.map(value => String(value)) : [];
+        const members = getKeyAccountUsers(keyData);
+        const identityMatch =
+            (userId && (keyData.userId === userId || keyData.googleUid === userId || usedBy.includes(userId))) ||
+            (email && (
+                String(keyData.googleEmail || keyData.boundEmail || '').toLowerCase() === email ||
+                usedBy.includes(`email:${email}`) ||
+                members.some(member => member.uid === userId || String(member.email || '').toLowerCase() === email)
+            ));
+        if (identityMatch) matches.push({ key, lastSeen: Number(keyData.lastSeen || keyData.updatedAt || keyData.createdAt || 0) });
+    }
+    matches.sort((a, b) => b.lastSeen - a.lastSeen);
+    return matches.length ? supportKeyChannel(matches[0].key) : '';
+}
+
 // Firestore free tier: /api/support/mine is polled by every open tab and used
 // to cost 1–3 queries per call. Memoise the merged answer per identity for a
 // minute, and drop it as soon as a report is submitted or an admin touches one.
@@ -4315,7 +4561,7 @@ function rememberSupportMine(cacheKey, value) {
 // Public: submit a bug report or feature suggestion (stored 100% in Firestore only)
 app.post('/api/support/submit', rateLimit('claim'), async (req, res) => {
     try {
-        let { userId, type, message, email } = req.body || {};
+        let { userId, type, message, email, accessKey } = req.body || {};
         const kind = (type === 'suggestion') ? 'suggestion' : 'bug';
         const verifiedUser = await verifyUserToken(req, false);
         const googleUser = verifiedUser && verifiedUser.email_verified && verifiedUser.email && verifiedUser.firebase?.sign_in_provider !== 'anonymous';
@@ -4330,6 +4576,15 @@ app.post('/api/support/submit', rateLimit('claim'), async (req, res) => {
             return res.status(400).json({ success: false, error: 'Message must be between 5 and 2000 characters.' });
         }
         const emailClean = email ? String(email).trim().toLowerCase().slice(0, 160) : '';
+        const cleanAccessKey = String(accessKey || '').trim().toUpperCase();
+        if (!cleanAccessKey || cleanAccessKey.length > 64 || !/^[A-Z0-9-]+$/.test(cleanAccessKey)) {
+            return res.status(401).json({ success: false, error: 'Your access key session is missing. Please unlock the site again.' });
+        }
+        const supportAccessKey = await getKeyFromStorage(cleanAccessKey);
+        if (!isUsableSupportKey(supportAccessKey)) {
+            return res.status(403).json({ success: false, error: 'Your access key is expired or unavailable. Please unlock the site again.' });
+        }
+        const keyChannel = supportKeyChannel(cleanAccessKey);
         const day = todayKey();
         const norm = text.toLowerCase().replace(/\s+/g, ' ');
 
@@ -4343,6 +4598,7 @@ app.post('/api/support/submit', rateLimit('claim'), async (req, res) => {
             normalizedMessage: norm,
             email: emailClean,
             googleUid: googleUser ? verifiedUser.uid : null,
+            supportKeyChannel: keyChannel,
             authProvider: googleUser ? 'google' : 'anonymous',
             status: 'pending',
             unique: true,
@@ -4355,7 +4611,8 @@ app.post('/api/support/submit', rateLimit('claim'), async (req, res) => {
 
         // 100% Firestore store for support reports/suggestions
         if (!db) return res.status(503).json({ error: 'Support storage is unavailable. Please try again.' });
-        const quotaIdentity = googleUser ? String(verifiedUser.email).toLowerCase() : normalizeIp(getClientIp(req));
+        // The same login key/device can submit once per rolling 24 hours.
+        const quotaIdentity = `access-key:${keyChannel}`;
         const accepted = await saveDailySubmission(db, quotaIdentity, doc);
         if (!accepted) return res.status(429).json({ error: 'You can send one bug report or suggestion every 24 hours.' });
         invalidateSupportMine();
@@ -4532,6 +4789,7 @@ app.delete('/api/admin/support/:id', verifyAdmin, rateLimit('admin'), async (req
     try {
         if (!db) return res.status(503).json({ error: 'Firestore database not connected.' });
         await db.collection('supportRequests').doc(req.params.id).delete();
+        if (rtdb) await rtdb.ref(`support_replies/${req.params.id}`).remove().catch(() => {});
         invalidateSupportMine();
         res.json({ success: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -4544,12 +4802,12 @@ app.delete('/api/admin/support', verifyAdmin, rateLimit('admin'), async (req, re
         let batch = db.batch();
         let count = 0;
         for (const docSnap of snap.docs) {
-            if (docSnap.data() && docSnap.data().pinned) continue;
             batch.delete(docSnap.ref);
             count++;
             if (count % 400 === 0) { await batch.commit(); batch = db.batch(); }
         }
         if (count % 400 !== 0) await batch.commit();
+        if (rtdb) await rtdb.ref('support_replies').remove().catch(() => {});
         invalidateSupportMine();
         res.json({ success: true, deleted: count });
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -4585,19 +4843,25 @@ app.post('/api/admin/support/:id/reply', verifyAdmin, rateLimit('admin'), async 
         const data = docSnap.data() || {};
         const isBug = data.type === 'bug';
         const replyTitle = isBug ? 'Bug Replay' : 'Suggestion Replay';
+        const replyVersion = Math.max(0, Number(data.replyVersion || data.reply?.replyVersion || 0)) + 1;
+        const keyChannel = String(data.supportKeyChannel || '').trim() || resolveLegacySupportKeyChannel(data);
 
         const replyObj = {
             title: replyTitle,
             username: cleanUser,
             message: cleanMsg,
-            repliedAt: Date.now()
+            repliedAt: Date.now(),
+            replyVersion
         };
 
         const updates = {
             reply: replyObj,
             replied: true,
-            replyAt: Date.now()
+            replyAt: replyObj.repliedAt,
+            replyVersion,
+            replyCount: replyVersion
         };
+        if (keyChannel && !data.supportKeyChannel) updates.supportKeyChannel = keyChannel;
         await docRef.update(updates);
 
         if (rtdb) {
@@ -4607,6 +4871,7 @@ app.post('/api/admin/support/:id/reply', verifyAdmin, rateLimit('admin'), async 
                     userId: data.userId || '',
                     googleUid: data.googleUid || '',
                     email: data.email || '',
+                    keyChannel,
                     type: data.type || (isBug ? 'bug' : 'suggestion'),
                     ...replyObj
                 });
@@ -4622,21 +4887,26 @@ app.post('/api/admin/support/:id/reply', verifyAdmin, rateLimit('admin'), async 
     }
 });
 
-// Public: Get support replies for current user (via Auth, IP hash, submitted IDs, or username)
+// Public: Get support replies for the verified identity or locally submitted IDs.
 app.get('/api/support/my-replies', async (req, res) => {
     try {
         const verifiedUser = await verifyUserToken(req, false).catch(() => null);
         const userId = verifiedUser?.uid || ('guest_' + crypto.createHash('sha256').update(normalizeIp(getClientIp(req))).digest('hex'));
         const googleEmail = verifiedUser?.email_verified && verifiedUser.email && verifiedUser.firebase?.sign_in_provider !== 'anonymous' ? verifiedUser.email.trim().toLowerCase() : '';
         const submittedIds = req.query.ids ? String(req.query.ids).split(',').map(s => s.trim()).filter(Boolean) : [];
-        const queryUsername = req.query.username ? String(req.query.username).trim().toLowerCase() : '';
+        const requestKey = String(req.get('x-access-key') || '').trim().toUpperCase();
+        const requestKeyChannel = requestKey && requestKey.length <= 64 && /^[A-Z0-9-]+$/.test(requestKey)
+            ? supportKeyChannel(requestKey)
+            : '';
 
         const repliesMap = new Map();
+        let rtdbChecked = false;
 
         // 1. Check RTDB for immediate replies if available
         if (rtdb) {
             try {
                 const rSnap = await rtdb.ref('support_replies').once('value');
+                rtdbChecked = true;
                 if (rSnap.exists()) {
                     const val = rSnap.val() || {};
                     Object.entries(val).forEach(([k, item]) => {
@@ -4645,9 +4915,17 @@ app.get('/api/support/my-replies', async (req, res) => {
                         const matchesId = submittedIds.includes(sId) || submittedIds.includes(k);
                         const matchesUser = (item.userId && item.userId === userId) || (item.googleUid && verifiedUser?.uid && item.googleUid === verifiedUser.uid);
                         const matchesEmail = googleEmail && item.email && item.email.toLowerCase() === googleEmail;
-                        const matchesUserQuery = queryUsername && item.username && item.username.toLowerCase() === queryUsername;
+                        // Resolve already-sent replies from before key routing
+                        // without requiring the admin to press Reply Again once
+                        // more. This is memory-only and adds no Firestore reads.
+                        const routedKeyChannel = String(item.keyChannel || '').trim() || resolveLegacySupportKeyChannel(item);
+                        const hasKeyChannel = !!routedKeyChannel;
+                        const matchesKey = !!requestKeyChannel && routedKeyChannel === requestKeyChannel;
 
-                        if (matchesId || matchesUser || matchesEmail || matchesUserQuery) {
+                        // Key-routed replies must only reach the browser using
+                        // that exact access key. Identity/ID matching remains a
+                        // compatibility fallback for old, un-routed replies.
+                        if ((hasKeyChannel && matchesKey) || (!hasKeyChannel && (matchesId || matchesUser || matchesEmail))) {
                             repliesMap.set(sId, {
                                 id: sId,
                                 type: item.type || 'bug',
@@ -4655,6 +4933,7 @@ app.get('/api/support/my-replies', async (req, res) => {
                                 username: item.username,
                                 message: item.message,
                                 repliedAt: item.repliedAt,
+                                replyVersion: item.replyVersion,
                                 repliedBy: item.repliedBy
                             });
                         }
@@ -4663,8 +4942,9 @@ app.get('/api/support/my-replies', async (req, res) => {
             } catch (err) {}
         }
 
-        // 2. Query Firestore if available
-        if (db) {
+        // 2. Firestore is only a fallback when RTDB is unavailable. Normal
+        // reply polling therefore consumes no Firestore document reads.
+        if (db && !rtdbChecked) {
             const snaps = await Promise.all([
                 db.collection('supportRequests').where('userId', '==', userId).get(),
                 ...(googleEmail ? [db.collection('supportRequests').where('email', '==', googleEmail).get()] : [])
@@ -4672,7 +4952,8 @@ app.get('/api/support/my-replies', async (req, res) => {
 
             snaps.forEach(snap => snap.forEach(docSnap => {
                 const d = docSnap.data();
-                if (d && d.reply) {
+                const hasKeyChannel = !!String(d?.supportKeyChannel || '').trim();
+                if (d && d.reply && ((!hasKeyChannel && (d.userId === userId || (googleEmail && String(d.email || '').toLowerCase() === googleEmail))) || (hasKeyChannel && d.supportKeyChannel === requestKeyChannel))) {
                     repliesMap.set(docSnap.id, { id: docSnap.id, type: d.type, ...d.reply });
                 }
             }));
@@ -4684,7 +4965,8 @@ app.get('/api/support/my-replies', async (req, res) => {
                             const sDoc = await db.collection('supportRequests').doc(sId).get();
                             if (sDoc.exists) {
                                 const d = sDoc.data();
-                                if (d && d.reply) {
+                                const hasKeyChannel = !!String(d?.supportKeyChannel || '').trim();
+                                if (d && d.reply && ((!hasKeyChannel) || (hasKeyChannel && d.supportKeyChannel === requestKeyChannel))) {
                                     repliesMap.set(sId, { id: sId, type: d.type, ...d.reply });
                                 }
                             }
@@ -4693,17 +4975,6 @@ app.get('/api/support/my-replies', async (req, res) => {
                 }
             }
 
-            if (queryUsername) {
-                try {
-                    const uSnap = await db.collection('supportRequests').where('reply.username', '==', queryUsername).get();
-                    uSnap.forEach(docSnap => {
-                        const d = docSnap.data();
-                        if (d && d.reply) {
-                            repliesMap.set(docSnap.id, { id: docSnap.id, type: d.type, ...d.reply });
-                        }
-                    });
-                } catch (e) {}
-            }
         }
 
         res.json({ replies: [...repliesMap.values()] });
