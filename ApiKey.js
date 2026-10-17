@@ -1060,7 +1060,7 @@ try {
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const API_BUILD_VERSION = '2026.10.03-stability-mobile-v19';
+const API_BUILD_VERSION = '2026.10.17-membership-persistence-v20';
 
 // Default Tokens
 const LINKVERTISE_TOKEN = process.env.LINKVERTISE_TOKEN || '05bea4d469e02f8573931ff654597345edb6092d8c418ffc588c91de1678325a';
@@ -1937,7 +1937,7 @@ app.get(['/', '/health', '/api/health'], (req, res) => {
         status: "ok",
         service: "buy-roblox-apikey-backend",
         apiBuildVersion: API_BUILD_VERSION,
-        capabilities: { authHandoff: true, accountKeySync: true },
+        capabilities: { authHandoff: true, accountKeySync: true, membershipRolePermissions: true, accountRolePersistence: true },
         timestamp: new Date().toISOString(),
         firebaseReady: !!db,
         activeKeys: memoryKeys.size

@@ -7,9 +7,9 @@ const emailOf = value => String(value || '').trim().toLowerCase();
 const defaults = {
   demoEnabled: true, demoMinutes: 20,
   roles: [
-    { id: 'basic', name: 'Basic', autoGift: false, stayAwake: false, customSettings: false },
-    { id: 'plus', name: 'Plus', autoGift: true, stayAwake: true, customSettings: true },
-    { id: 'vip', name: 'VIP', autoGift: true, stayAwake: true, customSettings: true }
+    { id: 'basic', name: 'Basic', autoGift: false, stayAwake: false, customSettings: false, hideAds: false },
+    { id: 'plus', name: 'Plus', autoGift: true, stayAwake: true, customSettings: true, hideAds: false },
+    { id: 'vip', name: 'VIP', autoGift: true, stayAwake: true, customSettings: true, hideAds: false }
   ],
   plans: [
     { id: 'free', name: 'Free', role: 'basic', price: 'Free', features: ['Store access with a valid key', 'Google profile and synced submissions', 'One Auto Gift demo'], tag: '', glow: false, url: 'https://discord.gg/6zEkP9jdM' },
@@ -28,7 +28,7 @@ function validateConfig(input) {
   const roles = input.roles.map(r => {
     if (!/^[a-z][a-z0-9_-]{0,31}$/.test(r.id) || ids.has(r.id)) throw fail('Role IDs must be unique lowercase names.');
     ids.add(r.id);
-    return { id: r.id, name: String(r.name || r.id).slice(0, 50), autoGift: !!r.autoGift, stayAwake: !!r.stayAwake, customSettings: !!r.customSettings };
+    return { id: r.id, name: String(r.name || r.id).slice(0, 50), autoGift: !!r.autoGift, stayAwake: !!r.stayAwake, customSettings: !!r.customSettings, hideAds: !!r.hideAds };
   });
   if (!ids.has('basic')) throw fail('Keep the Basic role.');
   const minutes = Number(input.demoMinutes);
@@ -45,10 +45,11 @@ function validateConfig(input) {
 function installMembership({ app, db, verifyAdmin, verifyUserToken, getKeyFromStorage, updateKeyInStorage, listKeysFromStorage = async () => [], mutateKeyInStorage = async (name, change) => { const current = await getKeyFromStorage(name); if (!current) throw fail('Key not found.', 404); const patch = change(current); await updateKeyInStorage(name, patch, { strict: true }); return { ...current, ...patch }; } }) {
   const database = () => { if (!db) throw fail('Account storage is unavailable. Please try again.', 503); return db; };
   const configRef = () => database().collection('privateMembership').doc('config');
-  async function config() {
-    if (configCache && Date.now() - configLoadedAt < CONFIG_TTL_MS) return configCache;
+  async function config(forceRefresh = false) {
+    if (!forceRefresh && configCache && Date.now() - configLoadedAt < CONFIG_TTL_MS) return configCache;
     const s = await configRef().get();
-    configCache = s.exists ? { ...defaults, ...s.data() } : structuredClone(defaults);
+    const base = s.exists ? { ...defaults, ...s.data() } : structuredClone(defaults);
+    configCache = { ...base, roles: (base.roles || []).map(role => ({ ...role, hideAds: !!role.hideAds })) };
     configLoadedAt = Date.now();
     return configCache;
   }
@@ -218,6 +219,7 @@ function installMembership({ app, db, verifyAdmin, verifyUserToken, getKeyFromSt
     const assignedKey = account?.assignedKey ? await getKeyFromStorage(account.assignedKey) : null;
     const assignedExpiry = assignedKey ? effectiveKeyExpiry(assignedKey) : 0;
     const validAssignedKey = !account?.assignedKey || (assignedKey && !assignedKey.revoked && (!assignedExpiry || assignedExpiry > now) && assignedKey.tier === account.role && isLinkedToGoogleAccount(assignedKey, user.uid, email, true));
+    const basicRole = cfg.roles.find(r => r.id === 'basic');
     let role = cfg.roles.find(r => r.id === account?.role && !['basic', 'none'].includes(r.id) && (!account.subscriptionExpiresAt || account.subscriptionExpiresAt > now) && validAssignedKey);
     let expiresAt = role ? (assignedExpiry && account.subscriptionExpiresAt ? Math.min(assignedExpiry, account.subscriptionExpiresAt) : assignedExpiry || account.subscriptionExpiresAt) : 0;
     let source = role ? 'subscription' : 'locked';
@@ -236,11 +238,12 @@ function installMembership({ app, db, verifyAdmin, verifyUserToken, getKeyFromSt
     if (!role && account && cfg.demoEnabled && account.demoEnabled !== false) {
       canStartDemo = account.demoStartedAt == null;
       if (account.demoStartedAt != null && account.demoExpiresAt > now) {
-        role = { id: 'basic', name: 'Free Demo', autoGift: true, stayAwake: true, customSettings: true };
+        role = { id: 'basic', name: 'Free Demo', autoGift: true, stayAwake: true, customSettings: true, hideAds: !!basicRole?.hideAds };
         expiresAt = account.demoExpiresAt || 0; source = 'demo';
       }
     }
-    return { serverNow: now, email, role: role?.id || 'basic', roleName: role?.name || 'Basic', source, expiresAt, canStartDemo, demoStatus, demoDisabledReason, demoMinutes: demoMinutesFor(account, cfg), permissions: { autoGift: !!role?.autoGift, stayAwake: !!role?.stayAwake, customSettings: !!role?.customSettings }, allowed: !!role?.autoGift };
+    const hideAds = !!role?.hideAds || (!!account && account.role === 'basic' && !!basicRole?.hideAds);
+    return { serverNow: now, email, role: role?.id || 'basic', roleName: role?.name || 'Basic', source, expiresAt, canStartDemo, demoStatus, demoDisabledReason, demoMinutes: demoMinutesFor(account, cfg), permissions: { autoGift: !!role?.autoGift, stayAwake: !!role?.stayAwake, customSettings: !!role?.customSettings, hideAds }, allowed: !!role?.autoGift };
   }
   app.get('/api/membership/plans', route(async (req, res) => { const c = await config(); res.json({ plans: c.plans, payments: c.payments, demoMinutes: c.demoMinutes, demoEnabled: c.demoEnabled }); }));
   app.post('/api/membership/access', route(async (req, res) => res.json(await entitlement(req, false))));
@@ -254,8 +257,37 @@ function installMembership({ app, db, verifyAdmin, verifyUserToken, getKeyFromSt
     if (!access.allowed) throw fail('Auto Gift is locked. Upgrade to unlock.', 403);
     res.json(access);
   }));
-  app.get('/api/admin/membership/config', verifyAdmin, route(async (req, res) => res.json(await config())));
-  app.put('/api/admin/membership/config', verifyAdmin, route(async (req, res) => { const value = validateConfig(req.body); await configRef().set(value); invalidateConfig(); res.json(value); }));
+  // Admin reads bypass the public access cache. This keeps the editor in sync
+  // with Firestore even when another backend instance performed the write.
+  app.get('/api/admin/membership/config', verifyAdmin, route(async (req, res) => res.json(await config(true))));
+  app.put('/api/admin/membership/config', verifyAdmin, route(async (req, res) => {
+    const value = validateConfig(req.body);
+    await configRef().set(value);
+    invalidateConfig();
+    const persisted = await config(true);
+    if (!isDeepStrictEqual(persisted, value)) {
+      throw fail('Membership roles were not saved exactly as requested. Please retry.', 503);
+    }
+    res.json(persisted);
+  }));
+  // Backward compatibility for Admin pages cached before Ads became part of
+  // the main role config. This uses the same Firestore document, so it adds no
+  // extra document reads and can be removed once old browser caches expire.
+  app.get('/api/admin/membership/ad-settings', verifyAdmin, route(async (req, res) => {
+    const cfg = await config(true);
+    res.json({ hiddenRoleIds: cfg.roles.filter(role => role.hideAds).map(role => role.id) });
+  }));
+  app.put('/api/admin/membership/ad-settings', verifyAdmin, route(async (req, res) => {
+    const cfg = await config(true);
+    const requested = Array.isArray(req.body.hiddenRoleIds) ? req.body.hiddenRoleIds.map(String) : [];
+    const knownRoleIds = new Set(cfg.roles.map(role => role.id));
+    if (requested.some(id => !knownRoleIds.has(id))) throw fail('Ads settings contain an unknown role.');
+    const hiddenRoleIds = [...new Set(requested)], hidden = new Set(hiddenRoleIds);
+    const value = validateConfig({ ...cfg, roles: cfg.roles.map(role => ({ ...role, hideAds: hidden.has(role.id) })) });
+    await configRef().set(value);
+    invalidateConfig();
+    res.json({ hiddenRoleIds });
+  }));
   app.get('/api/admin/membership/account', verifyAdmin, route(async (req, res) => {
     const email = emailOf(req.query.email);
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw fail('Enter a valid email.');
@@ -270,6 +302,7 @@ function installMembership({ app, db, verifyAdmin, verifyUserToken, getKeyFromSt
     const currentSnap = await accountRef(email).get();
     const current = currentSnap.exists ? currentSnap.data() : null;
     const updates = { email, role: req.body.role, subscriptionExpiresAt: expires, demoEnabled: req.body.demoEnabled !== false, adminManaged: true, accessUpdatedAt: Date.now(), accessOperationId: crypto.randomUUID() };
+    const matchesUpdate = data => !!data && Object.entries(updates).every(([field, value]) => isDeepStrictEqual(data[field], value));
     const previousKey = current?.assignedKey && current.role !== req.body.role ? await getKeyFromStorage(current.assignedKey) : null;
     if (current?.assignedKey && current.role !== req.body.role) updates.assignedKey = '';
     if (req.body.demoMinutesRemaining !== undefined && req.body.demoMinutesRemaining !== '') {
@@ -281,17 +314,23 @@ function installMembership({ app, db, verifyAdmin, verifyUserToken, getKeyFromSt
     try {
       if (previousKey) await journal.change(previousKey.key, fresh => isLinkedToGoogleAccount(fresh, current.uid || 'pending-admin-assignment', email, true) ? detachmentPatch(fresh, email, current.uid || '') : {});
       await accountRef(email).set(updates, { merge: true });
+      const saved = await accountRef(email).get();
+      if (!saved.exists || !matchesUpdate(saved.data())) throw fail('The account role could not be verified after saving. Please retry.', 503);
     } catch (e) {
       try {
         const check = await accountRef(email).get();
-        if (check.exists && check.data().accessOperationId === updates.accessOperationId) { invalidateAccess(email); return res.json({ success: true }); }
+        if (check.exists && check.data().accessOperationId === updates.accessOperationId && matchesUpdate(check.data())) {
+          invalidateAccess(email);
+          return res.json({ success: true, account: check.data() });
+        }
       } catch (_) {}
       const rollbackErrors = await journal.rollback();
       if (rollbackErrors.length) throw fail(`Account update failed and rollback needs review: ${rollbackErrors.join('; ')}. Original error: ${e.message}`, 503);
       throw e;
     }
     invalidateAccess(email);
-    res.json({ success: true });
+    const saved = await accountRef(email).get();
+    res.json({ success: true, account: saved.data() });
   }));
   app.get('/api/admin/membership/accounts', verifyAdmin, route(async (req, res) => {
     // This is the admin-managed subset, not every Google login. Do not cap it
