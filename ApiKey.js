@@ -11,7 +11,7 @@ const path = require('path');
 const { WINDOW_MS, countDevices } = require('./presence');
 const ONLINE_WINDOW_MS = WINDOW_MS || (120 * 1000);
 const { saveDailySubmission, latestSubmissions, removableOldSubmissionIds } = require('./support-store');
-const { isLinkedToGoogleAccount, findActiveGoogleKeys, findUsableGoogleKeys, accountKeySlot } = require('./google-key-lookup');
+const { isLinkedToGoogleAccount, findActiveGoogleKeys, findUsableGoogleKeys, accountKeySlot, effectiveAccessExpiry } = require('./google-key-lookup');
 const { mayDisconnectKeySession, mayDisconnectGuestSession } = require('./logout-authorization');
 
 let dashboardRevision = 1;
@@ -78,7 +78,8 @@ const DEFAULT_PROVIDER_SETTINGS = {
 const DEFAULT_STORE_DOMAINS = {
     primaryStoreUrl: 'https://buyrobux-store.pages.dev',
     keyGatewayUrl: 'https://nmc-key.vercel.app',
-    allowedDomains: ['https://buyrobux-store.pages.dev', 'https://pathan-sand.vercel.app']
+    allowedDomains: ['https://buyrobux-store.pages.dev', 'https://pathan-sand.vercel.app'],
+    searchBackendUrl: 'https://roblox-backend-1jck.onrender.com'
 };
 const memorySettings = {
     providerDurations: { ...DEFAULT_PROVIDER_DURATIONS },
@@ -1062,34 +1063,117 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const API_BUILD_VERSION = '2026.10.17-membership-persistence-v20';
 
-// Default Tokens
-const LINKVERTISE_TOKEN = process.env.LINKVERTISE_TOKEN || '05bea4d469e02f8573931ff654597345edb6092d8c418ffc588c91de1678325a';
+// Provider credentials are server-only. Never add fallback credentials here:
+// this file is source-controlled and deployed with the application bundle.
+const LINKVERTISE_TOKEN = String(process.env.LINKVERTISE_TOKEN || '').trim();
 const LINKVERTISE_TARGET_LINK = process.env.LINKVERTISE_TARGET_LINK || 'https://direct-link.net/1276098/1A4zh2pEaHCB';
 const LINKVERTISE_EXTEND_LINK = process.env.LINKVERTISE_EXTEND_LINK || 'https://link-target.net/1276098/0mXZLsuM8nZp';
 
 // LootLabs Configuration
-const LOOTLABS_API_TOKEN = process.env.LOOTLABS_API_TOKEN || '162b3c3519ec02bfbd0fc20ff5d6cd1fb10954357e0be1eeee7f00929c2d17e9';
+const LOOTLABS_API_TOKEN = String(process.env.LOOTLABS_API_TOKEN || '').trim();
 const LOOTLABS_TARGET_LINK = process.env.LOOTLABS_TARGET_LINK || 'https://pathan-keys.pages.dev/';
 const LOOTLABS_TIER_ID = parseInt(process.env.LOOTLABS_TIER_ID || '2', 10);
 const LOOTLABS_NUM_TASKS = parseInt(process.env.LOOTLABS_NUM_TASKS || '5', 10);
 const LOOTLABS_THEME = parseInt(process.env.LOOTLABS_THEME || '1', 10);
-const LOOTLABS_POSTBACK_SECRET = process.env.LOOTLABS_POSTBACK_SECRET || 'buyroblox_lootlabs_secret_2026';
-const ADMIN_SECRET = process.env.ADMIN_SECRET || 'admin1234';
+const LOOTLABS_POSTBACK_SECRET = String(process.env.LOOTLABS_POSTBACK_SECRET || '').trim();
 
 // Work.ink Configuration
-const WORKINK_API_TOKEN = process.env.WORKINK_API_TOKEN || '264a4745-074d-4071-99ca-b7f4a34f1f37';
+const WORKINK_API_TOKEN = String(process.env.WORKINK_API_TOKEN || '').trim();
 const WORKINK_TARGET_LINK = process.env.WORKINK_TARGET_LINK || 'https://work.ink/2Dqp/unlock-the-12h-key';
 const WORKINK_LOCAL_LINK = process.env.WORKINK_LOCAL_LINK || 'https://work.ink/2Dqp/key-bylocal-side';
-const WORKINK_POSTBACK_SECRET = process.env.WORKINK_POSTBACK_SECRET || 'buyroblox_workink_secret_2026';
+const WORKINK_POSTBACK_SECRET = String(process.env.WORKINK_POSTBACK_SECRET || '').trim();
 const WORKINK_MIN_COMPLETE_SECS = parseInt(process.env.WORKINK_MIN_COMPLETE_SECS || '15', 10);
 
 // Frontend base URL (for postback redirects)
 const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || 'https://nmc-key.vercel.app';
 
-// Middleware
-// Cache successful CORS preflights so periodic JSON heartbeats do not need a
-// separate OPTIONS request every time. Express still answers OPTIONS itself.
-app.use(cors({ maxAge: 3600 }));
+function envOriginSet(name, defaults) {
+    return new Set([
+        ...defaults,
+        ...String(process.env[name] || '').split(',')
+    ].map(value => {
+        try { return new URL(String(value).trim()).origin.toLowerCase(); } catch (e) { return ''; }
+    }).filter(Boolean));
+}
+
+const TRUSTED_WEB_ORIGINS = envOriginSet('CORS_ALLOWED_ORIGINS', [
+    'https://buyrobux-store.pages.dev',
+    'https://pathan-sand.vercel.app',
+    'https://nmc-key.vercel.app',
+    'https://robox-6nc.pages.dev',
+    'https://pathan-keys.pages.dev',
+    'https://buy-roblox-admin.onrender.com'
+]);
+const TRUSTED_API_ORIGINS = envOriginSet('TRUSTED_API_ORIGINS', [
+    'https://api-keysystem-bbbf.onrender.com',
+    'https://api-keysystem.onrender.com'
+]);
+const TRUSTED_SEARCH_ORIGINS = envOriginSet('TRUSTED_SEARCH_ORIGINS', [
+    'https://roblox-backend-1jck.onrender.com',
+    'https://roblox-backend-1-5fju.onrender.com',
+    'https://roblox-backend-s25h.onrender.com'
+]);
+const TRUSTED_STORE_ORIGINS = envOriginSet('TRUSTED_STORE_ORIGINS', [
+    'https://buyrobux-store.pages.dev',
+    'https://pathan-sand.vercel.app',
+    'https://nmc-key.vercel.app',
+    'https://robox-6nc.pages.dev',
+    'https://pathan-keys.pages.dev'
+]);
+const IS_PRODUCTION = process.env.NODE_ENV === 'production' || !!process.env.RENDER;
+
+function isPrivateDevelopmentOrigin(origin) {
+    if (IS_PRODUCTION) return false;
+    try {
+        const parsed = new URL(origin);
+        return parsed.protocol === 'http:' && (
+            parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1' ||
+            parsed.hostname.startsWith('192.168.') || parsed.hostname.startsWith('10.') ||
+            /^172\.(1[6-9]|2\d|3[01])\./.test(parsed.hostname)
+        );
+    } catch (e) { return false; }
+}
+
+function normalizeTrustedUrl(value, trustedOrigins, fallback = '') {
+    try {
+        const parsed = new URL(String(value || '').trim());
+        const origin = parsed.origin.toLowerCase();
+        if (parsed.username || parsed.password) return fallback;
+        if (!trustedOrigins.has(origin) && !isPrivateDevelopmentOrigin(origin)) return fallback;
+        parsed.hash = '';
+        return parsed.toString().replace(/\/+$/, '');
+    } catch (e) { return fallback; }
+}
+
+function safeSecretEqual(actual, expected) {
+    const a = Buffer.from(String(actual || ''), 'utf8');
+    const b = Buffer.from(String(expected || ''), 'utf8');
+    return a.length > 0 && a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function isAllowedBrowserOrigin(origin) {
+    if (!origin) return true; // server-to-server calls and same-origin clients
+    try {
+        const normalized = new URL(origin).origin.toLowerCase();
+        return TRUSTED_WEB_ORIGINS.has(normalized) || isPrivateDevelopmentOrigin(normalized);
+    } catch (e) { return false; }
+}
+
+// CORS is a browser boundary, not authentication. Reject unknown browser
+// origins explicitly and keep Firebase ID-token verification on privileged APIs.
+app.use((req, res, next) => {
+    const origin = req.get('Origin');
+    if (origin && !isAllowedBrowserOrigin(origin)) {
+        return res.status(403).json({ success: false, error: 'Origin is not allowed.' });
+    }
+    next();
+});
+app.use(cors({
+    origin(origin, callback) { callback(null, isAllowedBrowserOrigin(origin)); },
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Firebase-AppCheck'],
+    maxAge: 3600
+}));
 app.use(express.json({ limit: '10kb' })); // Limit body size to prevent abuse
 
 // 🔒 Security headers
@@ -1097,6 +1181,7 @@ app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
     res.setHeader('X-XSS-Protection', '1; mode=block');
     next();
 });
@@ -1757,8 +1842,9 @@ app.post('/api/sync-google-key', rateLimit('verify'), async (req, res) => {
             // selecting the account's newly linked key below.
             if (keyObj && !keyObj.revoked && !(keyObj.excludedEmails || []).some(value => String(value).toLowerCase() === cleanEmail)) {
                 if (keyObj.boundEmail && (!decoded.email_verified || keyObj.boundEmail !== cleanEmail)) return res.status(403).json({ error: 'Sign in with the email assigned to this key.' });
-                const isLifetime = !keyObj.expiresAt || keyObj.expiresAt === 0;
-                const isExpired = !isLifetime && keyObj.expiresAt <= now;
+                const submittedExpiry = effectiveAccessExpiry(keyObj);
+                const isLifetime = submittedExpiry === Infinity;
+                const isExpired = Number.isNaN(submittedExpiry) || (!isLifetime && submittedExpiry <= now);
 
                 if (!isExpired) {
                     const submittedMaxUsers = Math.max(1, parseInt(keyObj.maxUsers, 10) || 1);
@@ -1794,8 +1880,8 @@ app.post('/api/sync-google-key', rateLimit('verify'), async (req, res) => {
                         // If user already has another active key, pick the one with longer duration
                         let shouldBindNewKey = true;
                         if (targetKey && targetKey.key !== cleanKey) {
-                            const currentBestExp = (!targetKey.expiresAt || targetKey.expiresAt === 0) ? Infinity : targetKey.expiresAt;
-                            const newKeyExp = isLifetime ? Infinity : keyObj.expiresAt;
+                            const currentBestExp = effectiveAccessExpiry(targetKey);
+                            const newKeyExp = submittedExpiry;
                             if (currentBestExp >= newKeyExp) {
                                 shouldBindNewKey = false;
                             }
@@ -1932,7 +2018,9 @@ app.post('/api/sync-google-key', rateLimit('verify'), async (req, res) => {
 });
 
 // Health Check Endpoint (Render & Frontend Health Probe)
-app.get(['/', '/health', '/api/health'], (req, res) => {
+app.get(['/', '/health', '/api/health', '/api/ping', '/ping'], (req, res) => {
+    const src = req.query.source || 'probe';
+    console.log(`📡 [PING RECEIVED] API Backend health probe from IP: ${req.ip} | Source: "${src}" | Time: ${new Date().toLocaleTimeString()}`);
     res.json({
         status: "ok",
         service: "buy-roblox-apikey-backend",
@@ -2078,6 +2166,9 @@ app.get('/api/claim-key', (req, res) => {
 
 // Create a LootLabs content locker for the current user
 app.post('/api/create-lootlabs-locker', async (req, res) => {
+    if (!LOOTLABS_API_TOKEN) {
+        return res.status(503).json({ success: false, error: 'LootLabs integration is not configured.' });
+    }
     const { userId } = req.body;
     if (!userId) {
         return res.status(400).json({ success: false, error: "Missing userId." });
@@ -2103,8 +2194,8 @@ app.post('/api/create-lootlabs-locker', async (req, res) => {
 
     // Destination URL LootLabs will redirect user to after completion
     // Supports direct local redirects or forwarding via local_return parameter
-    const requestedUrl = (req.body && typeof req.body.destinationUrl === 'string' && req.body.destinationUrl.trim()) ? req.body.destinationUrl.trim() : null;
-    const localReturnUrl = (req.body && typeof req.body.localReturnUrl === 'string' && req.body.localReturnUrl.trim()) ? req.body.localReturnUrl.trim() : null;
+    const requestedUrl = normalizeTrustedUrl(req.body && req.body.destinationUrl, TRUSTED_STORE_ORIGINS, '');
+    const localReturnUrl = normalizeTrustedUrl(req.body && req.body.localReturnUrl, TRUSTED_STORE_ORIGINS, '');
 
     let targetBase = requestedUrl || `${FRONTEND_BASE_URL}/key.html`;
     if (localReturnUrl && !targetBase.includes('localhost') && !targetBase.includes('127.0.0.1')) {
@@ -2182,35 +2273,6 @@ async function redeemLootlabsPostback(postbackValue, req) {
         } catch (e) {}
     }
 
-    // LootLabs sends its own unique_id (numeric) NOT our custom postbackValue.
-    // So we must find the most recent unredeemed pending entry for this user.
-    if (!pending) {
-        for (const [key, val] of memoryLootlabsPending.entries()) {
-            if (key.startsWith('__')) continue;
-            if (!val.redeemed && val.time > Date.now() - (15 * 60 * 1000)) {
-                pending = val;
-                matchedDocId = key;
-                break;
-            }
-        }
-        if (!pending && rtdb) {
-            try {
-                const snap = await rtdb.ref('lootlabsPending').limitToLast(20).once('value');
-                if (snap.exists()) {
-                    const list = snap.val();
-                    const entries = Object.entries(list).reverse();
-                    for (const [key, val] of entries) {
-                        if (val && !val.redeemed && val.time > Date.now() - (15 * 60 * 1000)) {
-                            pending = val;
-                            matchedDocId = key;
-                            break;
-                        }
-                    }
-                }
-            } catch (e) {}
-        }
-    }
-
     if (!pending) {
         console.warn(`[LootLabs Postback] Unknown postbackValue received: "${cleanPostback}"`);
         return { status: 404, message: "Unknown postbackValue" };
@@ -2252,13 +2314,13 @@ const handleLootlabsPostback = async (req, res) => {
     // Log EVERY postback attempt for debugging
     const logEntry = {
         time: new Date().toISOString(),
-        query: req.query,
-        body: req.body,
+        queryKeys: Object.keys(req.query || {}),
+        bodyKeys: Object.keys(req.body || {}),
         ip: getClientIp(req)
     };
     recentLootlabsPostbacks.push(logEntry);
     if (recentLootlabsPostbacks.length > 20) recentLootlabsPostbacks.shift();
-    console.log(`[LootLabs Postback RECEIVED] query=${JSON.stringify(req.query)} body=${JSON.stringify(req.body)} ip=${logEntry.ip}`);
+    console.log(`[LootLabs Postback RECEIVED] queryKeys=${logEntry.queryKeys.join(',')} bodyKeys=${logEntry.bodyKeys.join(',')} ip=${logEntry.ip}`);
 
     // Accept postbackValue parameter from query OR body
     const postbackValue = req.query.postbackValue || 
@@ -2272,16 +2334,18 @@ const handleLootlabsPostback = async (req, res) => {
     const secret = req.query.secret || (req.body && req.body.secret);
 
     if (!postbackValue) {
-        console.warn(`[LootLabs Postback] No postbackValue in query or body. Got query: ${JSON.stringify(req.query)}, body: ${JSON.stringify(req.body)}`);
+        console.warn('[LootLabs Postback] No postbackValue in query or body.');
         return res.status(400).send("Missing postbackValue");
     }
 
-    // Strict mode: verify secret strictly if configured and secret is provided or required
-    if (LOOTLABS_POSTBACK_SECRET) {
-        if (secret && secret !== LOOTLABS_POSTBACK_SECRET) {
-            console.warn(`[LootLabs Postback] Rejected: Invalid secret provided.`);
-            return res.status(403).send("Invalid secret");
-        }
+    // Fail closed: a missing server secret or unsigned callback must never issue a key.
+    if (!LOOTLABS_POSTBACK_SECRET) {
+        console.error('[LootLabs Postback] LOOTLABS_POSTBACK_SECRET is not configured.');
+        return res.status(503).send('Postback verification is not configured');
+    }
+    if (!safeSecretEqual(secret, LOOTLABS_POSTBACK_SECRET)) {
+        console.warn('[LootLabs Postback] Rejected unsigned or invalid callback.');
+        return res.status(403).send('Invalid secret');
     }
 
     try {
@@ -2297,7 +2361,7 @@ app.get('/api/lootlabs-postback', handleLootlabsPostback);
 app.post('/api/lootlabs-postback', handleLootlabsPostback);
 
 // DEBUG: View recent postback attempts
-app.get('/api/debug/recent-postbacks', (req, res) => {
+app.get('/api/debug/recent-postbacks', verifyAdmin, rateLimit('admin'), (req, res) => {
     res.json({ count: recentLootlabsPostbacks.length, postbacks: recentLootlabsPostbacks });
 });
 
@@ -2447,6 +2511,9 @@ app.post('/api/claim-lootlabs-key', rateLimit('lootlabsPost'), async (req, res) 
 
 // Create a Work.ink task for the current user
 app.post('/api/create-workink-task', async (req, res) => {
+    if (!WORKINK_API_TOKEN) {
+        return res.status(503).json({ success: false, error: 'Work.ink integration is not configured.' });
+    }
     const { userId } = req.body;
     if (!userId) {
         return res.status(400).json({ success: false, error: "Missing userId." });
@@ -2468,8 +2535,8 @@ app.post('/api/create-workink-task', async (req, res) => {
         rtdb.ref(`workinkPending/${postbackValue}`).set(pendingData).catch(() => {});
     }
 
-    const requestedUrl = (req.body && typeof req.body.destinationUrl === 'string' && req.body.destinationUrl.trim()) ? req.body.destinationUrl.trim() : null;
-    const localReturnUrl = (req.body && typeof req.body.localReturnUrl === 'string' && req.body.localReturnUrl.trim()) ? req.body.localReturnUrl.trim() : null;
+    const requestedUrl = normalizeTrustedUrl(req.body && req.body.destinationUrl, TRUSTED_STORE_ORIGINS, '');
+    const localReturnUrl = normalizeTrustedUrl(req.body && req.body.localReturnUrl, TRUSTED_STORE_ORIGINS, '');
 
     let targetBase = requestedUrl || `${FRONTEND_BASE_URL}/key.html`;
     if (localReturnUrl && !targetBase.includes('localhost') && !targetBase.includes('127.0.0.1')) {
@@ -2538,18 +2605,6 @@ async function redeemWorkinkPostback(postbackValue, req) {
         } catch (e) {}
     }
 
-    // Memory fallback if not found by exact key
-    if (!pending) {
-        for (const [key, val] of memoryWorkinkPending.entries()) {
-            if (key.startsWith('__')) continue;
-            if (!val.redeemed && val.time > Date.now() - (15 * 60 * 1000)) {
-                pending = val;
-                matchedDocId = key;
-                break;
-            }
-        }
-    }
-
     if (!pending) {
         return { status: 404, message: "Unknown postbackValue" };
     }
@@ -2576,7 +2631,7 @@ async function redeemWorkinkPostback(postbackValue, req) {
 // Work.ink Postback - Work.ink server sends GET/POST request here when user completes tasks.
 app.all('/api/workink-postback', async (req, res) => {
     const params = { ...req.query, ...(req.body || {}) };
-    console.log(`[Work.ink Postback RECEIVED] params=${JSON.stringify(params)} ip=${getClientIp(req)}`);
+    console.log(`[Work.ink Postback RECEIVED] paramKeys=${Object.keys(params).join(',')} ip=${getClientIp(req)}`);
 
     const postbackValue = params.postbackValue ||
                           params.postback ||
@@ -2589,13 +2644,17 @@ app.all('/api/workink-postback', async (req, res) => {
     const { secret } = params;
 
     if (!postbackValue) {
-        console.warn(`[Work.ink Postback] No postbackValue in request. Got: ${JSON.stringify(params)}`);
+        console.warn('[Work.ink Postback] No postbackValue in request.');
         return res.status(400).send("Missing postbackValue");
     }
 
-    if (WORKINK_POSTBACK_SECRET && secret && secret !== WORKINK_POSTBACK_SECRET) {
-        console.warn(`[Work.ink Postback] Invalid secret provided.`);
-        return res.status(403).send("Invalid secret");
+    if (!WORKINK_POSTBACK_SECRET) {
+        console.error('[Work.ink Postback] WORKINK_POSTBACK_SECRET is not configured.');
+        return res.status(503).send('Postback verification is not configured');
+    }
+    if (!safeSecretEqual(secret, WORKINK_POSTBACK_SECRET)) {
+        console.warn('[Work.ink Postback] Rejected unsigned or invalid callback.');
+        return res.status(403).send('Invalid secret');
     }
 
     try {
@@ -2744,6 +2803,9 @@ app.get('/api/verify-key', (req, res) => {
 
 // Endpoint to verify Linkvertise hash and generate 12-hour key
 app.post('/api/claim-key', rateLimit('claim'), async (req, res) => {
+    if (!LINKVERTISE_TOKEN) {
+        return res.status(503).json({ success: false, error: 'Linkvertise integration is not configured.' });
+    }
     const { hash, userId } = req.body;
 
     if (!hash || !userId) {
@@ -2926,9 +2988,13 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
             return res.status(403).json({ valid: false, error: 'Sign in with the email assigned to this key.' });
         }
 
-        // Check expiry (expiresAt === 0 or null means lifetime key)
-        const hasExpiry = keyData.expiresAt && keyData.expiresAt > 0;
-        if (hasExpiry && Date.now() > keyData.expiresAt) {
+        // Provider-generated keys are always timed. Missing/malformed provider
+        // expiry must never be interpreted as lifetime access.
+        const effectiveExpiry = effectiveAccessExpiry(keyData);
+        if (Number.isNaN(effectiveExpiry)) {
+            return res.status(403).json({ valid: false, error: "Key has invalid expiration data. Please generate a fresh key." });
+        }
+        if (effectiveExpiry !== Infinity && Date.now() >= effectiveExpiry) {
             return res.status(403).json({ valid: false, error: "Key is expired. Please get a new 12-hour key." });
         }
 
@@ -3182,6 +3248,9 @@ app.post('/api/extend-key', rateLimit('extend'), async (req, res) => {
 
         // Completion Verification
         if (cleanProvider === 'linkvertise') {
+            if (!LINKVERTISE_TOKEN) {
+                return res.status(503).json({ success: false, error: 'Linkvertise integration is not configured.' });
+            }
             if (!hash) {
                 return res.status(400).json({ success: false, error: "Missing Linkvertise completion hash." });
             }
@@ -3354,7 +3423,7 @@ app.post('/api/extend-key', rateLimit('extend'), async (req, res) => {
 // Whitelist of allowed admin emails - loaded from env for security.
 // Set ADMIN_EMAILS env var in Render/local .env as comma-separated list.
 // Falls back to a safe default list if not set.
-const ADMIN_EMAILS_ENV = process.env.ADMIN_EMAILS || 'js7384333@gmail.com,js8495444@gmail.com,atifjanibrand@gmail.com,nmcpathan@gmail.com';
+const ADMIN_EMAILS_ENV = process.env.ADMIN_EMAILS || '';
 const ALLOWED_ADMIN_EMAILS = ADMIN_EMAILS_ENV
     .split(',')
     .map(e => e.toLowerCase().trim())
@@ -3380,20 +3449,18 @@ function verifyAdmin(req, res, next) {
         return res.status(401).json({ error: 'Unauthorized: Missing authentication token' });
     }
 
-    // Legacy ADMIN_SECRET fallback (for backwards compatibility)
-    if (idToken === ADMIN_SECRET) {
-        return next();
-    }
-
     // 🔒 Firebase Auth ID Token verification
     const a = getAdminAuth();
     if (!a) {
         return res.status(503).json({ error: 'Firebase Auth not available. Please contact admin.' });
     }
 
-    a.verifyIdToken(idToken)
+    a.verifyIdToken(idToken, true)
         .then((decoded) => {
             const email = (decoded.email || '').toLowerCase().trim();
+            if (decoded.email_verified !== true) {
+                return res.status(403).json({ error: 'Forbidden: Admin email must be verified' });
+            }
             if (!ALLOWED_ADMIN_EMAILS.includes(email)) {
                 return res.status(403).json({ error: `Forbidden: Email "${email}" is not authorized` });
             }
@@ -3406,13 +3473,8 @@ function verifyAdmin(req, res, next) {
         });
 }
 
-app.post('/api/admin/login', rateLimit('admin'), (req, res) => {
-    const { secret } = req.body;
-    if (secret === ADMIN_SECRET) {
-        res.json({ success: true });
-    } else {
-        res.status(401).json({ success: false, error: 'Invalid secret key' });
-    }
+app.post('/api/admin/login', rateLimit('admin'), verifyAdmin, (req, res) => {
+    res.json({ success: true, email: req.adminEmail });
 });
 
 // In-memory presence snapshot (0 RTDB reads on normal path)
@@ -5187,12 +5249,17 @@ app.post('/api/store-config', verifyAdmin, rateLimit('admin'), async (req, res) 
 // Store Domains: Get active store domains and gateway config
 app.get('/api/store-domains', async (req, res) => {
     try {
-        const domains = JSON.parse(JSON.stringify(memorySettings.storeDomains || DEFAULT_STORE_DOMAINS));
-        const list = Array.isArray(domains.allowedDomains) ? domains.allowedDomains : [];
-        if (!list.some(d => String(d).includes('pathan-sand.vercel.app'))) {
-            list.push('https://pathan-sand.vercel.app');
+        const stored = JSON.parse(JSON.stringify(memorySettings.storeDomains || DEFAULT_STORE_DOMAINS));
+        const primaryStoreUrl = normalizeTrustedUrl(stored.primaryStoreUrl, TRUSTED_STORE_ORIGINS, DEFAULT_STORE_DOMAINS.primaryStoreUrl);
+        const keyGatewayUrl = normalizeTrustedUrl(stored.keyGatewayUrl, TRUSTED_STORE_ORIGINS, DEFAULT_STORE_DOMAINS.keyGatewayUrl);
+        const searchBackendUrl = normalizeTrustedUrl(stored.searchBackendUrl, TRUSTED_SEARCH_ORIGINS, DEFAULT_STORE_DOMAINS.searchBackendUrl);
+        const list = Array.isArray(stored.allowedDomains)
+            ? stored.allowedDomains.map(value => normalizeTrustedUrl(value, TRUSTED_STORE_ORIGINS, '')).filter(Boolean)
+            : [];
+        for (const required of [primaryStoreUrl, 'https://pathan-sand.vercel.app']) {
+            if (!list.includes(required)) list.push(required);
         }
-        domains.allowedDomains = list;
+        const domains = { primaryStoreUrl, keyGatewayUrl, searchBackendUrl, allowedDomains: [...new Set(list)], updatedAt: Number(stored.updatedAt) || 0 };
         return res.json({ success: true, domains });
     } catch (e) {
         return res.json({ success: true, domains: DEFAULT_STORE_DOMAINS });
@@ -5203,16 +5270,24 @@ app.get('/api/store-domains', async (req, res) => {
 app.post('/api/admin/store-domains', verifyAdmin, rateLimit('admin'), async (req, res) => {
     try {
         const body = req.body || {};
-        const primaryStoreUrl = String(body.primaryStoreUrl || '').trim();
-        const keyGatewayUrl = String(body.keyGatewayUrl || '').trim();
+        const requestedPrimary = String(body.primaryStoreUrl || '').trim();
+        const requestedGateway = String(body.keyGatewayUrl || '').trim();
+        const requestedSearch = String(body.searchBackendUrl || body.activeStoreUrl || '').trim();
+        const primaryStoreUrl = normalizeTrustedUrl(requestedPrimary, TRUSTED_STORE_ORIGINS, '');
+        const keyGatewayUrl = normalizeTrustedUrl(requestedGateway, TRUSTED_STORE_ORIGINS, '');
+        const searchBackendUrl = normalizeTrustedUrl(requestedSearch, TRUSTED_SEARCH_ORIGINS, '');
+        if ((requestedPrimary && !primaryStoreUrl) || (requestedGateway && !keyGatewayUrl) || (requestedSearch && !searchBackendUrl)) {
+            return res.status(400).json({ success: false, error: 'One or more URLs are outside the trusted origin allowlist.' });
+        }
         const allowedDomains = Array.isArray(body.allowedDomains) 
-            ? body.allowedDomains.map(d => String(d).trim()).filter(Boolean)
+            ? body.allowedDomains.map(d => normalizeTrustedUrl(d, TRUSTED_STORE_ORIGINS, '')).filter(Boolean)
             : (primaryStoreUrl ? [primaryStoreUrl] : []);
 
         const payload = {
             primaryStoreUrl: primaryStoreUrl || DEFAULT_STORE_DOMAINS.primaryStoreUrl,
             keyGatewayUrl: keyGatewayUrl || DEFAULT_STORE_DOMAINS.keyGatewayUrl,
             allowedDomains: allowedDomains.length > 0 ? allowedDomains : [primaryStoreUrl || DEFAULT_STORE_DOMAINS.primaryStoreUrl],
+            searchBackendUrl: searchBackendUrl || DEFAULT_STORE_DOMAINS.searchBackendUrl || 'https://roblox-backend-1jck.onrender.com',
             updatedAt: Date.now()
         };
 
@@ -5222,6 +5297,9 @@ app.post('/api/admin/store-domains', verifyAdmin, rateLimit('admin'), async (req
             await rtdb.ref('settings/storeDomains').set(payload).catch(err => {
                 console.warn('RTDB storeDomains save warning:', err.message);
             });
+            if (searchBackendUrl) {
+                await rtdb.ref('settings/serverConfig/activeStoreUrl').set(searchBackendUrl).catch(() => {});
+            }
         }
         if (db) {
             await db.collection('settings').doc('storeDomains').set(payload).catch(() => {});
@@ -5257,8 +5335,9 @@ async function getLiveServerConfig() {
         try {
             const snap = await rtdb.ref('settings/serverConfig').once('value');
             if (snap.exists()) {
+                const stored = { ...DEFAULT_SERVER_CONFIG, ...snap.val() };
                 serverConfigRtdbCache = {
-                    cfg: { ...DEFAULT_SERVER_CONFIG, ...snap.val() },
+                    cfg: sanitizeServerConfig(stored),
                     fetchedAt: Date.now()
                 };
                 memoryServerConfig = serverConfigRtdbCache.cfg;
@@ -5268,6 +5347,19 @@ async function getLiveServerConfig() {
         }
     }
     return serverConfigRtdbCache.cfg || memoryServerConfig;
+}
+
+function sanitizeServerConfig(input) {
+    const config = input && typeof input === 'object' ? input : {};
+    return {
+        selectedStoreId: String(config.selectedStoreId || DEFAULT_SERVER_CONFIG.selectedStoreId).slice(0, 64),
+        selectedApiKeyId: String(config.selectedApiKeyId || DEFAULT_SERVER_CONFIG.selectedApiKeyId).slice(0, 64),
+        activeStoreUrl: normalizeTrustedUrl(config.activeStoreUrl, TRUSTED_SEARCH_ORIGINS, DEFAULT_SERVER_CONFIG.activeStoreUrl),
+        activeApiKeyUrl: normalizeTrustedUrl(config.activeApiKeyUrl, TRUSTED_API_ORIGINS, DEFAULT_SERVER_CONFIG.activeApiKeyUrl),
+        customStoreUrl: normalizeTrustedUrl(config.customStoreUrl, TRUSTED_SEARCH_ORIGINS, ''),
+        customApiKeyUrl: normalizeTrustedUrl(config.customApiKeyUrl, TRUSTED_API_ORIGINS, ''),
+        updatedAt: Number(config.updatedAt) || Date.now()
+    };
 }
 
 app.get('/api/server-config', async (req, res) => {
@@ -5285,12 +5377,22 @@ app.post('/api/admin/server-config', verifyAdmin, rateLimit('admin'), async (req
         if (!config || typeof config !== 'object') {
             return res.status(400).json({ success: false, error: 'Invalid server configuration.' });
         }
-        config.updatedAt = Date.now();
-        memoryServerConfig = { ...DEFAULT_SERVER_CONFIG, ...config };
+        const requestedStore = String(config.activeStoreUrl || '').trim();
+        const requestedApi = String(config.activeApiKeyUrl || '').trim();
+        if ((requestedStore && !normalizeTrustedUrl(requestedStore, TRUSTED_SEARCH_ORIGINS, '')) ||
+            (requestedApi && !normalizeTrustedUrl(requestedApi, TRUSTED_API_ORIGINS, ''))) {
+            return res.status(400).json({ success: false, error: 'Server URL is outside the trusted origin allowlist.' });
+        }
+        memoryServerConfig = sanitizeServerConfig({ ...DEFAULT_SERVER_CONFIG, ...config, updatedAt: Date.now() });
         serverConfigRtdbCache = { cfg: memoryServerConfig, fetchedAt: Date.now() };
 
         if (rtdb) {
-            await rtdb.ref('settings/serverConfig').set(memoryServerConfig);
+            await rtdb.ref('settings/serverConfig').set(memoryServerConfig).catch(() => {});
+            await rtdb.ref('announcements/serverRouting').set({
+                activeStoreUrl: memoryServerConfig.activeStoreUrl,
+                selectedStoreId: memoryServerConfig.selectedStoreId,
+                updatedAt: Date.now()
+            }).catch(() => {});
         }
         if (db) {
             await db.collection('settings').doc('serverConfig').set(memoryServerConfig).catch(() => {});

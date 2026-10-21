@@ -1,4 +1,21 @@
 const emailOf = value => String(value || '').trim().toLowerCase();
+const TIMED_PROVIDERS = new Set(['linkvertise', 'lootlabs', 'workink']);
+
+function isTimedProviderKey(key) {
+  const provider = String(key?.provider || '').trim().toLowerCase();
+  return TIMED_PROVIDERS.has(provider) || !!key?.lootlabsPostback || !!key?.lootlabsLocal ||
+    !!key?.linkvertiseHash || !!key?.workinkPostback;
+}
+
+function effectiveAccessExpiry(key) {
+  const rawExpiry = key?.expiresAt;
+  const numericExpiry = Number(rawExpiry);
+  if (isTimedProviderKey(key)) {
+    return Number.isFinite(numericExpiry) && numericExpiry > 0 ? numericExpiry : NaN;
+  }
+  if (rawExpiry === null || rawExpiry === undefined || rawExpiry === '' || numericExpiry === 0) return Infinity;
+  return Number.isFinite(numericExpiry) && numericExpiry > 0 ? numericExpiry : NaN;
+}
 
 function isLinkedToGoogleAccount(key, uid, email, emailVerified = false) {
   if (!key || !uid) return false;
@@ -27,10 +44,10 @@ function isLinkedToGoogleAccount(key, uid, email, emailVerified = false) {
 function findActiveGoogleKeys(keys, uid, email, emailVerified, now = Date.now()) {
   return [...keys].filter(key => {
     if (!key || key.revoked || !isLinkedToGoogleAccount(key, uid, email, emailVerified)) return false;
-    return !key.expiresAt || key.expiresAt === 0 || key.expiresAt > now;
+    const expiry = effectiveAccessExpiry(key);
+    return expiry === Infinity || (Number.isFinite(expiry) && expiry > now);
   }).sort((a, b) => {
-    const expiry = key => !key.expiresAt || key.expiresAt === 0 ? Infinity : key.expiresAt;
-    return expiry(b) - expiry(a);
+    return effectiveAccessExpiry(b) - effectiveAccessExpiry(a);
   });
 }
 
@@ -71,4 +88,4 @@ function findUsableGoogleKeys(keys, uid, email, emailVerified, ip = '', previous
     .filter(key => accountKeySlot(key, uid, ip, previousGuestUid, email).allowed);
 }
 
-module.exports = { isLinkedToGoogleAccount, findActiveGoogleKeys, findUsableGoogleKeys, accountKeySlot };
+module.exports = { isLinkedToGoogleAccount, findActiveGoogleKeys, findUsableGoogleKeys, accountKeySlot, isTimedProviderKey, effectiveAccessExpiry };
