@@ -5365,6 +5365,20 @@ let memoryServerConfig = { ...DEFAULT_SERVER_CONFIG };
 let serverConfigRtdbCache = { cfg: null, fetchedAt: 0 };
 const SERVER_CONFIG_RTDB_TTL_MS = 5 * 60 * 1000;
 
+// Every deployed API instance follows the same routing document immediately.
+// This prevents a warm secondary instance from serving a stale destination.
+if (rtdb) {
+    rtdb.ref('settings/serverConfig').on('value', (snap) => {
+        try {
+            if (!snap.exists()) return;
+            memoryServerConfig = sanitizeServerConfig({ ...DEFAULT_SERVER_CONFIG, ...snap.val() });
+            serverConfigRtdbCache = { cfg: memoryServerConfig, fetchedAt: Date.now() };
+        } catch (e) {
+            console.warn('Server routing live-sync warning:', e.message);
+        }
+    });
+}
+
 async function getLiveServerConfig() {
     if (rtdb && (Date.now() - serverConfigRtdbCache.fetchedAt) > SERVER_CONFIG_RTDB_TTL_MS) {
         try {
@@ -5426,6 +5440,8 @@ app.post('/api/admin/server-config', verifyAdmin, rateLimit('admin'), async (req
             await rtdb.ref('announcements/serverRouting').set({
                 activeStoreUrl: memoryServerConfig.activeStoreUrl,
                 selectedStoreId: memoryServerConfig.selectedStoreId,
+                activeApiKeyUrl: memoryServerConfig.activeApiKeyUrl,
+                selectedApiKeyId: memoryServerConfig.selectedApiKeyId,
                 updatedAt: Date.now()
             }).catch(() => {});
         }
