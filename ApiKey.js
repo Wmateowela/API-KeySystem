@@ -13,6 +13,7 @@ const ONLINE_WINDOW_MS = Math.max(WINDOW_MS || 0, 3 * 60 * 1000);
 const { saveDailySubmission, latestSubmissions, removableOldSubmissionIds } = require('./support-store');
 const { isLinkedToGoogleAccount, findActiveGoogleKeys, findUsableGoogleKeys, accountKeySlot, effectiveAccessExpiry } = require('./google-key-lookup');
 const { mayDisconnectKeySession, mayDisconnectGuestSession } = require('./logout-authorization');
+const { installActiveApiRouting } = require('./active-api-routing');
 
 let dashboardRevision = 1;
 function bumpDashboardRevision() {
@@ -1063,7 +1064,7 @@ try {
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const API_BUILD_VERSION = '2026.10.17-membership-persistence-v20';
+const API_BUILD_VERSION = '2026.10.22-active-api-routing-v21';
 
 // Provider credentials are server-only. Never add fallback credentials here:
 // this file is source-controlled and deployed with the application bundle.
@@ -1178,6 +1179,7 @@ app.use(cors({
     maxAge: 3600
 }));
 app.use(express.json({ limit: '10kb' })); // Limit body size to prevent abuse
+app.use(express.urlencoded({ extended: false, limit: '10kb' }));
 
 // 🔒 Security headers
 app.use((req, res, next) => {
@@ -1187,6 +1189,16 @@ app.use((req, res, next) => {
     res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
     res.setHeader('X-XSS-Protection', '1; mode=block');
     next();
+});
+
+// Only the API server selected in Admin is allowed to process API work.
+// This also catches third-party postbacks that still arrive at the old Render
+// URL and transparently forwards them before any key can be issued there.
+installActiveApiRouting({
+    app,
+    getActiveApiUrl: async () => (await getLiveServerConfig()).activeApiKeyUrl,
+    normalizeActiveUrl: value => normalizeTrustedUrl(value, TRUSTED_API_ORIGINS, ''),
+    serviceOrigin: process.env.RENDER_EXTERNAL_URL || ''
 });
 
 // ============================================================
@@ -5353,9 +5365,9 @@ app.post('/api/admin/store-domains', verifyAdmin, rateLimit('admin'), async (req
 // ====================
 const DEFAULT_SERVER_CONFIG = {
     selectedStoreId: 'render-b',
-    selectedApiKeyId: 'render-c',
+    selectedApiKeyId: 'render-d',
     activeStoreUrl: 'https://roblox-backend-1jck.onrender.com',
-    activeApiKeyUrl: 'https://api-keysystem-bbbf.onrender.com',
+    activeApiKeyUrl: 'https://api-keysystem.onrender.com',
     customStoreUrl: '',
     customApiKeyUrl: '',
     updatedAt: Date.now()
