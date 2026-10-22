@@ -1171,7 +1171,7 @@ app.use((req, res, next) => {
 app.use(cors({
     origin(origin, callback) { callback(null, isAllowedBrowserOrigin(origin)); },
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Firebase-AppCheck'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Firebase-AppCheck', 'If-None-Match'],
     maxAge: 3600
 }));
 app.use(express.json({ limit: '10kb' })); // Limit body size to prevent abuse
