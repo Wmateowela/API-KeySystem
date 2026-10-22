@@ -9,7 +9,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { WINDOW_MS, countDevices } = require('./presence');
-const ONLINE_WINDOW_MS = WINDOW_MS || (120 * 1000);
+const ONLINE_WINDOW_MS = Math.max(WINDOW_MS || 0, 3 * 60 * 1000);
 const { saveDailySubmission, latestSubmissions, removableOldSubmissionIds } = require('./support-store');
 const { isLinkedToGoogleAccount, findActiveGoogleKeys, findUsableGoogleKeys, accountKeySlot, effectiveAccessExpiry } = require('./google-key-lookup');
 const { mayDisconnectKeySession, mayDisconnectGuestSession } = require('./logout-authorization');
@@ -32,6 +32,8 @@ const onlineUsers = new Map();          // userId -> lastSeen (ms)
 const presenceSessions = new Map();     // session/node id -> canonical live visitor record
 const authHandoffs = new Map();         // one-time token -> verified Google/key session
 const keyEventClients = new Map();       // hashed key channel -> Set<SSE response>
+const googleUserWriteCache = new Map();  // uid -> { signature, writtenAt }
+const GOOGLE_USER_WRITE_INTERVAL_MS = 10 * 60 * 1000;
 
 let announcementsLastLoaded = 0;
 let announcementsRevision = Date.now();
@@ -1102,6 +1104,7 @@ const TRUSTED_WEB_ORIGINS = envOriginSet('CORS_ALLOWED_ORIGINS', [
     'https://nmc-key.vercel.app',
     'https://robox-6nc.pages.dev',
     'https://pathan-keys.pages.dev',
+    'https://admin-pathan.vercel.app',
     'https://buy-roblox-admin.onrender.com'
 ]);
 const TRUSTED_API_ORIGINS = envOriginSet('TRUSTED_API_ORIGINS', [
@@ -1784,6 +1787,17 @@ app.post('/api/auth/handoff/exchange', rateLimit('verify'), async (req, res) => 
 });
 
 // Sync and bind Google account to access key / retrieve active key for cross-device login
+async function persistGoogleUserState(uid, payload) {
+    if (!rtdb || !uid) return;
+    const stablePayload = { ...payload };
+    delete stablePayload.lastSeen;
+    const signature = JSON.stringify(stablePayload);
+    const cached = googleUserWriteCache.get(uid);
+    if (cached && cached.signature === signature && Date.now() - cached.writtenAt < GOOGLE_USER_WRITE_INTERVAL_MS) return;
+    await rtdb.ref(`users/${uid}`).update(payload);
+    googleUserWriteCache.set(uid, { signature, writtenAt: Date.now() });
+}
+
 app.post('/api/sync-google-key', rateLimit('verify'), async (req, res) => {
     try {
         const decoded = await verifyUserToken(req, true);
@@ -1955,7 +1969,7 @@ app.post('/api/sync-google-key', rateLimit('verify'), async (req, res) => {
 
             if (rtdb) {
                 try {
-                    await rtdb.ref(`users/${cleanUid}`).update({
+                    await persistGoogleUserState(cleanUid, {
                         uid: cleanUid,
                         email: cleanEmail,
                         displayName: cleanName,
@@ -1980,9 +1994,9 @@ app.post('/api/sync-google-key', rateLimit('verify'), async (req, res) => {
             });
         }
 
-        if (rtdb) {
-            try {
-                await rtdb.ref(`users/${cleanUid}`).update({
+            if (rtdb) {
+                try {
+                await persistGoogleUserState(cleanUid, {
                     uid: cleanUid,
                     email: cleanEmail,
                     displayName: cleanName,
@@ -3700,9 +3714,9 @@ app.get('/api/admin/dashboard-snapshot', verifyAdmin, rateLimit('admin'), async 
     try {
         const clientETag = req.headers['if-none-match'];
         const clientRev = req.query.revision;
-        // Presence is held in RAM, so a short time bucket refreshes online/offline
-        // status without a single Firebase read even when no key record changed.
-        const currentRevStr = `${dashboardRevision}-${Math.floor(Date.now() / 10000)}`;
+        // Keep this ETag stable until key data actually changes. Live presence is
+        // delivered separately as a small payload, avoiding repeated full key lists.
+        const currentRevStr = String(dashboardRevision);
         if (clientETag === `"${currentRevStr}"` || clientRev === currentRevStr) {
             return res.status(304).end();
         }
@@ -3731,6 +3745,27 @@ app.get('/api/admin/dashboard-snapshot', verifyAdmin, rateLimit('admin'), async 
         });
     } catch (e) {
         res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+app.get('/api/admin/dashboard-presence', verifyAdmin, rateLimit('admin'), async (req, res) => {
+    try {
+        const now = Date.now();
+        const sharedPresence = await getSharedPresence();
+        const keys = [];
+        for (const keyData of memoryKeys.values()) {
+            const breakdown = getKeyOnlineBreakdown(keyData.key, sharedPresence);
+            const online = breakdown.onlineUsers > 0 || isKeyOnline(keyData.key) ||
+                isUserOnline(keyData.userId) || isUserOnline(keyData.googleUid) ||
+                isUserOnline(keyData.googleEmail) || isUserOnline(keyData.email);
+            if (online && !isKeyBlocked(keyData) && (!keyData.expiresAt || keyData.expiresAt > now)) {
+                keys.push({ key: keyData.key, online: true, ...breakdown });
+            }
+        }
+        res.set('Cache-Control', 'private, no-store');
+        return res.json({ success: true, generatedAt: now, onlineCount: getOnlineUserIds().length, keys });
+    } catch (e) {
+        return res.status(500).json({ success: false, error: e.message });
     }
 });
 
@@ -5328,7 +5363,7 @@ const DEFAULT_SERVER_CONFIG = {
 
 let memoryServerConfig = { ...DEFAULT_SERVER_CONFIG };
 let serverConfigRtdbCache = { cfg: null, fetchedAt: 0 };
-const SERVER_CONFIG_RTDB_TTL_MS = 15000;
+const SERVER_CONFIG_RTDB_TTL_MS = 5 * 60 * 1000;
 
 async function getLiveServerConfig() {
     if (rtdb && (Date.now() - serverConfigRtdbCache.fetchedAt) > SERVER_CONFIG_RTDB_TTL_MS) {
