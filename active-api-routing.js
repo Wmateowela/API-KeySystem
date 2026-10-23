@@ -4,12 +4,27 @@ const { Readable } = require('stream');
 
 const ROUTE_HOP_HEADER = 'x-rblx-api-route-hop';
 const LOCAL_CONFIG_PATH = '/api/server-config';
+const LOCAL_ONLY_PATHS = new Set([
+    LOCAL_CONFIG_PATH,
+    '/api/admin/probe-server'
+]);
 
 function cleanOrigin(value) {
     try {
         return new URL(String(value || '').trim()).origin.toLowerCase();
     } catch (e) {
         return '';
+    }
+}
+
+function isLoopbackBrowserOrigin(value) {
+    try {
+        const parsed = new URL(String(value || '').trim());
+        return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && (
+            parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1' || parsed.hostname === '[::1]'
+        );
+    } catch (e) {
+        return false;
     }
 }
 
@@ -26,7 +41,7 @@ function requestOrigin(req, configuredOrigin = '') {
 
 function shouldForwardApiRequest({ path, currentOrigin, activeOrigin, routeHop = 0 }) {
     if (!String(path || '').startsWith('/api/')) return false;
-    if (String(path || '').replace(/\/+$/, '') === LOCAL_CONFIG_PATH) return false;
+    if (LOCAL_ONLY_PATHS.has(String(path || '').replace(/\/+$/, ''))) return false;
     if (!currentOrigin || !activeOrigin || currentOrigin === activeOrigin) return false;
     return Number(routeHop || 0) < 1;
 }
@@ -57,7 +72,14 @@ function forwardedRequestHeaders(req, routeHop) {
     ];
     for (const name of safeHeaders) {
         const value = req.get(name);
-        if (value) headers[name] = value;
+        // The local API has already validated localhost through its CORS
+        // boundary. Do not send that browser-only origin to a selected Render
+        // backend, where it is correctly absent from the production allowlist.
+        // The proxy call is server-to-server and the Firebase token remains the
+        // authorization boundary for privileged endpoints.
+        if (value && !(name === 'origin' && isLoopbackBrowserOrigin(value))) {
+            headers[name] = value;
+        }
     }
     const clientIp = String(req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '').split(',')[0].trim();
     if (clientIp) headers['x-forwarded-for'] = clientIp;
@@ -96,7 +118,7 @@ function installActiveApiRouting({
 
     app.use(async (req, res, next) => {
         const normalizedPath = String(req.path || '').replace(/\/+$/, '');
-        if (!req.path.startsWith('/api/') || normalizedPath === LOCAL_CONFIG_PATH) return next();
+        if (!req.path.startsWith('/api/') || LOCAL_ONLY_PATHS.has(normalizedPath)) return next();
 
         const routeHop = Number.parseInt(req.get(ROUTE_HOP_HEADER) || '0', 10) || 0;
         let activeBase = '';
@@ -153,6 +175,7 @@ function installActiveApiRouting({
 module.exports = {
     ROUTE_HOP_HEADER,
     cleanOrigin,
+    isLoopbackBrowserOrigin,
     requestOrigin,
     shouldForwardApiRequest,
     installActiveApiRouting

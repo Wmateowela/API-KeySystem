@@ -1,4 +1,4 @@
-const WINDOW_MS = 120000;
+const WINDOW_MS = 90000;
 function activeRecords(value, now = Date.now()) {
   return Object.entries(value || {}).filter(([, p]) => p && p.online !== false && Number(p.lastSeen) > now - WINDOW_MS && Number(p.lastSeen) <= now + 60000);
 }

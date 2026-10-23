@@ -9,7 +9,9 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { WINDOW_MS, countDevices } = require('./presence');
-const ONLINE_WINDOW_MS = Math.max(WINDOW_MS || 0, 3 * 60 * 1000);
+// The browser heartbeats every 60s. Keep only a small drift allowance so a
+// closed/crashed tab cannot inflate the dashboard for several extra minutes.
+const ONLINE_WINDOW_MS = Math.max(WINDOW_MS || 0, 90 * 1000);
 const { saveDailySubmission, latestSubmissions, removableOldSubmissionIds } = require('./support-store');
 const { isLinkedToGoogleAccount, findActiveGoogleKeys, findUsableGoogleKeys, accountKeySlot, effectiveAccessExpiry } = require('./google-key-lookup');
 const { mayDisconnectKeySession, mayDisconnectGuestSession } = require('./logout-authorization');
@@ -666,8 +668,9 @@ function setupRTDBListeners() {
             const nodeId = `rtdb:${vid}`;
             if ((p.lastSeen || 0) > cutoff) {
                 const ts = p.lastSeen || now;
-                presenceSessions.set(nodeId, { ...p, visitorId: vid, lastSeen: ts });
-                onlineUsers.set(vid, ts);
+                const canonicalVisitorId = String(p.visitorId || vid);
+                presenceSessions.set(nodeId, { ...p, visitorId: canonicalVisitorId, lastSeen: ts });
+                onlineUsers.set(canonicalVisitorId, ts);
                 if (p.uid) {
                     onlineUsers.set(p.uid, ts);
                     onlineUsers.set(`guid:${p.uid}`, ts);
@@ -1126,6 +1129,15 @@ const TRUSTED_STORE_ORIGINS = envOriginSet('TRUSTED_STORE_ORIGINS', [
 ]);
 const IS_PRODUCTION = process.env.NODE_ENV === 'production' || !!process.env.RENDER;
 
+function isLoopbackOrigin(origin) {
+    try {
+        const parsed = new URL(origin);
+        return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && (
+            parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1' || parsed.hostname === '[::1]'
+        );
+    } catch (e) { return false; }
+}
+
 function isPrivateDevelopmentOrigin(origin) {
     if (IS_PRODUCTION) return false;
     try {
@@ -1159,7 +1171,10 @@ function isAllowedBrowserOrigin(origin) {
     if (!origin) return true; // server-to-server calls and same-origin clients
     try {
         const normalized = new URL(origin).origin.toLowerCase();
-        return TRUSTED_WEB_ORIGINS.has(normalized) || isPrivateDevelopmentOrigin(normalized);
+        // Local Frontend/Key/Admin builds are valid callers even if the local
+        // backend inherited NODE_ENV=production. This exception applies only
+        // to browser CORS; trusted outbound server URLs keep their stricter list.
+        return TRUSTED_WEB_ORIGINS.has(normalized) || isLoopbackOrigin(normalized) || isPrivateDevelopmentOrigin(normalized);
     } catch (e) { return false; }
 }
 
@@ -1175,10 +1190,21 @@ app.use((req, res, next) => {
 app.use(cors({
     origin(origin, callback) { callback(null, isAllowedBrowserOrigin(origin)); },
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Firebase-AppCheck', 'If-None-Match'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Firebase-AppCheck', 'If-None-Match', 'X-Access-Key'],
     maxAge: 3600
 }));
-app.use(express.json({ limit: '10kb' })); // Limit body size to prevent abuse
+// Store backups can legitimately contain 100+ banner definitions. Keep every
+// other endpoint on the strict 10 KB ceiling and raise only the authenticated
+// store-config publish request.
+const standardJsonParser = express.json({ limit: '10kb' });
+const storeConfigJsonParser = express.json({ limit: '512kb' });
+app.use((req, res, next) => {
+    const requestPath = String(req.originalUrl || req.url || '').split('?')[0];
+    if (req.method === 'POST' && requestPath === '/api/store-config') {
+        return storeConfigJsonParser(req, res, next);
+    }
+    return standardJsonParser(req, res, next);
+});
 app.use(express.urlencoded({ extended: false, limit: '10kb' }));
 
 // 🔒 Security headers
@@ -1430,7 +1456,7 @@ async function releaseSupersededKeys() {
 }
 
 // ---------------- ONLINE TRACKING ----------------
-// ONLINE_WINDOW_MS is 120s (from presence.js), providing safety margin for 50s frontend heartbeat
+// ONLINE_WINDOW_MS is 90s (from presence.js), providing drift margin for the 60s frontend heartbeat.
 function markOnline(userId, ip, key, googleInfo) {
     const now = Date.now();
     if (userId && typeof userId === 'string') {
@@ -3775,7 +3801,10 @@ app.get('/api/admin/dashboard-presence', verifyAdmin, rateLimit('admin'), async 
             }
         }
         res.set('Cache-Control', 'private, no-store');
-        return res.json({ success: true, generatedAt: now, onlineCount: getOnlineUserIds().length, keys });
+        // Count canonical browser/device sessions. getOnlineUserIds() contains
+        // useful aliases (UID, email and key) and therefore is not a safe
+        // person counter: one browser can legitimately populate all of them.
+        return res.json({ success: true, generatedAt: now, onlineCount: countDevices(sharedPresence, now), keys });
     } catch (e) {
         return res.status(500).json({ success: false, error: e.message });
     }
@@ -5132,6 +5161,7 @@ setInterval(async () => {
 // STORE / CATALOG CONFIGURATION (RTDB-backed)
 // ============================================================
 const DEFAULT_STORE_CONFIG = {
+    activeBannerId: "gold-crown-ozymandias",
     avatarItems: [
         {
             id: "gold-crown-ozymandias",
@@ -5153,6 +5183,9 @@ const DEFAULT_STORE_CONFIG = {
             bannerAlign: "center",
             bannerOverlayColor: "#000000",
             bannerOverlayOpacity: 0,
+            bannerLeftDarkness: 55,
+            bannerRightDarkness: 20,
+            bannerDarknessSpread: 34,
             bannerFilterHue: 0,
             imageOffsetX: 0,
             imageOffsetY: 0,
@@ -5465,6 +5498,46 @@ app.post('/api/admin/server-config', verifyAdmin, rateLimit('admin'), async (req
     } catch(e) {
         console.error('[Server Config Error]:', e.message);
         return res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// Admin health checks run server-to-server. Browsers cannot reliably ping a
+// Render service directly because production CORS correctly rejects localhost.
+app.get('/api/admin/probe-server', verifyAdmin, rateLimit('admin'), async (req, res) => {
+    const requested = String(req.query.url || '').trim();
+    let target;
+    try { target = new URL(requested); } catch (e) {
+        return res.status(400).json({ success: false, error: 'Invalid server URL.' });
+    }
+    const targetOrigin = target.origin.toLowerCase();
+    const isLocalApi = isLoopbackOrigin(targetOrigin) && target.port === '3000';
+    if (!TRUSTED_API_ORIGINS.has(targetOrigin) && !isLocalApi) {
+        return res.status(400).json({ success: false, error: 'Server URL is outside the trusted API allowlist.' });
+    }
+    if (isLocalApi) {
+        return res.json({ success: true, online: true, status: 200, latencyMs: 0, url: targetOrigin });
+    }
+    const startedAt = Date.now();
+    try {
+        const response = await fetch(`${targetOrigin}/health?source=AdminApiRouting&t=${Date.now()}`, {
+            headers: { 'X-Roblox-Health-Probe': 'admin' },
+            signal: AbortSignal.timeout(10000)
+        });
+        return res.status(response.ok ? 200 : 502).json({
+            success: response.ok,
+            online: response.ok,
+            status: response.status,
+            latencyMs: Date.now() - startedAt,
+            url: targetOrigin
+        });
+    } catch (e) {
+        return res.status(502).json({
+            success: false,
+            online: false,
+            error: e.name === 'TimeoutError' ? 'Server timed out or is waking up.' : e.message,
+            latencyMs: Date.now() - startedAt,
+            url: targetOrigin
+        });
     }
 });
 
