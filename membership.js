@@ -7,9 +7,9 @@ const emailOf = value => String(value || '').trim().toLowerCase();
 const defaults = {
   demoEnabled: true, demoMinutes: 20,
   roles: [
-    { id: 'basic', name: 'Basic', autoGift: false, stayAwake: false, customSettings: false, hideAds: false },
-    { id: 'plus', name: 'Plus', autoGift: true, stayAwake: true, customSettings: true, hideAds: false },
-    { id: 'vip', name: 'VIP', autoGift: true, stayAwake: true, customSettings: true, hideAds: false }
+    { id: 'basic', name: 'Basic', autoGift: false, stayAwake: false, customSettings: false, hideAds: false, transectionDemo: false },
+    { id: 'plus', name: 'Plus', autoGift: true, stayAwake: true, customSettings: true, hideAds: false, transectionDemo: false },
+    { id: 'vip', name: 'VIP', autoGift: true, stayAwake: true, customSettings: true, hideAds: false, transectionDemo: false }
   ],
   plans: [
     { id: 'free', name: 'Free', role: 'basic', price: 'Free', features: ['Store access with a valid key', 'Google profile and synced submissions', 'One Auto Gift demo'], tag: '', glow: false, url: 'https://discord.gg/6zEkP9jdM' },
@@ -28,7 +28,7 @@ function validateConfig(input) {
   const roles = input.roles.map(r => {
     if (!/^[a-z][a-z0-9_-]{0,31}$/.test(r.id) || ids.has(r.id)) throw fail('Role IDs must be unique lowercase names.');
     ids.add(r.id);
-    return { id: r.id, name: String(r.name || r.id).slice(0, 50), autoGift: !!r.autoGift, stayAwake: !!r.stayAwake, customSettings: !!r.customSettings, hideAds: !!r.hideAds };
+    return { id: r.id, name: String(r.name || r.id).slice(0, 50), autoGift: !!r.autoGift, stayAwake: !!r.stayAwake, customSettings: !!r.customSettings, hideAds: !!r.hideAds, transectionDemo: !!r.transectionDemo };
   });
   if (!ids.has('basic')) throw fail('Keep the Basic role.');
   const minutes = Number(input.demoMinutes);
@@ -49,7 +49,7 @@ function installMembership({ app, db, verifyAdmin, verifyUserToken, getKeyFromSt
     if (!forceRefresh && configCache && Date.now() - configLoadedAt < CONFIG_TTL_MS) return configCache;
     const s = await configRef().get();
     const base = s.exists ? { ...defaults, ...s.data() } : structuredClone(defaults);
-    configCache = { ...base, roles: (base.roles || []).map(role => ({ ...role, hideAds: !!role.hideAds })) };
+    configCache = { ...base, roles: (base.roles || []).map(role => ({ ...role, hideAds: !!role.hideAds, transectionDemo: !!role.transectionDemo })) };
     configLoadedAt = Date.now();
     return configCache;
   }
@@ -225,10 +225,11 @@ function installMembership({ app, db, verifyAdmin, verifyUserToken, getKeyFromSt
     let source = role ? 'subscription' : 'locked';
     if (keyName) {
       const key = await getKeyFromStorage(keyName);
-      const member = key && (!email || !(key.excludedEmails || []).some(value => emailOf(value) === email)) && (key.userId === user.uid || key.googleUid === user.uid || (key.usedBy || []).includes(user.uid) || (key.accountUsers || []).some(a => a.uid === user.uid));
+      const notExcluded = key && (!email || !(key.excludedEmails || []).some(value => emailOf(value) === email));
       const keyRole = key && cfg.roles.find(r => r.id === key.tier && !['basic', 'none'].includes(r.id));
       const keyExpiry = key && Math.min(key.expiresAt || Infinity, key.subscriptionExpiresAt || Infinity);
-      if (member && !key.revoked && keyExpiry > now && keyRole && (!key.boundEmail || key.boundEmail === email) && (!role || (!role.autoGift && keyRole.autoGift))) {
+      const emailAllowed = !key?.boundEmail || key.emailOptional === true || key.boundEmail === email;
+      if (notExcluded && !key.revoked && keyExpiry > now && keyRole && emailAllowed && (!role || (!role.autoGift && keyRole.autoGift))) {
         role = keyRole; expiresAt = Number.isFinite(keyExpiry) ? keyExpiry : 0; source = 'key';
       }
     }
@@ -238,12 +239,25 @@ function installMembership({ app, db, verifyAdmin, verifyUserToken, getKeyFromSt
     if (!role && account && cfg.demoEnabled && account.demoEnabled !== false) {
       canStartDemo = account.demoStartedAt == null;
       if (account.demoStartedAt != null && account.demoExpiresAt > now) {
-        role = { id: 'basic', name: 'Free Demo', autoGift: true, stayAwake: true, customSettings: true, hideAds: !!basicRole?.hideAds };
+        role = { id: 'basic', name: 'Free Demo', autoGift: true, stayAwake: true, customSettings: true, hideAds: !!basicRole?.hideAds, transectionDemo: !!basicRole?.transectionDemo };
         expiresAt = account.demoExpiresAt || 0; source = 'demo';
       }
     }
-    const hideAds = !!role?.hideAds || (!!account && account.role === 'basic' && !!basicRole?.hideAds);
-    return { serverNow: now, email, role: role?.id || 'basic', roleName: role?.name || 'Basic', source, expiresAt, canStartDemo, demoStatus, demoDisabledReason, demoMinutes: demoMinutesFor(account, cfg), permissions: { autoGift: !!role?.autoGift, stayAwake: !!role?.stayAwake, customSettings: !!role?.customSettings, hideAds }, allowed: !!role?.autoGift };
+    let keyTierRole = null;
+    if (keyName) {
+      const kObj = await getKeyFromStorage(keyName).catch(() => null);
+      if (kObj && !kObj.revoked && (!kObj.expiresAt || kObj.expiresAt > now)) {
+        const emailAllowedForTier = !kObj.boundEmail || kObj.emailOptional === true || emailOf(kObj.boundEmail) === email;
+        if (emailAllowedForTier) {
+          keyTierRole = cfg.roles.find(r => r.id === (kObj.tier || 'basic')) || basicRole;
+        }
+      }
+    }
+    const displayRole = (keyTierRole && !['basic', 'none'].includes(keyTierRole.id)) ? keyTierRole : (role || keyTierRole || basicRole);
+    const effectiveDemoRole = displayRole || role || keyTierRole || basicRole;
+    const hideAds = !!role?.hideAds || !!displayRole?.hideAds || (!!account && account.role === 'basic' && !!basicRole?.hideAds);
+    const transectionDemo = !!effectiveDemoRole?.transectionDemo || (!!account && account.role === 'basic' && !!basicRole?.transectionDemo);
+    return { serverNow: now, email, role: displayRole?.id || 'basic', roleName: displayRole?.name || 'Basic', source, expiresAt, canStartDemo, demoStatus, demoDisabledReason, demoMinutes: demoMinutesFor(account, cfg), permissions: { autoGift: !!(role?.autoGift || displayRole?.autoGift), stayAwake: !!(role?.stayAwake || displayRole?.stayAwake), customSettings: !!(role?.customSettings || displayRole?.customSettings), hideAds, transectionDemo }, allowed: !!(role?.autoGift || displayRole?.autoGift) };
   }
   app.get('/api/membership/plans', route(async (req, res) => { const c = await config(); res.json({ plans: c.plans, payments: c.payments, demoMinutes: c.demoMinutes, demoEnabled: c.demoEnabled }); }));
   app.post('/api/membership/access', route(async (req, res) => res.json(await entitlement(req, false))));

@@ -506,7 +506,10 @@ async function updateKeyInStorage(key, updates, options = {}) {
     }
 
     // 1. RAM Cache
-    const existing = memoryKeys.get(cleanKey) || {};
+    let existing = memoryKeys.get(cleanKey);
+    if (!existing) {
+        existing = (await getKeyFromStorage(cleanKey)) || {};
+    }
     const merged = { ...existing, ...updates };
     memoryKeys.set(cleanKey, merged);
 
@@ -1637,7 +1640,12 @@ app.get('/api/key-events', (req, res) => {
     const channel = String(req.query.channel || '').trim().toLowerCase();
     if (!/^[a-f0-9]{64}$/.test(channel)) return res.status(400).json({ error: 'Invalid key event channel.' });
     const clients = keyEventClients.get(channel) || new Set();
-    if (clients.size >= 50) return res.status(429).json({ error: 'Too many listeners for this key.' });
+    while (clients.size >= 50) {
+        const oldest = clients.values().next().value;
+        if (!oldest) break;
+        clients.delete(oldest);
+        try { oldest.end(); } catch (e) {}
+    }
 
     res.set({
         'Content-Type': 'text/event-stream',
@@ -1818,7 +1826,14 @@ app.post('/api/auth/handoff/exchange', rateLimit('verify'), async (req, res) => 
         const a = getAdminAuth();
         if (!a) return res.status(503).json({ success: false, error: 'Firebase Auth is unavailable.' });
         const customToken = await a.createCustomToken(record.uid, { email: record.email || '' });
-        return res.json({ success: true, customToken, key: record.key, expiresAt: keyData.expiresAt || 0, sessionId: record.sessionId || '', photoURL: record.picture || '', displayName: record.name || '', email: record.email || '' });
+        if (record.uid && keyData.adminCreated) {
+            const usedBy = Array.isArray(keyData.usedBy) ? [...keyData.usedBy] : [];
+            if (!usedBy.includes(record.uid)) {
+                usedBy.push(record.uid);
+                await updateKeyInStorage(record.key, { usedBy, usedUsers: usedBy.length });
+            }
+        }
+        return res.json({ success: true, customToken, key: record.key, expiresAt: keyData.expiresAt || 0, tier: keyData.tier || 'basic', sessionId: record.sessionId || '', photoURL: record.picture || '', displayName: record.name || '', email: record.email || '' });
     } catch (e) {
         return res.status(500).json({ success: false, error: e.message });
     }
@@ -2026,6 +2041,7 @@ app.post('/api/sync-google-key', rateLimit('verify'), async (req, res) => {
                 hasActiveKey: true,
                 key: targetKey.key,
                 expiresAt: targetKey.expiresAt || 0,
+                tier: targetKey.tier || 'basic',
                 provider: targetKey.provider || null,
                 displayName: cleanName,
                 email: cleanEmail
@@ -3036,7 +3052,7 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
         if (verifiedUser?.email && (keyData.excludedEmails || []).some(value => String(value).toLowerCase() === String(verifiedUser.email).toLowerCase())) {
             return res.status(403).json({ valid: false, error: 'This account has been moved to a different key.' });
         }
-        if (keyData.boundEmail && (!verifiedUser?.email_verified || String(verifiedUser.email || '').toLowerCase() !== keyData.boundEmail)) {
+        if (keyData.boundEmail && !keyData.emailOptional && (!verifiedUser?.email_verified || String(verifiedUser.email || '').toLowerCase() !== keyData.boundEmail)) {
             return res.status(403).json({ valid: false, error: 'Sign in with the email assigned to this key.' });
         }
 
@@ -3077,7 +3093,11 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
                     if (!usedBy.includes(userId)) usedBy.push(userId);
                     await updateKeyInStorage(cleanKey, { usedIps, usedBy, usedUsers: usedBy.length });
                 } else if (usedIps.includes(reqIp)) {
-                    // same network -> allowed
+                    // same network -> allowed; ensure current userId is tracked in usedBy so membership role resolves after re-login
+                    if (userId && !usedBy.includes(userId)) {
+                        usedBy.push(userId);
+                        await updateKeyInStorage(cleanKey, { usedBy, usedUsers: usedBy.length });
+                    }
                 } else if (usedIps.length >= maxUsers) {
                     return res.status(403).json({ valid: false, error: `This key has reached its sharing limit (Max ${maxUsers} networks).` });
                 } else {
@@ -3092,11 +3112,17 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
                 // User already recognized
             } else {
                 if (usedBy.length >= maxUsers) {
-                    return res.status(403).json({ valid: false, error: `This key has reached its sharing limit (Max ${maxUsers} users).` });
+                    if (!keyData.activeSessionId && maxUsers === 1) {
+                        usedBy = [userId];
+                        await updateKeyInStorage(cleanKey, { usedBy, usedUsers: 1 });
+                    } else {
+                        return res.status(403).json({ valid: false, error: `This key has reached its sharing limit (Max ${maxUsers} users).` });
+                    }
+                } else {
+                    // Register user
+                    usedBy.push(userId);
+                    await updateKeyInStorage(cleanKey, { usedBy, usedUsers: usedBy.length });
                 }
-                // Register user
-                usedBy.push(userId);
-                await updateKeyInStorage(cleanKey, { usedBy, usedUsers: usedBy.length });
             }
         } else {
             // Normal gateway key: bind or allow valid holder
@@ -3143,6 +3169,7 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
             valid: true, 
             expiresAt: keyData.expiresAt || 0,
             maxUsers: keyMaxUsers,
+            tier: keyData.tier || 'basic',
             provider: keyData.provider || null,
             providerUsage,
             activeSessionId: sessionId || keyData.activeSessionId || null
@@ -3199,12 +3226,54 @@ app.post('/api/logout-key', async (req, res) => {
             await rtdb.ref(`users/${verifiedUser.uid}`).update({ logoutAt, activeKey: null });
         }
         if (mayDisconnect) {
-            await updateKeyInStorage(cleanKey, { activeSessionId: null, lastLoggedOut: logoutAt });
+            const logoutPatch = { activeSessionId: null, lastLoggedOut: logoutAt };
+            const logoutUid = String(req.body?.userId || verifiedUser?.uid || '').trim();
+            if (!isAccount && logoutUid && Array.isArray(keyData?.usedBy) && keyData.usedBy.includes(logoutUid)) {
+                const nextUsedBy = keyData.usedBy.filter(id => id !== logoutUid);
+                logoutPatch.usedBy = nextUsedBy;
+                logoutPatch.usedUsers = nextUsedBy.length;
+            }
+            await updateKeyInStorage(cleanKey, logoutPatch);
         }
         return res.json({ success: true, logoutAt });
     } catch (e) {
         const authError = /Firebase sign-in|valid Firebase sign-in/.test(e.message || '');
         return res.status(authError ? 401 : 503).json({ success: false, error: e.message });
+    }
+});
+
+// Store fetched Roblox player username & displayName on the active key (no avatar/profile URL, no admin domain exposed)
+app.post('/api/key-player-profile', rateLimit('verify'), async (req, res) => {
+    try {
+        const { key, username, displayName } = req.body || {};
+        if (!key || typeof key !== 'string' || key.length > 64 || !/^[A-Z0-9-]+$/i.test(key.trim())) {
+            return res.status(400).json({ success: false, error: 'Invalid key.' });
+        }
+        const cleanKey = key.trim().toUpperCase();
+        const cleanUsername = String(username || '').trim().replace(/[^\w.-]/g, '').slice(0, 32);
+        const cleanDisplayName = String(displayName || cleanUsername || '').trim().replace(/[<>"'`&\x00-\x1F\x7F]/g, '').slice(0, 50);
+        if (!cleanUsername && !cleanDisplayName) {
+            return res.status(400).json({ success: false, error: 'Missing player name.' });
+        }
+        let keyData = memoryKeys.get(cleanKey);
+        if (!keyData) keyData = await getKeyFromStorage(cleanKey);
+        if (!keyData || isKeyBlocked(keyData)) {
+            return res.status(404).json({ success: false, error: 'Key not found or inactive.' });
+        }
+        const effectiveExpiry = effectiveAccessExpiry(keyData);
+        if (Number.isNaN(effectiveExpiry) || (effectiveExpiry !== Infinity && Date.now() >= effectiveExpiry)) {
+            return res.status(403).json({ success: false, error: 'Key expired.' });
+        }
+        if (keyData.robloxUsername !== cleanUsername || keyData.robloxDisplayName !== cleanDisplayName) {
+            await updateKeyInStorage(cleanKey, {
+                robloxUsername: cleanUsername,
+                robloxDisplayName: cleanDisplayName || cleanUsername,
+                robloxUpdatedAt: Date.now()
+            });
+        }
+        return res.json({ success: true, robloxUsername: cleanUsername, robloxDisplayName: cleanDisplayName || cleanUsername });
+    } catch (e) {
+        return res.status(500).json({ success: false, error: 'Failed to update player profile.' });
     }
 });
 
@@ -3232,6 +3301,7 @@ app.get('/api/key-cooldowns', async (req, res) => {
         return res.json({
             success: true,
             expiresAt: keyData.expiresAt || 0,
+            tier: keyData.tier || 'basic',
             providerUsage,
             dailyCount,
             dailyRemaining,
@@ -3588,6 +3658,9 @@ function enrichKeyForAdmin(k, now, sharedKeyPresence) {
         googleUser: k.authProvider === 'google' || !!k.googleEmail || !!k.userEmail,
         email: k.googleEmail || k.userEmail || k.email || '',
         displayName: k.displayName || k.name || '',
+        robloxUsername: k.robloxUsername || '',
+        robloxDisplayName: k.robloxDisplayName || '',
+        robloxUpdatedAt: k.robloxUpdatedAt || 0,
         authProvider: k.authProvider || (k.googleEmail ? 'google' : 'anonymous'),
         accountUsers: Array.isArray(k.accountUsers) ? k.accountUsers : []
     };
@@ -3797,7 +3870,13 @@ app.get('/api/admin/dashboard-presence', verifyAdmin, rateLimit('admin'), async 
                 isUserOnline(keyData.userId) || isUserOnline(keyData.googleUid) ||
                 isUserOnline(keyData.googleEmail) || isUserOnline(keyData.email);
             if (online && !isKeyBlocked(keyData) && (!keyData.expiresAt || keyData.expiresAt > now)) {
-                keys.push({ key: keyData.key, online: true, ...breakdown });
+                keys.push({
+                    key: keyData.key,
+                    online: true,
+                    robloxUsername: keyData.robloxUsername || '',
+                    robloxDisplayName: keyData.robloxDisplayName || '',
+                    ...breakdown
+                });
             }
         }
         res.set('Cache-Control', 'private, no-store');
@@ -3840,6 +3919,8 @@ app.get('/api/admin/keys', verifyAdmin, rateLimit('admin'), async (req, res) => 
                 (k.note && k.note.toLowerCase().includes(search)) ||
                 (k.country && k.country.toLowerCase().includes(search)) ||
                 (k.tier && k.tier.toLowerCase().includes(search)) ||
+                (k.robloxUsername && k.robloxUsername.toLowerCase().includes(search)) ||
+                (k.robloxDisplayName && k.robloxDisplayName.toLowerCase().includes(search)) ||
                 (k.boundEmail && k.boundEmail.includes(search)) ||
                 getKeyAccountUsers(k).some(m => String(m.email || '').toLowerCase().includes(search)) ||
                 (k.ip && k.ip.toLowerCase().includes(search))
@@ -3921,8 +4002,9 @@ app.post('/api/admin/create-key', verifyAdmin, rateLimit('admin'), async (req, r
         const cleanTier = String(tier || 'none').toLowerCase();
         if (cleanTier !== 'none' && !membershipConfig.roles.some(r => r.id === cleanTier)) return res.status(400).json({ error: 'Choose an existing role.' });
         const premium = cleanTier !== 'none' && cleanTier !== 'basic';
-        const boundEmail = premium && req.body.emailOptional !== true ? String(req.body.boundEmail || '').trim().toLowerCase() : '';
-        if (premium && req.body.emailOptional !== true && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(boundEmail)) return res.status(400).json({ error: 'Enter the assigned email or enable email optional.' });
+        const isEmailOptional = req.body.emailOptional === true;
+        const boundEmail = premium ? String(req.body.boundEmail || '').trim().toLowerCase() : '';
+        if (premium && !isEmailOptional && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(boundEmail)) return res.status(400).json({ error: 'Enter the assigned email or enable email optional.' });
         const subscriptionDuration = Number(req.body.subscriptionDuration ?? durationNum);
         if (premium && (!Number.isFinite(subscriptionDuration) || subscriptionDuration < 0)) return res.status(400).json({ error: 'Invalid subscription duration.' });
 
@@ -3941,6 +4023,7 @@ app.post('/api/admin/create-key', verifyAdmin, rateLimit('admin'), async (req, r
             ipCheck: !!ipCheck,   // when true -> sharing counted per unique IP (same home/wifi allowed)
             tier: cleanTier,
             boundEmail,
+            emailOptional: isEmailOptional || !boundEmail,
             subscriptionExpiresAt: premium && subscriptionDuration > 0 ? now + subscriptionDuration : 0,
             note: note || '',
             ip: ip,
