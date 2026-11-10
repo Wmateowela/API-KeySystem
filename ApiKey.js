@@ -2993,6 +2993,7 @@ app.post('/api/claim-key', rateLimit('claim'), async (req, res) => {
 // Endpoint to verify user key
 app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
     const { key, userId } = req.body;
+    const sessionId = req.body && req.body.sessionId ? String(req.body.sessionId).trim() : null;
 
     if (!key || !userId) {
         return res.status(400).json({ valid: false, error: "Missing key or userId." });
@@ -3145,7 +3146,6 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
         // Session & Concurrency Tracking (Single active device / session per key)
         // Bandwidth guard: only write when something actually changed — RTDB
         // listeners re-download the whole key document on every write below it.
-        const sessionId = req.body.sessionId ? String(req.body.sessionId).trim() : null;
         const updates = {};
         if (!keyData.lastSeen || Date.now() - Number(keyData.lastSeen) > 10 * 60 * 1000) {
             updates.lastSeen = Date.now();
