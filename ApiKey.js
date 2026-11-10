@@ -3074,8 +3074,19 @@ app.post('/api/verify-key', rateLimit('verify'), async (req, res) => {
             if (!verifiedUser || verifiedUser.uid !== keyData.googleUid) {
                 return res.status(403).json({ valid: false, error: 'Sign in with the Google account linked to this key.' });
             }
-        } else if (!isMultiUserKey && !keyData.adminCreated && keyData.userId && keyData.userId !== 'anonymous' && (!verifiedUser || verifiedUser.uid !== keyData.userId)) {
-            return res.status(403).json({ valid: false, error: 'This guest key is locked to the device that created it.' });
+        } else if (!isMultiUserKey && !keyData.adminCreated && keyData.userId && keyData.userId !== 'anonymous') {
+            const matchesUid = (verifiedUser && verifiedUser.uid === keyData.userId) || (userId && userId === keyData.userId);
+            const isGoogleAccount = !!verifiedUser && verifiedUser.firebase?.sign_in_provider !== 'anonymous';
+            if (!matchesUid) {
+                if (isGoogleAccount) {
+                    return res.status(403).json({ valid: false, error: 'This guest key is locked to the device that created it.' });
+                }
+                if (!keyData.activeSessionId) {
+                    await updateKeyInStorage(cleanKey, { userId });
+                } else if (sessionId && keyData.activeSessionId && sessionId !== keyData.activeSessionId) {
+                    return res.status(403).json({ valid: false, error: 'This guest key is locked to the device that created it.' });
+                }
+            }
         }
 
         // Multi-user / Share Limits Check (for Admin generated keys or shared keys)
