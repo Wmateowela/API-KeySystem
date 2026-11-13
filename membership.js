@@ -228,7 +228,8 @@ function installMembership({ app, db, verifyAdmin, verifyUserToken, getKeyFromSt
       const notExcluded = key && (!email || !(key.excludedEmails || []).some(value => emailOf(value) === email));
       const keyRole = key && cfg.roles.find(r => r.id === key.tier && !['basic', 'none'].includes(r.id));
       const keyExpiry = key && Math.min(key.expiresAt || Infinity, key.subscriptionExpiresAt || Infinity);
-      const emailAllowed = !key?.boundEmail || key.emailOptional === true || key.boundEmail === email;
+      const emailAllowed = (!key?.boundEmail || key.emailOptional === true || key.boundEmail === email) &&
+        (!Array.isArray(key?.usedBy) || !key.usedBy.length || key.usedBy.includes(user.uid) || isLinkedToGoogleAccount(key, user.uid, email, true));
       if (notExcluded && !key.revoked && keyExpiry > now && keyRole && emailAllowed && (!role || (!role.autoGift && keyRole.autoGift))) {
         role = keyRole; expiresAt = Number.isFinite(keyExpiry) ? keyExpiry : 0; source = 'key';
       }
@@ -257,7 +258,7 @@ function installMembership({ app, db, verifyAdmin, verifyUserToken, getKeyFromSt
     const effectiveDemoRole = displayRole || role || keyTierRole || basicRole;
     const hideAds = !!role?.hideAds || !!displayRole?.hideAds || (!!account && account.role === 'basic' && !!basicRole?.hideAds);
     const transectionDemo = !!effectiveDemoRole?.transectionDemo || (!!account && account.role === 'basic' && !!basicRole?.transectionDemo);
-    return { serverNow: now, email, role: displayRole?.id || 'basic', roleName: displayRole?.name || 'Basic', source, expiresAt, canStartDemo, demoStatus, demoDisabledReason, demoMinutes: demoMinutesFor(account, cfg), permissions: { autoGift: !!(role?.autoGift || displayRole?.autoGift), stayAwake: !!(role?.stayAwake || displayRole?.stayAwake), customSettings: !!(role?.customSettings || displayRole?.customSettings), hideAds, transectionDemo }, allowed: !!(role?.autoGift || displayRole?.autoGift) };
+    return { serverNow: now, email, role: displayRole?.id || 'basic', roleName: displayRole?.name || 'Basic', source, expiresAt, canStartDemo, demoStatus, demoDisabledReason, demoMinutes: demoMinutesFor(account, cfg), permissions: { autoGift: !!role?.autoGift, stayAwake: !!role?.stayAwake, customSettings: !!role?.customSettings, hideAds, transectionDemo }, allowed: !!role?.autoGift };
   }
   app.get('/api/membership/plans', route(async (req, res) => { const c = await config(); res.json({ plans: c.plans, payments: c.payments, demoMinutes: c.demoMinutes, demoEnabled: c.demoEnabled }); }));
   app.post('/api/membership/access', route(async (req, res) => res.json(await entitlement(req, false))));
